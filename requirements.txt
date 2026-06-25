@@ -1,0 +1,10 @@
+pandas
+numpy
+yfinance
+ta
+requests
+feedparser
+transformers
+torch
+beautifulsoup4
+google-generativeai
