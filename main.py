@@ -354,7 +354,7 @@ def main():
             </tr>
 """
 
-    print("Running unified stock analysis...\n")
+    print("Running unified stock analysis...\\n")
     rows = []
     for stock_name, ticker in STOCKS.items():
         try:
@@ -416,16 +416,10 @@ def main():
             risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
 
             if "sell" in signal.lower():
-                row_color = "#fef2f2"
-                text_color = "#991b1b"
                 priority = 3
             elif "hold" in signal.lower() or "buy / hold" in signal.lower():
-                row_color = "#fffbeb"
-                text_color = "#78350f"
                 priority = 2
             else:
-                row_color = "#ecfdf5"
-                text_color = "#0f766e"
                 priority = 1
 
             # card-style HTML for each stock (email-safe)
@@ -475,9 +469,7 @@ def main():
         except Exception as e:
             error_text = f"Error processing {ticker}: {str(e)}"
             print(error_text)
-            import traceback
             traceback.print_exc()
-            err_html = f"""
             err_html = f"""
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
                 <tr>
@@ -487,7 +479,7 @@ def main():
             """
             rows.append((4, 0, ticker, err_html))
 
-    # group rows by priority for clearer sections
+    # This block is now correctly dedented and will run only once
     groups = {"Buy": [], "Hold": [], "Sell": [], "Errors": []}
     for pr, score, name, html in rows:
         if pr == 1:
@@ -499,7 +491,6 @@ def main():
         else:
             groups["Errors"].append((score, name, html))
 
-    # sort each group by score (desc)
     for key in groups:
         groups[key].sort(key=lambda item: item[0], reverse=True)
 
@@ -508,7 +499,6 @@ def main():
     sell_count = len(groups["Sell"])
     err_count = len(groups["Errors"])
 
-    # build summary and section HTML
     from datetime import datetime, timezone
     summary_html = f"""
         <tr>
@@ -544,7 +534,6 @@ def main():
         for _, _, html_row in groups["Errors"]:
             section_html += f"<tr><td>{html_row}</td></tr>"
 
-    # assemble final email
     report_html += summary_html + section_html
     report_html += """
           </table>
@@ -555,7 +544,6 @@ def main():
 </html>
     """
 
-    # send or save report
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("report.html", "w") as f:
             f.write(report_html)
@@ -563,139 +551,6 @@ def main():
     else:
         send_email(report_html)
         print("\\nEmail report sent successfully.")
-
-
-if __name__ == "__main__":
-    main()
-            """
-            rows.append((4, 0, ticker, err_html))
-
-    # group rows by priority for clearer sections
-    groups = {"Buy": [], "Hold": [], "Sell": [], "Errors": []}
-    for pr, score, name, html in rows:
-        if pr == 1:
-            groups["Buy"].append((score, name, html))
-        elif pr == 2:
-            groups["Hold"].append((score, name, html))
-        elif pr == 3:
-            groups["Sell"].append((score, name, html))
-        else:
-            groups["Errors"].append((score, name, html))
-
-    # sort each group by score (desc)
-    for key in groups:
-        groups[key].sort(key=lambda item: item[0], reverse=True)
-
-    buy_count = len(groups["Buy"])
-    hold_count = len(groups["Hold"])
-    sell_count = len(groups["Sell"])
-    err_count = len(groups["Errors"])
-
-    # build summary and section HTML
-    from datetime import datetime
-    summary_html = f"""
-        <tr>
-          <td style="padding:16px 20px;border-top:1px solid #e5e7eb;">
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-              <tr>
-                <td>
-                  <h2 style="margin:0;font-size:16px;">Portfolio Snapshot</h2>
-                </td>
-                <td style="text-align:right;font-size:13px;color:#475569;">{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</td>
-              </tr>
-            </table>
-            <p style="margin:8px 0 0;font-size:13px;color:#4b5563;">Total symbols: <strong>{len(rows)}</strong>  &bull;  Buy: <strong>{buy_count}</strong>  &bull;  Hold: <strong>{hold_count}</strong>  &bull;  Sell: <strong>{sell_count}</strong></p>
-          </td>
-        </tr>
-    """
-
-    section_html = ""
-    if groups["Buy"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#059669;">Buy ({buy_count})</h2></td></tr>'
-        for _, _, html_row in groups["Buy"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Hold"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#a16207;">Hold ({hold_count})</h2></td></tr>'
-        for _, _, html_row in groups["Hold"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Sell"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#b91c1c;">Sell ({sell_count})</h2></td></tr>'
-        for _, _, html_row in groups["Sell"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Errors"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#b91c1c;">Errors ({err_count})</h2></td></tr>'
-        for _, _, html_row in groups["Errors"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-
-    # assemble final email
-    report_html += summary_html + section_html
-    report_html += """
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
-    """
-
-    # send or save report
-    if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("report.html", "w") as f:
-            f.write(report_html)
-        print("\\nReport saved to report.html (DRY_RUN enabled)")
-    else:
-        send_email(report_html)
-        print("\\nEmail report sent successfully.")
-                        groups["Errors"].append((score, name, html))
-
-        # summary header
-        total = len(rows)
-        buy_count = len(groups["Buy"]) ; hold_count = len(groups["Hold"]) ; sell_count = len(groups["Sell"]) ; err_count = len(groups["Errors"])
-        from datetime import datetime
-        summary_html = f"""
-                        <tr>
-                            <td style=\"padding:12px 20px;\">
-                                <table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\" style=\"border-collapse:collapse;background:#f8fafc;border-radius:10px;padding:12px;\">
-                                    <tr>
-                                        <td style=\"font-size:14px;color:#0f172a;font-weight:700;\">Portfolio Snapshot</td>
-                                        <td style=\"text-align:right;font-size:13px;color:#475569;\">{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}</td>
-                                    </tr>
-                                    <tr>
-                                        <td colspan=\"2\" style=\"padding-top:8px;font-size:13px;color:#334155;\">Total symbols: <strong>{total}</strong> &nbsp;•&nbsp; Buy: <strong>{buy_count}</strong> &nbsp;•&nbsp; Hold: <strong>{hold_count}</strong> &nbsp;•&nbsp; Sell: <strong>{sell_count}</strong></td>
-                                    </tr>
-                                </table>
-                            </td>
-                        </tr>
-        """
-        html_report += summary_html
-
-        # sections
-        section_order = [("Buy", "#ecfdf5"), ("Hold", "#fffbeb"), ("Sell", "#fff1f2"), ("Errors", "#fff7f7")]
-        for section, bg in section_order:
-                items = groups.get(section, [])
-                if not items:
-                        continue
-                html_report += f"""\n            <tr><td style=\"padding:12px 20px;\"><h2 style=\"margin:0;font-size:16px;color:#0f172a;\">{section} ({len(items)})</h2></td></tr>\n        """
-                # add each card (sorted by score desc)
-                for score, name, card_html in sorted(items, key=lambda x: -x[0]):
-                        # wrap card in a table row container for consistent spacing
-                        html_report += f"""\n            <tr><td style=\"padding:0;\">{card_html}</td></tr>\n            """
-
-    html_report += """
-            <tr>
-              <td style="padding:0 20px 18px;">
-                <p style="margin:0;font-size:12px;color:#6b7280;line-height:1.5;">Generated by BlueOcean — review before acting on any trade.</p>
-              </td>
-            </tr>
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
-"""
-
-    send_email(html_report)
 
 
 if __name__ == "__main__":
