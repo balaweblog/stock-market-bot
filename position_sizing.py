@@ -9,6 +9,14 @@ def calculate_position_size(cash, confidence, risk_per_trade=0.01, stop_loss_pct
 def apply_risk_management(signal, total_score, cash, price):
     confidence = min(1.0, max(0.0, total_score / 100))
     size = calculate_position_size(cash, confidence)
+    
+    # define buy zone based on current price
+    buy_levels = {
+        "aggressive_entry": round(price * 1.02, 2),
+        "optimal_entry": round(price, 2),
+        "patient_entry": round(price * 0.95, 2)
+    }
+
     target = price * 1.1
     stop_loss = price * 0.95
 
@@ -20,4 +28,5 @@ def apply_risk_management(signal, total_score, cash, price):
         "size": round(size, 2),
         "target": round(target, 2),
         "stop_loss": round(stop_loss, 2),
+        "buy_levels": buy_levels,
     }

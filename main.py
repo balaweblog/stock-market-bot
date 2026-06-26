@@ -5,6 +5,7 @@ import ta
 import smtplib
 import traceback
 from email.mime.text import MIMEText
+from datetime import datetime
 try:
     import google.generativeai as genai
 except ImportError:
@@ -18,6 +19,10 @@ from news_engine import get_news
 from sentiment_score import score_headlines
 from scorer import final_score, decision
 from position_sizing import apply_risk_management
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from intraday_analyzer import find_optimal_entry_time
+from logger import log
 
 # -----------------------------
 # Fetch historical data
@@ -267,29 +272,9 @@ def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamental
     return round(max(0, min(100, total)), 2)
 
 
-def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines):
-    headlines_text = "; ".join(headlines[:3]) if headlines else "No recent headlines."
-    prompt = (
-        f"Write a concise, insightful investment note for {stock_name} ({ticker}). "
-        f"Use the following data to explain the current posture, what is driving it, and what investors should watch next:\n"
-        f"- Close: {round(latest['close'], 2)}\n"
-        f"- EMA20: {round(latest['ema20'], 2)}\n"
-        f"- EMA50: {round(latest['ema50'], 2)}\n"
-        f"- EMA100: {round(latest['ema100'], 2)}\n"
-        f"- EMA200: {round(latest['ema200'], 2)}\n"
-        f"- RSI: {round(latest['rsi'], 2)}\n"
-        f"- ADX: {round(latest['adx'], 2)}\n"
-        f"- Technical score: {tech_score} ({tech_signal})\n"
-        f"- Fundamental score: {fund_score}\n"
-        f"- Sentiment: {sentiment_label} ({round(sentiment_score, 2)})\n"
-        f"- Overall signal: {signal}\n"
-        f"- Headlines: {headlines_text}\n\n"
-        f"Output a short, clear rationale that highlights momentum, valuation/fundamental strength, sentiment context, and a key risk or catalyst. "
-        f"Do not simply repeat the signal or scores. Focus on why the current posture makes sense and what could change it."
-    )
-
-    generator = init_llm_generator()
-    if generator is None:
+def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines, risk_data):
+    # Fallback summary generation
+    def _get_fallback_reason():
         headline_summary = headlines[:2]
         headline_text = "; ".join(headline_summary) if headline_summary else "No recent headlines."
         return (
@@ -299,42 +284,251 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
             f"Recent headlines: {headline_text}."
         )
 
+    # New prompt for the swing trader persona
+    prompt = (
+        f"As a professional swing trader, provide a concise, actionable trade plan for {stock_name} ({ticker}). "
+        f"The analysis must be brief, data-driven, and focused on the next 1-10 trading sessions. "
+        f"Synthesize the following data into a clear trade setup:\n\n"
+        f"**Trade Context:**\n"
+        f"- Overall Signal: {signal}\n"
+        f"- Technical Score: {tech_score}\n"
+        f"- Key Price Levels: Close Price: {round(latest['close'], 2)}, EMA20: {round(latest['ema20'], 2)}, EMA50: {round(latest['ema50'], 2)}\n"
+        f"- Momentum: RSI at {round(latest['rsi'], 2)}; ADX at {round(latest['adx'], 2)}\n"
+        f"- Sentiment: {sentiment_label} ({round(sentiment_score, 2)})\n\n"
+        f"- **Pre-calculated Risk Levels:**\n"
+        f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']}\n"
+        f"- Optimal Entry: {risk_data['buy_levels']['optimal_entry']}\n"
+        f"- Patient Entry: {risk_data['buy_levels']['patient_entry']}\n"
+        f"- Stop-Loss: {risk_data['stop_loss']}\n"
+        f"- Profit Target: {risk_data['target']}\n\n"
+        f"**Instructions for Swing Trader:**\n"
+        f"1. **Trade Thesis:** Start with a one-sentence thesis describing the technical setup (e.g., 'The stock is showing bullish continuation as it holds above the 20-day EMA...').\n"
+        f"2. **Optimal Timing:** Based on the chart, what is the ideal timing or condition for entry? (e.g., 'Entry is ideal on a brief pullback to the 20-day EMA,' or 'Wait for a high-volume breakout above the recent highs.').\n"
+        f"3. **Action Plan:** Clearly state the plan. Use the pre-calculated levels. (e.g., 'The plan is to buy on a dip into the patient entry zone around {risk_data['buy_levels']['patient_entry']}...').\n"
+        f"4. **Risk Management:** Specify the exit strategy. (e.g., 'The trade is invalidated if the price breaks below the stop-loss at {risk_data['stop_loss']}...').\n"
+        f"5. **Confirmation Signal:** What near-term event would confirm the trade's strength? (e.g., 'A move above the recent high of {round(latest['high20'], 2)} would confirm momentum.').\n"
+        f"6. **Tone & Format:** Be decisive and clear. Output a single, concise paragraph. No conversational language or disclaimers."
+    )
+
+    generator = init_llm_generator()
+    if generator is None:
+        return _get_fallback_reason()
+
     if generator == "gemini" and genai is not None:
         gemini_text = generate_gemini_reasoning(prompt)
         if gemini_text:
             return gemini_text
 
-    headline_summary = headlines[:2]
-    headline_text = "; ".join(headline_summary) if headline_summary else "No recent headlines."
-    return (
-        f"{stock_name} is currently in a {signal.lower()} posture. "
-        f"Technical momentum is {tech_signal.lower()} with a score of {tech_score}, "
-        f"fundamentals are {fund_score}, and sentiment is {sentiment_label.lower()} ({round(sentiment_score, 2)}). "
-        f"Recent headlines: {headline_text}."
-    )
+    # Fallback if the AI model fails for any reason
+    return _get_fallback_reason()
+
+
+def get_date_with_suffix(d):
+    day = d.day
+    if 4 <= day <= 20 or 24 <= day <= 30:
+        suffix = "th"
+    else:
+        suffix = ["st", "nd", "rd"][day % 10 - 1]
+    return d.strftime(f"%#d{suffix} %B %Y" if os.name == 'nt' else f"%-d{suffix} %B %Y")
 
 
 # -----------------------------
 # Email
 # -----------------------------
-def send_email(report_html):
+def send_email(report_html, mode):
+    if not all([EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO]):
+        print(
+            "Email credentials not found. "
+            "Please set EMAIL_FROM, EMAIL_PASSWORD, and EMAIL_TO environment variables."
+        )
+        return
+
+    subject = " BlueOcean Stock Report"
+    if mode == "real_time":
+        subject = f"REAL-TIME: {subject}"
+    elif mode == "eod":
+        subject = f"EOD: {subject}"
+
+    # Append the formatted date
+    formatted_date = get_date_with_suffix(datetime.now())
+    subject += f" - {formatted_date}"
+
     msg = MIMEText(report_html, "html")
-    msg["Subject"] = "BlueOcean - Technical Stock Report"
+    msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
-    server = smtplib.SMTP("smtp.gmail.com", 587)
-    server.starttls()
-    server.login(EMAIL_FROM, EMAIL_PASSWORD)
-    server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-    server.quit()
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(EMAIL_FROM, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+    except smtplib.SMTPAuthenticationError:
+        print(
+            "SMTP Authentication Error: The username or password you entered is not correct. "
+            "Please check your credentials and App Password if using Gmail."
+        )
+    except Exception as e:
+        print(f"An error occurred while sending the email: {e}")
+        traceback.print_exc()
+
+
+def process_stock(stock_name, ticker, use_llm=True):
+    try:
+        # fetch data and compute scores
+        df = fetch_data(ticker)
+        df = calculate_indicators(df)
+
+        # consolidated technical score calculation
+        tech_score, reasons = calculate_score(df)
+        tech_signal = get_signal(tech_score)
+
+        fund_raw = fetch_fundamentals(ticker)
+        fund_score = score_fundamentals(fund_raw)
+
+        adv_raw = fetch_advanced_fundamentals(ticker)
+        adv_fund_score = score_advanced_fundamentals(adv_raw)
+
+        headlines = get_news(stock_name)
+        sentiment = score_headlines(headlines)
+        sentiment_score = sentiment.get("score", 50.0)
+        sentiment_label = sentiment.get("label", "Neutral")
+
+        try:
+            market_context = build_market_context(ticker)
+        except Exception as exc:
+            print(f"Market context failed for {ticker}: {exc}")
+            market_context = {
+                "trend": "unknown",
+                "return_20d": 0.0,
+                "return_50d": 0.0,
+                "sector": "unknown",
+                "industry": "unknown",
+            }
+        total_score = calculate_combined_score(
+            tech_score,
+            fund_score,
+            sentiment_score,
+            adv_fund_score,
+            market_context,
+        )
+
+        signal = decision(total_score)
+
+        latest = df.iloc[-1]
+        news_text = ", ".join(headlines[:3])
+        
+        # Get risk management data
+        risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
+
+        llm_reason = generate_llm_reasoning(
+            stock_name,
+            ticker,
+            latest,
+            tech_score,
+            fund_score,
+            sentiment_score,
+            sentiment_label,
+            tech_signal,
+            signal,
+            headlines,
+            risk_data,
+        )
+
+        if "sell" in signal.lower():
+            priority = 3
+        elif "hold" in signal.lower() or "buy / hold" in signal.lower():
+            priority = 2
+        else:
+            priority = 1
+
+        # card-style HTML for each stock (email-safe)
+        row_html = f"""
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
+            <tr>
+                <td style="padding:14px;">
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                        <tr>
+                            <td style="vertical-align:top;">
+                                <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
+                                <p style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">{llm_reason}</p>
+                            </td>
+                            <td style="width:110px;text-align:right;vertical-align:top;">
+                                <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
+                                <div style="margin-top:8px;font-size:13px;color:#334155;">Score: <strong>{total_score}</strong></div>
+                            </td>
+                        </tr>
+                    </table>
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
+                        <tr>
+                            <td style="padding:6px 0;width:50%;"><strong>Close</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
+                            <td style="padding:6px 0;width:50%;"><strong>EMA20 / EMA50</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema20'],2)} / {round(latest['ema50'],2)}</div></td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
+                            <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
+                            <td style="padding:6px 0;"><strong>AdvFund / Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{adv_fund_score} / {sentiment_score} ({sentiment_label})</div></td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
+                            <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
+                        </tr>
+                        <tr>
+                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
+                                <div style="font-size:12px;color:#0f172a;margin-top:4px;">
+                                    Patient: <strong>{risk_data['buy_levels']['patient_entry']}</strong> &bull;
+                                    Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
+                                    Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+        """
+        print(f"{stock_name} ({ticker}) -> {signal} | Score: {total_score}")
+        return (priority, total_score, stock_name, row_html)
+    except Exception as e:
+        error_text = f"Error processing {ticker}: {str(e)}"
+        print(error_text)
+        traceback.print_exc()
+        err_html = f"""
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
+            <tr>
+                <td style="padding:12px;color:#721c24;font-size:13px;"><strong>Error:</strong> {error_text}</td>
+            </tr>
+        </table>
+        """
+        return (4, 0, ticker, err_html)
+
+
+def get_section_html(title, count, items):
+    """
+    Generates the HTML for a section of the report.
+    """
+    if not items:
+        return ""
+
+    header = f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;">{title} ({count})</h2></td></tr>'
+    rows_html = "".join([f'<tr><td style="padding:0 20px;">{html}</td></tr>' for _, _, html in items])
+    return header + rows_html
 
 
 # -----------------------------
 # Main
 # -----------------------------
-def main():
-    html_report = """
+def main(mode, use_llm):
+    log.info(f"Starting stock analysis run. Mode: {mode}, LLM Enabled: {use_llm}")
+    report_html = """
 <html>
   <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#111827;">
     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f6f8;width:100%;min-width:100%;">
@@ -343,7 +537,7 @@ def main():
           <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="max-width:680px;min-width:320px;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
             <tr>
               <td style="padding:18px 20px 12px;">
-                <h1 style="margin:0;font-size:22px;line-height:1.2;color:#111827;">BlueOcean Stock Report</h1>
+                <h1 style="margin:0;font-size:22px;line-height:1.2;color:#111827;"> Stock Report</h1>
                 <p style="margin:10px 0 0;font-size:14px;line-height:1.6;color:#4b5563;">A clean mobile-friendly stock update with color-coded signal cards and compact metrics optimized for Gmail and Outlook.</p>
               </td>
             </tr>
@@ -354,130 +548,31 @@ def main():
             </tr>
 """
 
-    print("Running unified stock analysis...\\n")
     rows = []
-    for stock_name, ticker in STOCKS.items():
-        try:
-            # fetch data and compute scores
-            df = fetch_data(ticker)
-            df = calculate_indicators(df)
+    if use_llm:
+        init_llm_generator()
 
-            # consolidated technical score calculation
-            tech_score, reasons = calculate_score(df)
-            tech_signal = get_signal(tech_score)
-
-            fund_raw = fetch_fundamentals(ticker)
-            fund_score = score_fundamentals(fund_raw)
-
-            adv_raw = fetch_advanced_fundamentals(ticker)
-            adv_fund_score = score_advanced_fundamentals(adv_raw)
-
-            headlines = get_news(stock_name)
-            sentiment = score_headlines(headlines)
-            sentiment_score = sentiment.get("score", 50.0)
-            sentiment_label = sentiment.get("label", "Neutral")
-
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_stock = {
+            executor.submit(process_stock, name, ticker, use_llm): (name, ticker)
+            for name, ticker in STOCKS.items()
+        }
+        for future in as_completed(future_to_stock):
+            stock_name, ticker = future_to_stock[future]
             try:
-                market_context = build_market_context(ticker)
+                result = future.result()
+                if result:
+                    rows.append(result)
             except Exception as exc:
-                print(f"Market context failed for {ticker}: {exc}")
-                market_context = {
-                    "trend": "unknown",
-                    "return_20d": 0.0,
-                    "return_50d": 0.0,
-                    "sector": "unknown",
-                    "industry": "unknown",
-                }
-            total_score = calculate_combined_score(
-                tech_score,
-                fund_score,
-                sentiment_score,
-                adv_fund_score,
-                market_context,
-            )
-
-            signal = decision(total_score)
-
-            latest = df.iloc[-1]
-            news_text = ", ".join(headlines[:3])
-            llm_reason = generate_llm_reasoning(
-                stock_name,
-                ticker,
-                latest,
-                tech_score,
-                fund_score,
-                sentiment_score,
-                sentiment_label,
-                tech_signal,
-                signal,
-                headlines,
-            )
-
-            risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
-
-            if "sell" in signal.lower():
-                priority = 3
-            elif "hold" in signal.lower() or "buy / hold" in signal.lower():
-                priority = 2
-            else:
-                priority = 1
-
-            # card-style HTML for each stock (email-safe)
-            row_html = f"""
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
-                <tr>
-                    <td style="padding:14px;">
-                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
-                            <tr>
-                                <td style="vertical-align:top;">
-                                    <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
-                                    <p style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">{llm_reason}</p>
-                                </td>
-                                <td style="width:110px;text-align:right;vertical-align:top;">
-                                    <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
-                                    <div style="margin-top:8px;font-size:13px;color:#334155;">Score: <strong>{total_score}</strong></div>
-                                </td>
-                            </tr>
-                        </table>
-                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
-                            <tr>
-                                <td style="padding:6px 0;width:50%;"><strong>Close</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
-                                <td style="padding:6px 0;width:50%;"><strong>EMA20 / EMA50</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema20'],2)} / {round(latest['ema50'],2)}</div></td>
-                            </tr>
-                            <tr>
-                                <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
-                                <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
-                            </tr>
-                            <tr>
-                                <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
-                                <td style="padding:6px 0;"><strong>AdvFund / Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{adv_fund_score} / {sentiment_score} ({sentiment_label})</div></td>
-                            </tr>
-                            <tr>
-                                <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
-                                <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
-                            </tr>
-                            <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-            """
-            rows.append((priority, total_score, stock_name, row_html))
-            print(f"{stock_name} ({ticker}) -> {signal} | Score: {total_score}")
-        except Exception as e:
-            error_text = f"Error processing {ticker}: {str(e)}"
-            print(error_text)
-            traceback.print_exc()
-            err_html = f"""
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
-                <tr>
-                    <td style="padding:12px;color:#721c24;font-size:13px;"><strong>Error:</strong> {error_text}</td>
-                </tr>
-            </table>
-            """
-            rows.append((4, 0, ticker, err_html))
+                log.error(f"Error processing {stock_name} ({ticker}) in executor: {exc}")
+                err_html = f"""
+                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
+                    <tr>
+                        <td style="padding:12px;color:#721c24;font-size:13px;"><strong>Error processing {ticker}:</strong> {exc}</td>
+                    </tr>
+                </table>
+                """
+                rows.append((4, 0, ticker, err_html))
 
     # This block is now correctly dedented and will run only once
     groups = {"Buy": [], "Hold": [], "Sell": [], "Errors": []}
@@ -516,23 +611,10 @@ def main():
         </tr>
     """
 
-    section_html = ""
-    if groups["Buy"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#059669;">Buy ({buy_count})</h2></td></tr>'
-        for _, _, html_row in groups["Buy"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Hold"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#a16207;">Hold ({hold_count})</h2></td></tr>'
-        for _, _, html_row in groups["Hold"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Sell"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#b91c1c;">Sell ({sell_count})</h2></td></tr>'
-        for _, _, html_row in groups["Sell"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
-    if groups["Errors"]:
-        section_html += f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;color:#b91c1c;">Errors ({err_count})</h2></td></tr>'
-        for _, _, html_row in groups["Errors"]:
-            section_html += f"<tr><td>{html_row}</td></tr>"
+    section_html = get_section_html("Buy", buy_count, groups["Buy"])
+    section_html += get_section_html("Hold", hold_count, groups["Hold"])
+    section_html += get_section_html("Sell", sell_count, groups["Sell"])
+    section_html += get_section_html("Errors", err_count, groups["Errors"])
 
     report_html += summary_html + section_html
     report_html += """
@@ -547,11 +629,26 @@ def main():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("report.html", "w") as f:
             f.write(report_html)
-        print("\\nReport saved to report.html (DRY_RUN enabled)")
+        log.info("Report saved to report.html (DRY_RUN enabled)")
     else:
-        send_email(report_html)
-        print("\\nEmail report sent successfully.")
+        send_email(report_html, mode)
+        log.info("Email report sent successfully.")
+    log.info("Stock analysis run finished.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Run stock analysis.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="eod",
+        choices=["real_time", "eod"],
+        help="Specify the mode: real_time or eod"
+    )
+    parser.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Disable AI-powered reasoning to speed up execution."
+    )
+    args = parser.parse_args()
+    main(args.mode, use_llm=not args.no_llm)

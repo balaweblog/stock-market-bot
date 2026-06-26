@@ -8,3 +8,5 @@ transformers
 torch
 beautifulsoup4
 google-generativeai
+ratelimit
+requests-cache

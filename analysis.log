@@ -1,0 +1,25 @@
+2026-06-26 12:19:20 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-26 12:19:43 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:19:43 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-26 12:20:36 - stock_analyzer - INFO - Starting stock analysis run. Mode: real_time, LLM Enabled: True
+2026-06-26 12:21:00 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:21:00 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-26 12:21:55 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-26 12:22:16 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:22:16 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-26 12:25:15 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-26 12:25:19 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:25:19 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-26 12:28:41 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-26 12:28:50 - stock_analyzer - ERROR - Could not determine optimal entry time for SBIN.NS: 'low'
+2026-06-26 12:28:50 - stock_analyzer - ERROR - Could not determine optimal entry time for ITC.NS: 'low'
+2026-06-26 12:28:51 - stock_analyzer - ERROR - Could not determine optimal entry time for SHRIRAMFIN.NS: 'low'
+2026-06-26 12:28:54 - stock_analyzer - ERROR - Could not determine optimal entry time for BHARTIARTL.NS: 'low'
+2026-06-26 12:28:59 - stock_analyzer - ERROR - Could not determine optimal entry time for COALINDIA.NS: 'low'
+2026-06-26 12:28:59 - stock_analyzer - ERROR - Could not determine optimal entry time for ASIANPAINT.NS: 'low'
+2026-06-26 12:28:59 - stock_analyzer - ERROR - Could not determine optimal entry time for BEL.NS: 'low'
+2026-06-26 12:29:03 - stock_analyzer - ERROR - Could not determine optimal entry time for TCS.NS: 'low'
+2026-06-26 12:29:08 - stock_analyzer - ERROR - Could not determine optimal entry time for ICICIBANK.NS: 'low'
+2026-06-26 12:29:13 - stock_analyzer - ERROR - Could not determine optimal entry time for SUNPHARMA.NS: 'low'
+2026-06-26 12:29:18 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:29:18 - stock_analyzer - INFO - Stock analysis run finished.
