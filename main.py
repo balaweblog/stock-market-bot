@@ -8,6 +8,10 @@ from email.mime.text import MIMEText
 from datetime import datetime
 from zoneinfo import ZoneInfo
 try:
+    from transformers import pipeline
+except ImportError:
+    pipeline = None
+try:
     import google.generativeai as genai
 except ImportError:
     genai = None
@@ -15,7 +19,7 @@ from config import *
 from stock_fetcher import fetch_fundamentals
 from fundamentals import score_fundamentals
 from advanced_fundamentals import fetch_advanced_fundamentals, score_advanced_fundamentals
-from market_context import build_market_context
+from market_context import build_market_context, get_resilient_session
 from news_engine import get_news
 from sentiment_score import score_headlines
 from scorer import final_score, decision
@@ -23,17 +27,124 @@ from position_sizing import apply_risk_management
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import log
+import threading
 
-# -----------------------------
-# Fetch historical data
-# -----------------------------
+model_lock = threading.Lock()
+
+llm_pipeline = None
+use_gemini_flash = False
+
+def init_llm_generator():
+    """
+    Initializes the AI model.
+    Prioritizes Gemini 1.5 Flash (Free Cloud Tier) if GOOGLE_API_KEY is present.
+    Otherwise, falls back to the ultra-lightweight and highly smart Qwen2.5-1.5B local model.
+    """
+    global llm_pipeline, use_gemini_flash
+    
+    # 1. Check for Gemini API key
+    api_key = os.getenv("GOOGLE_API_KEY") or globals().get("GOOGLE_API_KEY")
+    if api_key and genai is not None:
+        try:
+            log.info("Google API key detected. Initializing Gemini 1.5 Flash (Free Cloud Tier)...")
+            genai.configure(api_key=api_key)
+            use_gemini_flash = True
+            log.info("Gemini 1.5 Flash initialized successfully.")
+            return "gemini"
+        except Exception as exc:
+            log.warning(f"Failed to initialize Gemini, falling back to local model: {exc}")
+            use_gemini_flash = False
+
+    # 2. Fallback to local model
+    if pipeline is None:
+        log.warning("The 'transformers' library is not installed. LLM reasoning will be disabled.")
+        return None
+        
+    if llm_pipeline is None:
+        try:
+            import torch
+            device = -1
+            torch_dtype = torch.float32
+            
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                device = "mps"
+                torch_dtype = torch.float16
+                log.info("Apple Silicon GPU (MPS) detected. Enabling hardware acceleration.")
+            elif torch.cuda.is_available():
+                device = 0
+                torch_dtype = torch.float16
+                log.info("Nvidia GPU (CUDA) detected. Enabling hardware acceleration.")
+            else:
+                log.info("No compatible GPU detected. Running model on CPU.")
+
+            log.info("Initializing high-quality local AI model (Qwen2.5-1.5B-Instruct)...")
+            # Using Qwen2.5-1.5B-Instruct: extremely smart, fast on MPS/CPU, vastly superior reasoning
+            llm_pipeline = pipeline(
+                "text-generation", 
+                model="Qwen/Qwen2.5-1.5B-Instruct",
+                device=device,
+                torch_dtype=torch_dtype
+            )
+            log.info("Local AI model initialized successfully.")
+        except Exception as e:
+            log.error(f"Failed to initialize local AI model: {e}")
+            llm_pipeline = None
+            
+    return "local" if llm_pipeline is not None else None
+
+
+def generate_gemini_reasoning(prompt):
+    """
+    Generates text using the Gemini 1.5 Flash model.
+    """
+    if genai is None:
+        return None
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        log.error(f"Gemini generation failed: {e}")
+        return None
+
+
+def generate_hf_reasoning(prompt, stock_name=""):
+    """
+    Generates text using the locally run Hugging Face model.
+    Serializes execution using a thread lock to prevent CPU/GPU thrashing.
+    """
+    if llm_pipeline is None:
+        return None
+
+    try:
+        # Format the prompt for Qwen2.5 Chat template (uses ChatML template)
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = llm_pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        # Inference must be serialized to prevent resource thrashing
+        with model_lock:
+            log.info(f"Generating AI trade plan for {stock_name}...")
+            # Limit max_new_tokens to 120 for extremely fast execution
+            outputs = llm_pipeline(formatted_prompt, max_new_tokens=120, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
+            log.info(f"AI trade plan successfully generated for {stock_name}.")
+        
+        generated_text = outputs[0]['generated_text']
+        
+        # Clean up the output to get only the assistant's response (Qwen2.5 style)
+        response = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
+        
+        return response
+    except Exception as e:
+        log.error(f"Hugging Face model generation failed for {stock_name}: {e}")
+        return None
 def fetch_data(symbol):
     df = yf.download(
         symbol,
         period="300d",
         interval="1d",
         auto_adjust=True,
-        progress=False
+        progress=False,
+        session=get_resilient_session()
     )
 
     if df.empty:
@@ -213,51 +324,6 @@ def get_signal(score):
         return "RED -> SELL / REDUCE"
 
 
-def init_llm_generator():
-    if genai is None:
-        return None
-
-    api_key = os.getenv("GOOGLE_API_KEY") or globals().get("GOOGLE_API_KEY")
-    if not api_key:
-        print("Google API key not found for Gemini.")
-        return None
-
-    try:
-        genai.configure(api_key=api_key)
-        return "gemini"
-    except Exception as exc:
-        print(f"Failed to initialize Gemini: {exc}")
-        return None
-
-
-def generate_gemini_reasoning(prompt):
-    if genai is None:
-        return None
-
-    try:
-        if hasattr(genai, "GenerativeModel") and hasattr(genai.GenerativeModel, "from_pretrained"):
-            model = genai.GenerativeModel.from_pretrained("gemini-1.5")
-            response = model.generate(prompt=prompt, max_output_tokens=220)
-            if hasattr(response, "text"):
-                return response.text.strip()
-            if isinstance(response, dict):
-                return response.get("output", {}).get("text", "").strip()
-
-        if hasattr(genai, "generate"):
-            response = genai.generate(model="gemini-1.5", prompt=prompt, max_output_tokens=220)
-            if isinstance(response, dict):
-                if "candidates" in response and response["candidates"]:
-                    return response["candidates"][0].get("output", "").strip()
-                if "output" in response and isinstance(response["output"], dict):
-                    return response["output"].get("text", "").strip()
-                return str(response.get("output", "")).strip()
-
-        return None
-    except Exception as exc:
-        print(f"Gemini generation failed: {exc}")
-        return None
-
-
 def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamentals, market_context):
     # Use the existing final_score weighting and fold advanced fundamentals into total score.
     combined_fund = fundamentals + (adv_fundamentals * 0.4)
@@ -295,7 +361,7 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
         f"- Key Price Levels: Close Price: {round(latest['close'], 2)}, EMA20: {round(latest['ema20'], 2)}, EMA50: {round(latest['ema50'], 2)}\n"
         f"- Momentum: RSI at {round(latest['rsi'], 2)}; ADX at {round(latest['adx'], 2)}\n"
         f"- Sentiment: {sentiment_label} ({round(sentiment_score, 2)})\n\n"
-        f"- **Pre-calculated Risk Levels:**\n"
+        f"**Pre-calculated Risk Levels:**\n"
         f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']}\n"
         f"- Optimal Entry: {risk_data['buy_levels']['optimal_entry']}\n"
         f"- Patient Entry: {risk_data['buy_levels']['patient_entry']}\n"
@@ -314,10 +380,10 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
     if generator is None:
         return _get_fallback_reason()
 
-    if generator == "gemini" and genai is not None:
-        gemini_text = generate_gemini_reasoning(prompt)
-        if gemini_text:
-            return gemini_text
+    # Use the Hugging Face model for reasoning
+    hf_text = generate_hf_reasoning(prompt, stock_name=stock_name)
+    if hf_text:
+        return hf_text
 
     # Fallback if the AI model fails for any reason
     return _get_fallback_reason()
