@@ -1,9 +1,11 @@
 name: Stock Bot
-
 on:
   schedule:
-    - cron: "55 7 * * *"
+    - cron: "10 8 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   stock-analysis:
@@ -15,7 +17,7 @@ jobs:
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      STOCKS_JSON: ${{secrets.STOCKS_JSON}}
+      STOCKS_JSON: ${{ secrets.STOCKS_JSON }}
 
     steps:
       - name: Checkout source
