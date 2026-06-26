@@ -1,7 +1,7 @@
-name: Stock Bot
+name: SStock Scheduler Agent
 on:
   schedule:
-    - cron: "15 9 * * *"
+    - cron: "35 8 * * *"
   workflow_dispatch:
 
 permissions:
