@@ -6,6 +6,7 @@ import smtplib
 import traceback
 from email.mime.text import MIMEText
 from datetime import datetime
+from zoneinfo import ZoneInfo
 try:
     import google.generativeai as genai
 except ImportError:
@@ -21,7 +22,6 @@ from scorer import final_score, decision
 from position_sizing import apply_risk_management
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from intraday_analyzer import find_optimal_entry_time
 from logger import log
 
 # -----------------------------
@@ -594,7 +594,11 @@ def main(mode, use_llm):
     sell_count = len(groups["Sell"])
     err_count = len(groups["Errors"])
 
-    from datetime import datetime, timezone
+    # Format date for the report header
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    formatted_date_ist = now_ist.strftime('%A, %d %B %Y, %I:%M %p %Z')
+
     summary_html = f"""
         <tr>
           <td style="padding:16px 20px;border-top:1px solid #e5e7eb;">
@@ -603,7 +607,7 @@ def main(mode, use_llm):
                 <td>
                   <h2 style="margin:0;font-size:16px;">Portfolio Snapshot</h2>
                 </td>
-                <td style="text-align:right;font-size:13px;color:#475569;">{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</td>
+                <td style="text-align:right;font-size:13px;color:#475569;">{formatted_date_ist}</td>
               </tr>
             </table>
             <p style="margin:8px 0 0;font-size:13px;color:#4b5563;">Total symbols: <strong>{len(rows)}</strong>  &bull;  Buy: <strong>{buy_count}</strong>  &bull;  Hold: <strong>{hold_count}</strong>  &bull;  Sell: <strong>{sell_count}</strong></p>

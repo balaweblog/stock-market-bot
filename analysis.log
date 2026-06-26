@@ -23,3 +23,6 @@
 2026-06-26 12:29:13 - stock_analyzer - ERROR - Could not determine optimal entry time for SUNPHARMA.NS: 'low'
 2026-06-26 12:29:18 - stock_analyzer - INFO - Email report sent successfully.
 2026-06-26 12:29:18 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-26 12:32:45 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-26 12:33:08 - stock_analyzer - INFO - Email report sent successfully.
+2026-06-26 12:33:08 - stock_analyzer - INFO - Stock analysis run finished.
