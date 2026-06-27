@@ -28,7 +28,6 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import log
 from commodity_tracker import CommodityTracker
-from config import GOLD_API_KEY
 
 import threading
 
@@ -704,9 +703,15 @@ def main(mode, use_llm):
             f.write(report_html)
         log.info("Report saved to report.html (DRY_RUN enabled)")
     else:
-        tracker = CommodityTracker(GOLD_API_KEY)
-        commodity_html = tracker.generate_html()
-        report_html += commodity_html
+        try:
+         tracker = CommodityTracker(os.getenv("GOLD_API_KEY"))
+         commodity_html = tracker.generate_html()
+         report_html += commodity_html
+        except Exception as e:
+         log.error(f"Commodity tracker failed: {e}")
+         traceback.print_exc()
+
+        # Continue even if commodity API fails
         send_email(report_html, mode)
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
