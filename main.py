@@ -27,6 +27,9 @@ from position_sizing import apply_risk_management
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import log
+from commodity_tracker import CommodityTracker
+from config import GOLD_API_KEY
+
 import threading
 
 model_lock = threading.Lock()
@@ -701,6 +704,9 @@ def main(mode, use_llm):
             f.write(report_html)
         log.info("Report saved to report.html (DRY_RUN enabled)")
     else:
+        tracker = CommodityTracker(GOLD_API_KEY)
+        commodity_html = tracker.generate_html()
+        report_html += commodity_html
         send_email(report_html, mode)
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
