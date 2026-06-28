@@ -1,6 +1,5 @@
 name: SStock Scheduler Agent
 on:
-  schedule:
   workflow_dispatch:
 
 permissions:
