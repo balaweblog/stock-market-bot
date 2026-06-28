@@ -11,8 +11,15 @@ def send_email(body, html=False):
     msg["From"] = EMAIL_FROM
     msg["To"] = EMAIL_TO
 
+    recipients = [
+        email.strip()
+        for email in EMAIL_TO.split(",")
+        if email.strip()
+    ]
+
+
     server = smtplib.SMTP("smtp.gmail.com", 587)
     server.starttls()
     server.login(EMAIL_FROM, EMAIL_PASSWORD)
-    server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+    server.sendmail(EMAIL_FROM, recipients, msg.as_string())
     server.quit()
