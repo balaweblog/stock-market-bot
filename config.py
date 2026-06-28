@@ -9,6 +9,10 @@ STOCKS_JSON = os.getenv("STOCKS_JSON")
 STOCKS_CSV = os.getenv("STOCKS")
 GOLD_API_KEY = os.getenv("GOLD_API_KEY")
 
+
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
 STOCKS = {}
 
 if STOCKS_JSON:
@@ -28,7 +32,3 @@ elif STOCKS_CSV:
             STOCKS[name.strip()] = ticker.strip()
     except Exception as exc:
         raise ValueError(f"Invalid STOCKS environment variable: {exc}")
-
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GOLD_API_KEY = os.getenv("GOLD_API_KEY")
