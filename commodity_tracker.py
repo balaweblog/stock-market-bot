@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime, timedelta
+from config import GOLD_API_KEY
 
 
 class CommodityTracker:
@@ -302,5 +303,5 @@ class CommodityTracker:
 
 
 if __name__ == "__main__":
-    tracker = CommodityTracker("YOUR_GOLD_API_KEY")
+    tracker = CommodityTracker(GOLD_API_KEY)
     print(tracker.generate_html())

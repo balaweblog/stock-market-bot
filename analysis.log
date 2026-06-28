@@ -531,3 +531,6 @@
 2026-06-27 23:00:16 - stock_analyzer - ERROR - Commodity tracker failed: API Error: 403, {"error":"Monthly API quota exceeded. Upgrade to Unlimited reqs/month plan."}
 2026-06-27 23:00:21 - stock_analyzer - INFO - Email report sent successfully.
 2026-06-27 23:00:21 - stock_analyzer - INFO - Stock analysis run finished.
+2026-06-28 08:35:27 - stock_analyzer - INFO - Starting stock analysis run. Mode: eod, LLM Enabled: True
+2026-06-28 08:35:28 - stock_analyzer - INFO - Apple Silicon GPU (MPS) detected. Enabling hardware acceleration.
+2026-06-28 08:35:28 - stock_analyzer - INFO - Initializing high-quality local AI model (Qwen2.5-1.5B-Instruct)...
