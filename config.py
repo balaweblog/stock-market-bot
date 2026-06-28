@@ -7,7 +7,6 @@ EMAIL_TO = os.getenv("EMAIL_TO")
 
 STOCKS_JSON = os.getenv("STOCKS_JSON")
 STOCKS_CSV = os.getenv("STOCKS")
-GOLD_API_KEY = os.getenv("GOLD_API_KEY")
 
 
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")

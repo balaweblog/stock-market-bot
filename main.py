@@ -704,7 +704,7 @@ def main(mode, use_llm):
         log.info("Report saved to report.html (DRY_RUN enabled)")
     else:
         try:
-         tracker = CommodityTracker(os.getenv("GOLD_API_KEY"))
+         tracker = CommodityTracker()
          commodity_html = tracker.generate_html()
          report_html += commodity_html
         except Exception as e:

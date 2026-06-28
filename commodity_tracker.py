@@ -1,28 +1,31 @@
 import requests
 from datetime import datetime, timedelta
-from config import GOLD_API_KEY
-
+import yfinance as yf
 
 class CommodityTracker:
-    BASE_URL = "https://www.goldapi.io/api"
+    BASE_URL = "https://api.gold-api.com"
 
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.headers = {
-            "x-access-token": api_key,
-            "Content-Type": "application/json"
-        }
+    # Adjust to Indian retail market price
+    GOLD_MARKUP = 1.15
+    SILVER_MARKUP = 1.36
+    GOLD_KARAT = 22
+
+    def __init__(self, api_key=None):
+       pass
 
     # ---------------- API ----------------
     def call_api(self, endpoint):
         url = f"{self.BASE_URL}/{endpoint}"
-        response = requests.get(url, headers=self.headers)
+        response = requests.get(url, timeout=10)
 
         if response.status_code != 200:
             raise Exception(f"API Error: {response.status_code}, {response.text}")
 
         return response.json()
 
+    def adjust_gold_purity(self, price):
+        return round(price * self.GOLD_KARAT / 24, 2)
+    
     def oz_to_gram(self, price):
         return round(price / 31.1035, 2)
 
@@ -45,28 +48,74 @@ class CommodityTracker:
 
     # ---------------- Prices ----------------
     def fetch_current_prices(self):
-        gold = self.call_api("XAU/INR")
-        silver = self.call_api("XAG/INR")
+        usd_inr = self.usd_to_inr()
+
+        gold = self.call_api("price/XAU")
+        silver = self.call_api("price/XAG")
+
+        gold_price = gold["price"] * usd_inr
+        silver_price = silver["price"] * usd_inr
+
+        # Convert ounce -> gram
+        gold_per_gram = self.oz_to_gram(gold_price)
+        silver_per_gram = self.oz_to_gram(silver_price)
+
+        
+
+        gold_per_gram = round(gold_per_gram * self.GOLD_MARKUP, 2)
+        silver_per_gram = round(silver_per_gram * self.SILVER_MARKUP, 2)
+
+        gold_per_gram = self.adjust_gold_purity(gold_per_gram)
 
         return {
-            "gold": {"current": self.oz_to_gram(gold["price"])},
-            "silver": {"current": self.oz_to_gram(silver["price"])}
+            "gold": {"current": gold_per_gram},
+            "silver": {"current": silver_per_gram}
         }
+    def usd_to_inr(self):
+        url = "https://open.er-api.com/v6/latest/USD"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
 
+        data = response.json()
+
+        if "rates" not in data:
+            raise Exception(f"FX API Error: {data}")
+
+        return data["rates"]["INR"]
     # ---------------- Historical ----------------
     def fetch_history(self, symbol, days=7):
         history = []
 
-        for i in range(days, 0, -1):
-            dt = datetime.now() - timedelta(days=i)
-            date_str = dt.strftime("%Y%m%d")
+        usd_inr = self.usd_to_inr()
 
-            data = self.call_api(f"{symbol}/INR/{date_str}")
-            price = self.oz_to_gram(data["price"])
+        ticker = "GC=F" if symbol == "XAU" else "SI=F"
+
+        df = yf.download(
+            ticker,
+            period=f"{days + 2}d",
+            interval="1d",
+            progress=False
+        )
+
+        close_series = df["Close"].squeeze().dropna().tail(days)
+
+
+        for date, close in close_series.items():
+            price_inr = close.item() * usd_inr if hasattr(close, "item") else float(close) * usd_inr
+            price_per_gram = self.oz_to_gram(price_inr)
+
+            # Adjust to Indian retail market
+            if symbol == "XAU":
+                price_per_gram *= self.GOLD_MARKUP  # Gold markup
+                price_per_gram = self.adjust_gold_purity(price_per_gram)
+            else:
+                price_per_gram *= self.SILVER_MARKUP   # Silver markup
+
+            price_per_gram = round(price_per_gram, 2)
 
             history.append({
-                "date": self.format_date_short(date_str),
-                "price": price
+                "date": self.format_date_short(date.strftime("%Y%m%d")),
+                "price": price_per_gram
             })
 
         return history
@@ -148,9 +197,8 @@ class CommodityTracker:
 
         rows = ""
 
-        for i in range(len(gold["history"])):
-            g = gold["history"][i]
-            s = silver["history"][i]
+        for g, s in zip(reversed(gold["history"]), reversed(silver["history"])):
+            
 
             gold_color = "#16a34a" if g["change"] >= 0 else "#dc2626"
             silver_color = "#16a34a" if s["change"] >= 0 else "#dc2626"
@@ -222,7 +270,7 @@ class CommodityTracker:
                                 background:linear-gradient(135deg,#fff8dc,#fff3b0);
                                 padding:20px;
                                 border-radius:16px;">
-                                <div style="font-size:15px;font-weight:700;">Gold (24K)</div>
+                                <div style="font-size:15px;font-weight:700;">Gold (22K)</div>
                                 <div style="font-size:34px;font-weight:800;margin-top:8px;">
                                     ₹{gold['current']}
                                 </div>
@@ -291,7 +339,6 @@ class CommodityTracker:
                         <ul>
                             <li>Gold trend: {gold_trend}</li>
                             <li>Silver trend: {silver_trend}</li>
-                            <li>Market data sourced from GoldAPI</li>
                         </ul>
                     </div>
                 </div>
@@ -303,5 +350,5 @@ class CommodityTracker:
 
 
 if __name__ == "__main__":
-    tracker = CommodityTracker(GOLD_API_KEY)
+    tracker = CommodityTracker()
     print(tracker.generate_html())

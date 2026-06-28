@@ -1,7 +1,6 @@
 name: SStock Scheduler Agent
 on:
   schedule:
-    - cron: "35 8 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,7 +17,6 @@ jobs:
       NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       STOCKS_JSON: ${{ secrets.STOCKS_JSON }}
-      GOLD_API_KEY: ${{ secrets.GOLD_API_KEY }}
 
     steps:
       - name: Checkout source
