@@ -1,7 +1,6 @@
 import smtplib
 from email.mime.text import MIMEText
 from config import *
-import re
 
 
 def send_email(body, html=False):
@@ -10,26 +9,28 @@ def send_email(body, html=False):
     else:
         msg = MIMEText(body)
 
-    clean_email_to = EMAIL_TO.replace("\n", "").replace("\r", "")
+    recipients = parse_email_list(EMAIL_TO)
+    cc_recipients = parse_email_list(EMAIL_CC)
 
-    recipients = [
-        email.strip()
-        for email in clean_email_to.split(",")
-        if email.strip()
-    ]
-    EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
-
-    recipients = [e for e in recipients if re.match(EMAIL_REGEX, e)]
+    if not recipients:
+        print("No valid TO recipients found. Please set EMAIL_TO.")
+        return
 
     msg["Subject"] = "AI Stock Report"
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(recipients)
+    if cc_recipients:
+        msg["Cc"] = ", ".join(cc_recipients)
+
+    all_recipients = recipients + cc_recipients
 
     print("RAW EMAIL_TO:", repr(EMAIL_TO))
-    print("RECIPIENTS:", recipients)
+    print("RAW EMAIL_CC:", repr(EMAIL_CC))
+    print("TO RECIPIENTS:", recipients)
+    print("CC RECIPIENTS:", cc_recipients)
 
     server = smtplib.SMTP("smtp.gmail.com", 587)
     server.starttls()
     server.login(EMAIL_FROM, EMAIL_PASSWORD)
-    server.sendmail(EMAIL_FROM, recipients, msg.as_string())
+    server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
     server.quit()

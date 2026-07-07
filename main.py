@@ -411,6 +411,13 @@ def send_email(report_html, mode):
         )
         return
 
+    to_recipients = parse_email_list(EMAIL_TO)
+    cc_recipients = parse_email_list(EMAIL_CC)
+
+    if not to_recipients:
+        print("No valid TO recipients found. Please set EMAIL_TO with a comma-separated list of emails.")
+        return
+
     subject = " BlueOcean Stock Report"
     if mode == "real_time":
         subject = f"REAL-TIME: {subject}"
@@ -424,13 +431,17 @@ def send_email(report_html, mode):
     msg = MIMEText(report_html, "html")
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
+    msg["To"] = ", ".join(to_recipients)
+    if cc_recipients:
+        msg["Cc"] = ", ".join(cc_recipients)
+
+    all_recipients = to_recipients + cc_recipients
 
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
         server.login(EMAIL_FROM, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
         server.quit()
     except smtplib.SMTPAuthenticationError:
         print(

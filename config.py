@@ -1,9 +1,22 @@
 import os
 import json
+import re
 
 EMAIL_FROM = os.getenv("EMAIL_FROM")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_TO = os.getenv("EMAIL_TO")
+EMAIL_CC = os.getenv("EMAIL_CC")
+
+EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+
+
+def parse_email_list(value):
+    if not value:
+        return []
+
+    cleaned_value = value.replace("\n", "").replace("\r", "")
+    emails = [email.strip() for email in cleaned_value.split(",") if email.strip()]
+    return [email for email in emails if re.match(EMAIL_REGEX, email)]
 
 STOCKS_JSON = os.getenv("STOCKS_JSON")
 STOCKS_CSV = os.getenv("STOCKS")
