@@ -515,6 +515,12 @@ def process_stock(stock_name, ticker, use_llm=True):
         signal = decision(total_score)
 
         latest = df.iloc[-1]
+        prev_close = df.iloc[-2]["close"] if len(df) >= 2 else None
+        prev_close_change_pct = None
+        if prev_close is not None and prev_close != 0:
+            prev_close_change_pct = round(((latest["close"] - prev_close) / prev_close) * 100, 2)
+        prev_close_change_color = "#16a34a" if prev_close_change_pct is not None and prev_close_change_pct >= 0 else "#dc2626"
+        prev_close_change_text = f"{prev_close_change_pct:+.2f}%" if prev_close_change_pct is not None else "n/a"
         news_text = ", ".join(headlines[:3])
         
         # Get risk management data
@@ -580,6 +586,10 @@ def process_stock(stock_name, ticker, use_llm=True):
                         <tr>
                             <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
                             <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;"><strong>Prev Close</strong><div style="color:#0f172a;margin-top:4px;">{prev_close if prev_close is not None else 'n/a'}</div></td>
+                            <td style="padding:6px 0;"><strong>Change vs Prev</strong><div style="color:{prev_close_change_color};margin-top:4px;">{prev_close_change_text}</div></td>
                         </tr>
                         <tr>
                             <td style="padding:6px 0;"><strong>Entry Edge</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['price_vs_ema20_pct']:+.1f}% vs EMA20 / {entry_context['price_vs_ema50_pct']:+.1f}% vs EMA50</div></td>
