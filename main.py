@@ -24,6 +24,7 @@ from news_engine import get_news
 from sentiment_score import score_headlines
 from scorer import final_score, decision
 from position_sizing import apply_risk_management
+from recommendation_logic import choose_stock_entry
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import log
@@ -341,97 +342,7 @@ def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamental
 
 
 def get_recommended_entry(signal, total_score, latest, market_context, entry_context):
-    trend_text = str(market_context.get("trend", "")).lower()
-    bullish = any(token in trend_text for token in ["up", "positive", "bull", "strong", "rise", "recovery"])
-    bearish = any(token in trend_text for token in ["down", "negative", "bear", "weak", "decline"])
-
-    if signal.lower() in {"sell"} or total_score < 55:
-        return "patient_entry"
-
-    if bearish:
-        return "patient_entry"
-
-    adx = latest.get("adx")
-    rsi = latest.get("rsi")
-    volume_ratio = entry_context.get("volume_vs_avg_pct", 0) or 0
-    rr = entry_context.get("risk_reward_ratio", 0) or 0
-    price_vs_ema20 = entry_context.get("price_vs_ema20_pct", 0) or 0
-    price_vs_ema50 = entry_context.get("price_vs_ema50_pct", 0) or 0
-
-    scores = {
-        "patient_entry": 0,
-        "optimal_entry": 0,
-        "aggressive_entry": 0,
-    }
-
-    # Base score from overall signal strength
-    scores["patient_entry"] += max(0, 70 - total_score) * 0.25
-    scores["optimal_entry"] += min(25, total_score * 0.25)
-    scores["aggressive_entry"] += min(25, total_score * 0.28)
-
-    # Trend bias
-    if bullish:
-        scores["optimal_entry"] += 8
-        scores["aggressive_entry"] += 10
-    else:
-        scores["patient_entry"] += 12
-
-    # Trend strength
-    if adx is not None:
-        if adx >= 25:
-            scores["aggressive_entry"] += 14
-            scores["optimal_entry"] += 8
-        elif adx >= 20:
-            scores["optimal_entry"] += 10
-        else:
-            scores["patient_entry"] += 8
-
-    # Momentum quality
-    if rsi is not None:
-        if 45 <= rsi <= 70:
-            scores["optimal_entry"] += 8
-            scores["aggressive_entry"] += 4
-        elif rsi > 70:
-            scores["patient_entry"] += 8
-        else:
-            scores["patient_entry"] += 4
-
-    # Volume confirmation
-    if volume_ratio >= 12:
-        scores["aggressive_entry"] += 12
-        scores["optimal_entry"] += 6
-    elif volume_ratio >= 6:
-        scores["optimal_entry"] += 8
-    else:
-        scores["patient_entry"] += 8
-
-    # Reward-to-risk quality
-    if rr >= 1.8:
-        scores["aggressive_entry"] += 12
-        scores["optimal_entry"] += 6
-    elif rr >= 1.2:
-        scores["optimal_entry"] += 8
-    else:
-        scores["patient_entry"] += 10
-
-    # Price location relative to moving averages
-    if price_vs_ema20 >= 0 and price_vs_ema50 >= 0:
-        scores["aggressive_entry"] += 8
-        scores["optimal_entry"] += 4
-    elif price_vs_ema20 >= -3 and price_vs_ema50 >= -4:
-        scores["optimal_entry"] += 8
-    else:
-        scores["patient_entry"] += 10
-
-    # Penalize aggressive if setup is not clean enough
-    if total_score < 80 or (rsi is not None and rsi > 75) or volume_ratio < 8 or rr < 1.5:
-        scores["aggressive_entry"] -= 15
-
-    # Penalize optimal if the setup is too extended or weak
-    if total_score < 65 or price_vs_ema20 < -5 or price_vs_ema50 < -6:
-        scores["optimal_entry"] -= 8
-
-    return max(scores, key=scores.get)
+    return choose_stock_entry(signal, total_score, latest, market_context, entry_context)
 
 
 def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines, risk_data, entry_context=None):
