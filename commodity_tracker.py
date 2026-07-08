@@ -189,6 +189,90 @@ class CommodityTracker:
         </span>
         """
 
+    def buy_signal(self, history, label):
+        if len(history) < 3:
+            return ""
+
+        recent_changes = [row["change"] for row in history[-3:]]
+        latest_change = recent_changes[-1]
+        prev_change = recent_changes[-2]
+        older_change = recent_changes[-3]
+
+        score = 0
+        if latest_change <= -1.5:
+            score += 4
+        if latest_change <= -2.5:
+            score += 4
+        if prev_change <= -1.0:
+            score += 2
+        if older_change <= -1.0:
+            score += 1
+        if latest_change < prev_change:
+            score += 2
+        if latest_change < 0:
+            score += 1
+
+        if score >= 8:
+            return f"""
+            <div style="margin-top:10px;display:inline-block;padding:6px 10px;border-radius:999px;background:#dcfce7;color:#166534;font-weight:700;font-size:12px;">
+                Buy {label}
+            </div>
+            """
+        return ""
+
+    def derive_buy_levels(self, current_price, history):
+        if not history:
+            return {
+                "patient_entry": round(current_price * 0.98, 2),
+                "optimal_entry": round(current_price, 2),
+                "aggressive_entry": round(current_price * 1.02, 2),
+            }
+
+        recent_changes = [row["change"] for row in history[-3:]]
+        latest_change = recent_changes[-1]
+        prev_change = recent_changes[-2]
+        older_change = recent_changes[-3]
+
+        score = 0
+        if latest_change <= -1.5:
+            score += 2
+        if latest_change <= -2.5:
+            score += 2
+        if prev_change <= -1.0:
+            score += 1
+        if older_change <= -1.0:
+            score += 1
+        if latest_change < prev_change:
+            score += 1
+        if latest_change < 0:
+            score += 1
+
+        if score >= 6:
+            recommended = "patient_entry"
+            patient_discount = 0.03
+            optimal_discount = 0.015
+            aggressive_premium = 0.015
+        elif score >= 4:
+            recommended = "optimal_entry"
+            patient_discount = 0.025
+            optimal_discount = 0.01
+            aggressive_premium = 0.012
+        else:
+            recommended = "aggressive_entry"
+            patient_discount = 0.02
+            optimal_discount = 0.005
+            aggressive_premium = 0.008
+
+        buy_levels = {
+            "patient_entry": round(current_price * (1 - patient_discount), 2),
+            "optimal_entry": round(current_price * (1 - optimal_discount), 2),
+            "aggressive_entry": round(current_price * (1 + aggressive_premium), 2),
+        }
+        buy_levels["recommended_entry"] = recommended
+        buy_levels["recommended_entry_label"] = recommended.replace("_", " ").title()
+        buy_levels["recommended_buy_level"] = buy_levels[recommended]
+        return buy_levels
+
     # ---------------- HTML ----------------
     def generate_html(self):
         data = self.get_commodity_data()
@@ -241,6 +325,9 @@ class CommodityTracker:
             else '<span style="color:#dc2626;font-weight:700;">Bearish ↘</span>'
         )
 
+        gold_levels = self.derive_buy_levels(gold["current"], gold["history"])
+        silver_levels = self.derive_buy_levels(silver["current"], silver["history"])
+
         html = f"""
         <div style="
             margin-top:24px;
@@ -276,6 +363,11 @@ class CommodityTracker:
                                 </div>
                                 <div style="margin-top:10px;">
                                     {self.badge(gold['change'])}
+                                    {self.buy_signal(gold['history'], 'Gold')}
+                                </div>
+                                <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#fffdf7;border:1px solid #f3e8b2;font-size:12px;color:#334155;">
+                                    <div style="font-weight:700;color:#047857;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']}</div>
+                                    <div style="margin-top:4px;">Patient: ₹{gold_levels['patient_entry']} • Optimal: ₹{gold_levels['optimal_entry']} • Aggressive: ₹{gold_levels['aggressive_entry']}</div>
                                 </div>
                             </div>
                         </td>
@@ -291,6 +383,11 @@ class CommodityTracker:
                                 </div>
                                 <div style="margin-top:10px;">
                                     {self.badge(silver['change'])}
+                                    {self.buy_signal(silver['history'], 'Silver')}
+                                </div>
+                                <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:12px;color:#334155;">
+                                    <div style="font-weight:700;color:#047857;">Recommended {silver_levels['recommended_entry_label']}: ₹{silver_levels['recommended_buy_level']}</div>
+                                    <div style="margin-top:4px;">Patient: ₹{silver_levels['patient_entry']} • Optimal: ₹{silver_levels['optimal_entry']} • Aggressive: ₹{silver_levels['aggressive_entry']}</div>
                                 </div>
                             </div>
                         </td>

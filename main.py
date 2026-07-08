@@ -340,7 +340,101 @@ def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamental
     return round(max(0, min(100, total)), 2)
 
 
-def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines, risk_data):
+def get_recommended_entry(signal, total_score, latest, market_context, entry_context):
+    trend_text = str(market_context.get("trend", "")).lower()
+    bullish = any(token in trend_text for token in ["up", "positive", "bull", "strong", "rise", "recovery"])
+    bearish = any(token in trend_text for token in ["down", "negative", "bear", "weak", "decline"])
+
+    if signal.lower() in {"sell"} or total_score < 55:
+        return "patient_entry"
+
+    if bearish:
+        return "patient_entry"
+
+    adx = latest.get("adx")
+    rsi = latest.get("rsi")
+    volume_ratio = entry_context.get("volume_vs_avg_pct", 0) or 0
+    rr = entry_context.get("risk_reward_ratio", 0) or 0
+    price_vs_ema20 = entry_context.get("price_vs_ema20_pct", 0) or 0
+    price_vs_ema50 = entry_context.get("price_vs_ema50_pct", 0) or 0
+
+    scores = {
+        "patient_entry": 0,
+        "optimal_entry": 0,
+        "aggressive_entry": 0,
+    }
+
+    # Base score from overall signal strength
+    scores["patient_entry"] += max(0, 70 - total_score) * 0.25
+    scores["optimal_entry"] += min(25, total_score * 0.25)
+    scores["aggressive_entry"] += min(25, total_score * 0.28)
+
+    # Trend bias
+    if bullish:
+        scores["optimal_entry"] += 8
+        scores["aggressive_entry"] += 10
+    else:
+        scores["patient_entry"] += 12
+
+    # Trend strength
+    if adx is not None:
+        if adx >= 25:
+            scores["aggressive_entry"] += 14
+            scores["optimal_entry"] += 8
+        elif adx >= 20:
+            scores["optimal_entry"] += 10
+        else:
+            scores["patient_entry"] += 8
+
+    # Momentum quality
+    if rsi is not None:
+        if 45 <= rsi <= 70:
+            scores["optimal_entry"] += 8
+            scores["aggressive_entry"] += 4
+        elif rsi > 70:
+            scores["patient_entry"] += 8
+        else:
+            scores["patient_entry"] += 4
+
+    # Volume confirmation
+    if volume_ratio >= 12:
+        scores["aggressive_entry"] += 12
+        scores["optimal_entry"] += 6
+    elif volume_ratio >= 6:
+        scores["optimal_entry"] += 8
+    else:
+        scores["patient_entry"] += 8
+
+    # Reward-to-risk quality
+    if rr >= 1.8:
+        scores["aggressive_entry"] += 12
+        scores["optimal_entry"] += 6
+    elif rr >= 1.2:
+        scores["optimal_entry"] += 8
+    else:
+        scores["patient_entry"] += 10
+
+    # Price location relative to moving averages
+    if price_vs_ema20 >= 0 and price_vs_ema50 >= 0:
+        scores["aggressive_entry"] += 8
+        scores["optimal_entry"] += 4
+    elif price_vs_ema20 >= -3 and price_vs_ema50 >= -4:
+        scores["optimal_entry"] += 8
+    else:
+        scores["patient_entry"] += 10
+
+    # Penalize aggressive if setup is not clean enough
+    if total_score < 80 or (rsi is not None and rsi > 75) or volume_ratio < 8 or rr < 1.5:
+        scores["aggressive_entry"] -= 15
+
+    # Penalize optimal if the setup is too extended or weak
+    if total_score < 65 or price_vs_ema20 < -5 or price_vs_ema50 < -6:
+        scores["optimal_entry"] -= 8
+
+    return max(scores, key=scores.get)
+
+
+def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines, risk_data, entry_context=None):
     # Fallback summary generation
     def _get_fallback_reason():
         headline_summary = headlines[:2]
@@ -352,30 +446,41 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
             f"Recent headlines: {headline_text}."
         )
 
-    # New prompt for the swing trader persona
+    entry_context = entry_context or {}
+    price_vs_ema20 = entry_context.get("price_vs_ema20_pct", "n/a")
+    price_vs_ema50 = entry_context.get("price_vs_ema50_pct", "n/a")
+    volume_vs_avg = entry_context.get("volume_vs_avg_pct", "n/a")
+    risk_reward = entry_context.get("risk_reward_ratio", "n/a")
+    current_price = entry_context.get("current_price", round(latest['close'], 2))
+
+    # High-quality prompt for a professional swing-trading analysis
     prompt = (
-        f"As a professional swing trader, provide a concise, actionable trade plan for {stock_name} ({ticker}). "
-        f"The analysis must be brief, data-driven, and focused on the next 1-10 trading sessions. "
-        f"Synthesize the following data into a clear trade setup:\n\n"
+        f"Act as a veteran swing trader managing real capital. Deliver a high-conviction trade plan for {stock_name} ({ticker}) focused on the next 1-10 trading sessions. "
+        f"Be direct, professional, and actionable, and treat this as a real decision-making brief rather than a generic summary.\n\n"
         f"**Trade Context:**\n"
         f"- Overall Signal: {signal}\n"
+        f"- Current Market Price: {current_price}\n"
         f"- Technical Score: {tech_score}\n"
-        f"- Key Price Levels: Close Price: {round(latest['close'], 2)}, EMA20: {round(latest['ema20'], 2)}, EMA50: {round(latest['ema50'], 2)}\n"
+        f"- Key Price Levels: EMA20: {round(latest['ema20'], 2)}, EMA50: {round(latest['ema50'], 2)}, EMA200: {round(latest['ema200'], 2)}\n"
+        f"- Price vs EMA20 / EMA50: {price_vs_ema20} / {price_vs_ema50}\n"
+        f"- Volume vs 20D Avg: {volume_vs_avg}\n"
+        f"- Risk/Reward Ratio: {risk_reward}\n"
         f"- Momentum: RSI at {round(latest['rsi'], 2)}; ADX at {round(latest['adx'], 2)}\n"
         f"- Sentiment: {sentiment_label} ({round(sentiment_score, 2)})\n\n"
         f"**Pre-calculated Risk Levels:**\n"
-        f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']}\n"
-        f"- Optimal Entry: {risk_data['buy_levels']['optimal_entry']}\n"
-        f"- Patient Entry: {risk_data['buy_levels']['patient_entry']}\n"
+        f"- Patient Entry: {risk_data['buy_levels']['patient_entry']} (best for a pullback or discount entry)\n"
+        f"- Optimal Entry: {risk_data['buy_levels']['optimal_entry']} (best for a retest or confirmation entry)\n"
+        f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']} (only for breakout momentum or a strong trend continuation)\n"
         f"- Stop-Loss: {risk_data['stop_loss']}\n"
         f"- Profit Target: {risk_data['target']}\n\n"
-        f"**Instructions for Swing Trader:**\n"
-        f"1. **Trade Thesis:** Start with a one-sentence thesis describing the technical setup (e.g., 'The stock is showing bullish continuation as it holds above the 20-day EMA...').\n"
-        f"2. **Optimal Timing:** Based on the chart, what is the ideal timing or condition for entry? (e.g., 'Entry is ideal on a brief pullback to the 20-day EMA,' or 'Wait for a high-volume breakout above the recent highs.').\n"
-        f"3. **Action Plan:** Clearly state the plan. Use the pre-calculated levels. (e.g., 'The plan is to buy on a dip into the patient entry zone around {risk_data['buy_levels']['patient_entry']}...').\n"
-        f"4. **Risk Management:** Specify the exit strategy. (e.g., 'The trade is invalidated if the price breaks below the stop-loss at {risk_data['stop_loss']}...').\n"
-        f"5. **Confirmation Signal:** What near-term event would confirm the trade's strength? (e.g., 'A move above the recent high of {round(latest['high20'], 2)} would confirm momentum.').\n"
-        f"6. **Tone & Format:** Be decisive and clear. Output a single, concise paragraph. No conversational language or disclaimers."
+        f"**Instructions for a Pro Swing Trader:**\n"
+        f"1. **Trade Thesis:** Write one crisp sentence that states the setup and expected move.\n"
+        f"2. **Entry Plan:** State the best entry style as Patient, Optimal, or Aggressive and name the exact level to use.\n"
+        f"3. **Positioning:** Say whether to buy full size, scale in, or wait for confirmation.\n"
+        f"4. **Risk Management:** State the stop-loss, invalidation point, and why the risk is controlled.\n"
+        f"5. **Exit Plan:** State the profit target and the event that would weaken the setup.\n"
+        f"6. **Confirmation Signal:** Name one near-term trigger that would confirm the trade.\n"
+        f"7. **Format:** Output in a clean structure with short bullets or labeled sections. Keep it concise, factual, and trading-focused. Do not use filler, fluff, or disclaimers."
     )
 
     generator = init_llm_generator()
@@ -422,11 +527,14 @@ def send_email(report_html, mode):
     if mode == "real_time":
         subject = f"REAL-TIME: {subject}"
     elif mode == "eod":
-        subject = f"EOD: {subject}"
+        subject = f"DAILY: {subject}"
 
-    # Append the formatted date
-    formatted_date = get_date_with_suffix(datetime.now())
-    subject += f" - {formatted_date}"
+    # Append the formatted date and current time in IST
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+    formatted_date = get_date_with_suffix(now_ist)
+    formatted_time = now_ist.strftime("%I:%M %p")
+    subject += f" - {formatted_date} {formatted_time} IST"
 
     msg = MIMEText(report_html, "html")
     msg["Subject"] = subject
@@ -501,6 +609,19 @@ def process_stock(stock_name, ticker, use_llm=True):
         # Get risk management data
         risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
 
+        entry_context = {
+            "current_price": round(latest["close"], 2),
+            "price_vs_ema20_pct": round(((latest["close"] - latest["ema20"]) / latest["ema20"]) * 100, 2) if pd.notna(latest["ema20"]) and latest["ema20"] else None,
+            "price_vs_ema50_pct": round(((latest["close"] - latest["ema50"]) / latest["ema50"]) * 100, 2) if pd.notna(latest["ema50"]) and latest["ema50"] else None,
+            "volume_vs_avg_pct": round(((latest["volume"] - latest["vol_avg"]) / latest["vol_avg"]) * 100, 2) if pd.notna(latest["vol_avg"]) and latest["vol_avg"] else None,
+            "risk_reward_ratio": round((risk_data["target"] - latest["close"]) / max(latest["close"] - risk_data["stop_loss"], 1e-6), 2) if latest["close"] > risk_data["stop_loss"] else None,
+        }
+
+        recommended_entry = get_recommended_entry(signal, total_score, latest, market_context, entry_context)
+        risk_data["recommended_entry"] = recommended_entry
+        risk_data["recommended_entry_label"] = recommended_entry.replace("_", " ").title()
+        risk_data["recommended_buy_level"] = risk_data["buy_levels"][recommended_entry]
+
         llm_reason = generate_llm_reasoning(
             stock_name,
             ticker,
@@ -513,6 +634,7 @@ def process_stock(stock_name, ticker, use_llm=True):
             signal,
             headlines,
             risk_data,
+            entry_context,
         )
 
         if "sell" in signal.lower():
@@ -541,12 +663,16 @@ def process_stock(stock_name, ticker, use_llm=True):
                     </table>
                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
                         <tr>
-                            <td style="padding:6px 0;width:50%;"><strong>Close</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
+                            <td style="padding:6px 0;width:50%;"><strong>Current Price</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
                             <td style="padding:6px 0;width:50%;"><strong>EMA20 / EMA50</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema20'],2)} / {round(latest['ema50'],2)}</div></td>
                         </tr>
                         <tr>
                             <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
                             <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
+                        </tr>
+                        <tr>
+                            <td style="padding:6px 0;"><strong>Entry Edge</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['price_vs_ema20_pct']:+.1f}% vs EMA20 / {entry_context['price_vs_ema50_pct']:+.1f}% vs EMA50</div></td>
+                            <td style="padding:6px 0;"><strong>Volume / RR</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['volume_vs_avg_pct']:+.1f}% vol / {entry_context['risk_reward_ratio']}:1 RR</div></td>
                         </tr>
                         <tr>
                             <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
@@ -560,9 +686,12 @@ def process_stock(stock_name, ticker, use_llm=True):
                             <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
                                 <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
                                 <div style="font-size:12px;color:#0f172a;margin-top:4px;">
-                                    Patient: <strong>{risk_data['buy_levels']['patient_entry']}</strong> &bull;
-                                    Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
-                                    Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
+                                    <span style="color:#047857;font-weight:700;">Recommended {risk_data['recommended_entry_label']}: <strong>{risk_data['recommended_buy_level']}</strong></span>
+                                    <div style="margin-top:4px;color:#64748b;">
+                                        Patient: <strong>{risk_data['buy_levels']['patient_entry']}</strong> &bull;
+                                        Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
+                                        Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
+                                    </div>
                                 </div>
                             </td>
                         </tr>
