@@ -171,6 +171,35 @@ class CommodityTracker:
 
         return current
 
+    def build_trade_plan(self, current_price, history, levels):
+        entry_low = round(min(levels["patient_entry"], levels["optimal_entry"], levels["aggressive_entry"]), 2)
+        entry_high = round(max(levels["patient_entry"], levels["optimal_entry"], levels["aggressive_entry"]), 2)
+        stop_loss = round(min(entry_low, current_price) * 0.985, 2)
+        target = round(max(entry_high, current_price) * 1.02, 2)
+
+        if not history:
+            bias = "Neutral"
+        else:
+            latest_change = history[-1].get("change", 0)
+            prev_change = history[-2].get("change", 0) if len(history) > 1 else 0
+            if latest_change >= 0 and latest_change >= prev_change:
+                bias = "Bullish"
+            elif latest_change < 0 and latest_change <= prev_change:
+                bias = "Bearish"
+            else:
+                bias = "Neutral"
+
+        risk_reward = round((target - current_price) / max(current_price - stop_loss, 0.01), 2)
+
+        return {
+            "bias": bias,
+            "entry_low": entry_low,
+            "entry_high": entry_high,
+            "stop_loss": stop_loss,
+            "target": target,
+            "risk_reward": risk_reward,
+        }
+
     # ---------------- Badge ----------------
     def badge(self, change):
         color = "#16a34a" if change >= 0 else "#dc2626"
@@ -237,8 +266,8 @@ class CommodityTracker:
             gold_rows += f"""
             <tr style="border-bottom:1px solid #f1f5f9;">
                 <td style="padding:12px;">{g['date']}</td>
-                <td>₹{g['price']}</td>
-                <td style="color:{gold_color};font-weight:700;">{gold_sign}{g['change']}%</td>
+                <td>₹{g['price']:.2f}</td>
+                <td style="color:{gold_color};font-weight:700;">{gold_sign}{g['change']:.2f}%</td>
             </tr>
             """
 
@@ -249,8 +278,8 @@ class CommodityTracker:
             silver_rows += f"""
             <tr style="border-bottom:1px solid #f1f5f9;">
                 <td style="padding:12px;">{s['date']}</td>
-                <td>₹{s['price']}</td>
-                <td style="color:{silver_color};font-weight:700;">{silver_sign}{s['change']}%</td>
+                <td>₹{s['price']:.2f}</td>
+                <td style="color:{silver_color};font-weight:700;">{silver_sign}{s['change']:.2f}%</td>
             </tr>
             """
 
@@ -259,6 +288,8 @@ class CommodityTracker:
 
         gold_levels = self.derive_buy_levels(gold["current"], gold["history"])
         silver_levels = self.derive_buy_levels(silver["current"], silver["history"])
+        gold_plan = self.build_trade_plan(gold["current"], gold["history"], gold_levels)
+        silver_plan = self.build_trade_plan(silver["current"], silver["history"], silver_levels)
 
         html = f"""
         <div style="
@@ -271,46 +302,124 @@ class CommodityTracker:
                 <div style="font-size:13px;color:#64748b;margin-top:6px;line-height:1.5;">Separate Gold and Silver sections for a cleaner, professional layout.</div>
             </div>
 
-            <div style="padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px;">
-                <!-- Gold Section -->
-                <div style="background:#ffffff;border-radius:14px;border:1px solid #e5e7eb;padding:16px;">
-                    <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">Gold (22K)</div>
-                    <div style="font-size:28px;font-weight:800;color:#111827;margin-top:8px;">₹{gold['current']}</div>
-                    <div style="margin-top:10px;">{self.badge(gold['change'])} {self.buy_signal(gold['history'], 'Gold')}</div>
-                    <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#fffdf7;border:1px solid #f3e8b2;font-size:12px;color:#334155;line-height:1.5;">
-                        <div style="font-weight:700;color:#047857;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']}</div>
-                        <div style="margin-top:4px;">Patient: ₹{gold_levels['patient_entry']} • Optimal: ₹{gold_levels['optimal_entry']} • Aggressive: ₹{gold_levels['aggressive_entry']}</div>
-                    </div>
+            <div style="padding:20px;">
+                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
+                    <tr>
+                        <td style="padding:14px;">
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                                <tr>
+                                    <td style="vertical-align:top;">
+                                        <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">Gold (22K)</h3>
+                                        <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">{self.badge(gold['change'])} {self.buy_signal(gold['history'], 'Gold')}</div>
+                                    </td>
+                                    <td style="width:140px;text-align:right;vertical-align:top;">
+                                        <div style="font-size:13px;color:#64748b;">Current Price</div>
+                                        <div style="margin-top:4px;font-size:16px;font-weight:700;color:#111827;">₹{gold['current']:.2f}</div>
+                                    </td>
+                                </tr>
+                            </table>
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
+                                <tr>
+                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                        <div style="margin-top:4px;padding:12px 12px;border-radius:12px;background:linear-gradient(135deg,#fef3c7,#fff7ed);border:1px solid #fcd34d;box-shadow:0 1px 2px rgba(15,23,42,0.06);">
+                                            <div style="font-size:11px;font-weight:800;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">Recommendation</div>
+                                            <div style="margin-top:6px;font-size:12px;color:#0f172a;line-height:1.5;">
+                                                <span style="display:inline-block;padding:4px 8px;border-radius:999px;background:#fff7ed;color:#b45309;font-weight:700;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']:.2f}</span>
+                                                <div style="margin-top:8px;color:#475569;">
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #fde68a;margin-right:6px;margin-bottom:4px;">Patient: ₹{gold_levels['patient_entry']:.2f}</span>
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #fde68a;margin-right:6px;margin-bottom:4px;">Optimal: ₹{gold_levels['optimal_entry']:.2f}</span>
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #fde68a;margin-bottom:4px;">Aggressive: ₹{gold_levels['aggressive_entry']:.2f}</span>
+                                                </div>
+                                            </div>
+                                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:12px;color:#334155;">
+                                                <tr>
+                                                    <td style="padding:4px 0;width:50%;"><strong>Bias</strong><div style="color:#0f172a;margin-top:2px;">{gold_plan['bias']}</div></td>
+                                                    <td style="padding:4px 0;width:50%;"><strong>Entry Zone</strong><div style="color:#0f172a;margin-top:2px;">₹{gold_plan['entry_low']:.2f} - ₹{gold_plan['entry_high']:.2f}</div></td>
+                                                </tr>
+                                                <tr>
+                                                    <td style="padding:4px 0;"><strong>Stop Loss</strong><div style="color:#dc2626;margin-top:2px;">₹{gold_plan['stop_loss']:.2f}</div></td>
+                                                    <td style="padding:4px 0;"><strong>Target</strong><div style="color:#047857;margin-top:2px;">₹{gold_plan['target']:.2f}</div></td>
+                                                </tr>
+                                            </table>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                        <div style="font-size:13px;color:#475569;"><strong>History</strong></div>
+                                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:8px;font-size:13px;color:#475569;">
+                                            <tr style="background:#f8fafc;">
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
+                                            </tr>
+                                            {gold_rows}
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                </table>
 
-                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px;border-collapse:collapse;font-size:13px;color:#334155;">
-                        <tr style="background:#f8fafc;">
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
-                        </tr>
-                        {gold_rows}
-                    </table>
-                </div>
-
-                <!-- Silver Section -->
-                <div style="background:#ffffff;border-radius:14px;border:1px solid #e5e7eb;padding:16px;">
-                    <div style="font-size:13px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.04em;">Silver</div>
-                    <div style="font-size:28px;font-weight:800;color:#111827;margin-top:8px;">₹{silver['current']}</div>
-                    <div style="margin-top:10px;">{self.badge(silver['change'])} {self.buy_signal(silver['history'], 'Silver')}</div>
-                    <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:12px;color:#334155;line-height:1.5;">
-                        <div style="font-weight:700;color:#047857;">Recommended {silver_levels['recommended_entry_label']}: ₹{silver_levels['recommended_buy_level']}</div>
-                        <div style="margin-top:4px;">Patient: ₹{silver_levels['patient_entry']} • Optimal: ₹{silver_levels['optimal_entry']} • Aggressive: ₹{silver_levels['aggressive_entry']}</div>
-                    </div>
-
-                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px;border-collapse:collapse;font-size:13px;color:#334155;">
-                        <tr style="background:#f8fafc;">
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
-                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
-                        </tr>
-                        {silver_rows}
-                    </table>
-                </div>
+                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
+                    <tr>
+                        <td style="padding:14px;">
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                                <tr>
+                                    <td style="vertical-align:top;">
+                                        <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">Silver</h3>
+                                        <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">{self.badge(silver['change'])} {self.buy_signal(silver['history'], 'Silver')}</div>
+                                    </td>
+                                    <td style="width:140px;text-align:right;vertical-align:top;">
+                                        <div style="font-size:13px;color:#64748b;">Current Price</div>
+                                        <div style="margin-top:4px;font-size:16px;font-weight:700;color:#111827;">₹{silver['current']:.2f}</div>
+                                    </td>
+                                </tr>
+                            </table>
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
+                                <tr>
+                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                        <div style="margin-top:4px;padding:12px 12px;border-radius:12px;background:linear-gradient(135deg,#eff6ff,#f8fafc);border:1px solid #93c5fd;box-shadow:0 1px 2px rgba(15,23,42,0.06);">
+                                            <div style="font-size:11px;font-weight:800;color:#1d4ed8;text-transform:uppercase;letter-spacing:0.04em;">Recommendation</div>
+                                            <div style="margin-top:6px;font-size:12px;color:#0f172a;line-height:1.5;">
+                                                <span style="display:inline-block;padding:4px 8px;border-radius:999px;background:#eff6ff;color:#2563eb;font-weight:700;">Recommended {silver_levels['recommended_entry_label']}: ₹{silver_levels['recommended_buy_level']:.2f}</span>
+                                                <div style="margin-top:8px;color:#475569;">
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #bfdbfe;margin-right:6px;margin-bottom:4px;">Patient: ₹{silver_levels['patient_entry']:.2f}</span>
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #bfdbfe;margin-right:6px;margin-bottom:4px;">Optimal: ₹{silver_levels['optimal_entry']:.2f}</span>
+                                                    <span style="display:inline-block;padding:3px 8px;border-radius:999px;background:#ffffff;border:1px solid #bfdbfe;margin-bottom:4px;">Aggressive: ₹{silver_levels['aggressive_entry']:.2f}</span>
+                                                </div>
+                                            </div>
+                                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:12px;color:#334155;">
+                                                <tr>
+                                                    <td style="padding:4px 0;width:50%;"><strong>Bias</strong><div style="color:#0f172a;margin-top:2px;">{silver_plan['bias']}</div></td>
+                                                    <td style="padding:4px 0;width:50%;"><strong>Entry Zone</strong><div style="color:#0f172a;margin-top:2px;">₹{silver_plan['entry_low']:.2f} - ₹{silver_plan['entry_high']:.2f}</div></td>
+                                                </tr>
+                                                <tr>
+                                                    <td style="padding:4px 0;"><strong>Stop Loss</strong><div style="color:#dc2626;margin-top:2px;">₹{silver_plan['stop_loss']:.2f}</div></td>
+                                                    <td style="padding:4px 0;"><strong>Target</strong><div style="color:#047857;margin-top:2px;">₹{silver_plan['target']:.2f}</div></td>
+                                                </tr>
+                                            </table>
+                                        </div>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                        <div style="font-size:13px;color:#475569;"><strong>History</strong></div>
+                                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:8px;font-size:13px;color:#475569;">
+                                            <tr style="background:#f8fafc;">
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
+                                                <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
+                                            </tr>
+                                            {silver_rows}
+                                        </table>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                </table>
             </div>
 
             <div style="padding:16px 20px 20px;border-top:1px solid #e5e7eb;background:transparent;border-radius:0 0 12px 12px;margin-top:12px;">

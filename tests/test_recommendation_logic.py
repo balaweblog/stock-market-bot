@@ -1,5 +1,6 @@
 import unittest
 
+from commodity_tracker import CommodityTracker
 from position_sizing import apply_risk_management
 from recommendation_logic import derive_commodity_buy_levels
 
@@ -33,6 +34,27 @@ class RecommendationLogicTests(unittest.TestCase):
         self.assertLess(levels["patient_entry"], 94.5)
         self.assertLess(levels["optimal_entry"], 94.5)
         self.assertGreater(levels["aggressive_entry"], 94.5)
+
+    def test_trade_plan_builds_actionable_levels(self):
+        tracker = CommodityTracker()
+        levels = {
+            "patient_entry": 95.0,
+            "optimal_entry": 97.0,
+            "aggressive_entry": 100.0,
+        }
+        history = [
+            {"price": 96.0, "change": -0.5},
+            {"price": 97.0, "change": 0.2},
+            {"price": 98.0, "change": 1.1},
+        ]
+
+        plan = tracker.build_trade_plan(98.0, history, levels)
+
+        self.assertEqual(plan["entry_low"], 95.0)
+        self.assertEqual(plan["entry_high"], 100.0)
+        self.assertGreater(plan["stop_loss"], 0)
+        self.assertGreater(plan["target"], 98.0)
+        self.assertIn(plan["bias"], {"Bullish", "Bearish", "Neutral"})
 
 
 if __name__ == "__main__":
