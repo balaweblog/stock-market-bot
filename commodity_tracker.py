@@ -62,8 +62,6 @@ class CommodityTracker:
         gold_per_gram = self.oz_to_gram(gold_price)
         silver_per_gram = self.oz_to_gram(silver_price)
 
-        
-
         gold_per_gram = round(gold_per_gram * self.GOLD_MARKUP, 2)
         silver_per_gram = round(silver_per_gram * self.SILVER_MARKUP, 2)
 
@@ -231,173 +229,92 @@ class CommodityTracker:
         gold = data["gold"]
         silver = data["silver"]
 
-        rows = ""
-
-        for g, s in zip(reversed(gold["history"]), reversed(silver["history"])):
-            
-
+        # Build separate history rows for Gold and Silver for clearer, split sections
+        gold_rows = ""
+        for g in reversed(gold["history"]):
             gold_color = "#16a34a" if g["change"] >= 0 else "#dc2626"
-            silver_color = "#16a34a" if s["change"] >= 0 else "#dc2626"
-
             gold_sign = "+" if g["change"] > 0 else ""
-            silver_sign = "+" if s["change"] > 0 else ""
-
-            rows += f"""
+            gold_rows += f"""
             <tr style="border-bottom:1px solid #f1f5f9;">
                 <td style="padding:12px;">{g['date']}</td>
                 <td>₹{g['price']}</td>
-                <td style="color:{gold_color};font-weight:700;">
-                    {gold_sign}{g['change']}%
-                </td>
+                <td style="color:{gold_color};font-weight:700;">{gold_sign}{g['change']}%</td>
+            </tr>
+            """
+
+        silver_rows = ""
+        for s in reversed(silver["history"]):
+            silver_color = "#16a34a" if s["change"] >= 0 else "#dc2626"
+            silver_sign = "+" if s["change"] > 0 else ""
+            silver_rows += f"""
+            <tr style="border-bottom:1px solid #f1f5f9;">
+                <td style="padding:12px;">{s['date']}</td>
                 <td>₹{s['price']}</td>
-                <td style="color:{silver_color};font-weight:700;">
-                    {silver_sign}{s['change']}%
-                </td>
+                <td style="color:{silver_color};font-weight:700;">{silver_sign}{s['change']}%</td>
             </tr>
             """
 
         gold_prices = [x["price"] for x in gold["history"]]
         silver_prices = [x["price"] for x in silver["history"]]
 
-        gold_spark = self.generate_sparkline(gold_prices)
-        silver_spark = self.generate_sparkline(silver_prices)
-
-        gold_spark_color = "#16a34a" if gold["change"] >= 0 else "#dc2626"
-        silver_spark_color = "#16a34a" if silver["change"] >= 0 else "#dc2626"
-
-        gold_trend = (
-            '<span style="color:#16a34a;font-weight:700;">Bullish ↗</span>'
-            if gold["change"] >= 0
-            else '<span style="color:#dc2626;font-weight:700;">Bearish ↘</span>'
-        )
-
-        silver_trend = (
-            '<span style="color:#16a34a;font-weight:700;">Bullish ↗</span>'
-            if silver["change"] >= 0
-            else '<span style="color:#dc2626;font-weight:700;">Bearish ↘</span>'
-        )
-
         gold_levels = self.derive_buy_levels(gold["current"], gold["history"])
         silver_levels = self.derive_buy_levels(silver["current"], silver["history"])
 
         html = f"""
         <div style="
-            margin-top:24px;
-            background:#ffffff;
-            border-radius:14px;
-            border:1px solid #e5e7eb;
-            box-shadow:0 8px 24px rgba(15, 23, 42, 0.06);
-            overflow:hidden;
-            font-family:Arial, sans-serif;">
-
+            margin-top:24px;">
             <div style="
                 padding:18px 20px 12px;
                 border-bottom:1px solid #e5e7eb;
                 background:linear-gradient(135deg,#fff7ed,#fffbeb);">
-                <div style="font-size:20px;font-weight:800;color:#111827;">
-                    Gold & Silver Market
+                <div style="font-size:20px;font-weight:800;color:#111827;">Commodities</div>
+                <div style="font-size:13px;color:#64748b;margin-top:6px;line-height:1.5;">Separate Gold and Silver sections for a cleaner, professional layout.</div>
+            </div>
+
+            <div style="padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+                <!-- Gold Section -->
+                <div style="background:#ffffff;border-radius:14px;border:1px solid #e5e7eb;padding:16px;">
+                    <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">Gold (22K)</div>
+                    <div style="font-size:28px;font-weight:800;color:#111827;margin-top:8px;">₹{gold['current']}</div>
+                    <div style="margin-top:10px;">{self.badge(gold['change'])} {self.buy_signal(gold['history'], 'Gold')}</div>
+                    <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#fffdf7;border:1px solid #f3e8b2;font-size:12px;color:#334155;line-height:1.5;">
+                        <div style="font-weight:700;color:#047857;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']}</div>
+                        <div style="margin-top:4px;">Patient: ₹{gold_levels['patient_entry']} • Optimal: ₹{gold_levels['optimal_entry']} • Aggressive: ₹{gold_levels['aggressive_entry']}</div>
+                    </div>
+
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px;border-collapse:collapse;font-size:13px;color:#334155;">
+                        <tr style="background:#f8fafc;">
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
+                        </tr>
+                        {gold_rows}
+                    </table>
                 </div>
-                <div style="font-size:13px;color:#64748b;margin-top:6px;line-height:1.5;">
-                    A polished commodity snapshot with live price, momentum, and entry guidance styled like the stock report.
+
+                <!-- Silver Section -->
+                <div style="background:#ffffff;border-radius:14px;border:1px solid #e5e7eb;padding:16px;">
+                    <div style="font-size:13px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.04em;">Silver</div>
+                    <div style="font-size:28px;font-weight:800;color:#111827;margin-top:8px;">₹{silver['current']}</div>
+                    <div style="margin-top:10px;">{self.badge(silver['change'])} {self.buy_signal(silver['history'], 'Silver')}</div>
+                    <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:12px;color:#334155;line-height:1.5;">
+                        <div style="font-weight:700;color:#047857;">Recommended {silver_levels['recommended_entry_label']}: ₹{silver_levels['recommended_buy_level']}</div>
+                        <div style="margin-top:4px;">Patient: ₹{silver_levels['patient_entry']} • Optimal: ₹{silver_levels['optimal_entry']} • Aggressive: ₹{silver_levels['aggressive_entry']}</div>
+                    </div>
+
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px;border-collapse:collapse;font-size:13px;color:#334155;">
+                        <tr style="background:#f8fafc;">
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Date</th>
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Price</th>
+                            <th align="left" style="padding:10px;border-bottom:1px solid #e5e7eb;">Change</th>
+                        </tr>
+                        {silver_rows}
+                    </table>
                 </div>
             </div>
 
-            <div style="padding:20px;">
-                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
-                    <tr>
-                        <td width="50%" style="padding:0 8px 12px 0;vertical-align:top;">
-                            <div style="
-                                background:linear-gradient(135deg,#fff8dc,#fef3c7);
-                                border:1px solid #f3e8b2;
-                                border-radius:14px;
-                                padding:16px;
-                                min-height:180px;">
-                                <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">Gold (22K)</div>
-                                <div style="font-size:30px;font-weight:800;color:#111827;margin-top:8px;">
-                                    ₹{gold['current']}
-                                </div>
-                                <div style="margin-top:10px;">
-                                    {self.badge(gold['change'])}
-                                    {self.buy_signal(gold['history'], 'Gold')}
-                                </div>
-                                <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#fffdf7;border:1px solid #f3e8b2;font-size:12px;color:#334155;line-height:1.5;">
-                                    <div style="font-weight:700;color:#047857;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']}</div>
-                                    <div style="margin-top:4px;">Patient: ₹{gold_levels['patient_entry']} • Optimal: ₹{gold_levels['optimal_entry']} • Aggressive: ₹{gold_levels['aggressive_entry']}</div>
-                                </div>
-                            </div>
-                        </td>
-
-                        <td width="50%" style="padding:0 0 12px 8px;vertical-align:top;">
-                            <div style="
-                                background:linear-gradient(135deg,#f8fafc,#e2e8f0);
-                                border:1px solid #e2e8f0;
-                                border-radius:14px;
-                                padding:16px;
-                                min-height:180px;">
-                                <div style="font-size:13px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:0.04em;">Silver</div>
-                                <div style="font-size:30px;font-weight:800;color:#111827;margin-top:8px;">
-                                    ₹{silver['current']}
-                                </div>
-                                <div style="margin-top:10px;">
-                                    {self.badge(silver['change'])}
-                                    {self.buy_signal(silver['history'], 'Silver')}
-                                </div>
-                                <div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:#f8fafc;border:1px solid #e2e8f0;font-size:12px;color:#334155;line-height:1.5;">
-                                    <div style="font-weight:700;color:#047857;">Recommended {silver_levels['recommended_entry_label']}: ₹{silver_levels['recommended_buy_level']}</div>
-                                    <div style="margin-top:4px;">Patient: ₹{silver_levels['patient_entry']} • Optimal: ₹{silver_levels['optimal_entry']} • Aggressive: ₹{silver_levels['aggressive_entry']}</div>
-                                </div>
-                            </div>
-                        </td>
-                    </tr>
-                </table>
-
-                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="
-                    margin-top:12px;
-                    border-collapse:collapse;
-                    font-size:13px;
-                    color:#334155;
-                    border:1px solid #e5e7eb;
-                    border-radius:12px;
-                    overflow:hidden;">
-                    <tr style="background:#f8fafc;">
-                        <th align="left" style="padding:12px;border-bottom:1px solid #e5e7eb;">Date</th>
-                        <th align="left" style="padding:12px;border-bottom:1px solid #e5e7eb;">Gold</th>
-                        <th align="left" style="padding:12px;border-bottom:1px solid #e5e7eb;">Gold %</th>
-                        <th align="left" style="padding:12px;border-bottom:1px solid #e5e7eb;">Silver</th>
-                        <th align="left" style="padding:12px;border-bottom:1px solid #e5e7eb;">Silver %</th>
-                    </tr>
-                    {rows}
-                </table>
-
-                <div style="
-                    margin-top:18px;
-                    padding:16px 18px;
-                    background:#f8fafc;
-                    border-radius:14px;
-                    border:1px solid #e5e7eb;">
-
-                    <div style="font-weight:700;color:#111827;font-size:14px;">7-Day Trend</div>
-
-                    <div style="font-size:18px;margin-top:10px;color:#334155;">
-                        Gold:
-                        <span style="color:{gold_spark_color};font-family:monospace;font-weight:700;">
-                            {gold_spark}
-                        </span>
-                    </div>
-
-                    <div style="font-size:18px;margin-top:8px;color:#334155;">
-                        Silver:
-                        <span style="color:{silver_spark_color};font-family:monospace;font-weight:700;">
-                            {silver_spark}
-                        </span>
-                    </div>
-
-                    <div style="margin-top:14px;font-size:13px;color:#475569;line-height:1.6;">
-                        <div style="font-weight:700;color:#111827;margin-bottom:6px;">AI Insights</div>
-                        <div>• Gold trend: {gold_trend}</div>
-                        <div>• Silver trend: {silver_trend}</div>
-                    </div>
-                </div>
+            <div style="padding:16px 20px 20px;border-top:1px solid #e5e7eb;background:transparent;border-radius:0 0 12px 12px;margin-top:12px;">
+                <div style="font-size:13px;color:#64748b;">Summary: Latest live prices and recommended buy levels for Gold and Silver are shown above.</div>
             </div>
         </div>
         """

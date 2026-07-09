@@ -127,8 +127,8 @@ def generate_hf_reasoning(prompt, stock_name=""):
         # Inference must be serialized to prevent resource thrashing
         with model_lock:
             log.info(f"Generating AI trade plan for {stock_name}...")
-            # Limit max_new_tokens to 120 for extremely fast execution
-            outputs = llm_pipeline(formatted_prompt, max_new_tokens=120, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
+            # Allow a longer, more detailed generation for richer trade analysis
+            outputs = llm_pipeline(formatted_prompt, max_new_tokens=400, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
             log.info(f"AI trade plan successfully generated for {stock_name}.")
         
         generated_text = outputs[0]['generated_text']
@@ -384,14 +384,16 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
         f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']} (only for breakout momentum or a strong trend continuation)\n"
         f"- Stop-Loss: {risk_data['stop_loss']}\n"
         f"- Profit Target: {risk_data['target']}\n\n"
-        f"**Instructions for a Pro Swing Trader:**\n"
-        f"1. **Trade Thesis:** Write one crisp sentence that states the setup and expected move.\n"
-        f"2. **Entry Plan:** State the best entry style as Patient, Optimal, or Aggressive and name the exact level to use.\n"
-        f"3. **Positioning:** Say whether to buy full size, scale in, or wait for confirmation.\n"
-        f"4. **Risk Management:** State the stop-loss, invalidation point, and why the risk is controlled.\n"
-        f"5. **Exit Plan:** State the profit target and the event that would weaken the setup.\n"
-        f"6. **Confirmation Signal:** Name one near-term trigger that would confirm the trade.\n"
-        f"7. **Format:** Output in a clean structure with short bullets or labeled sections. Keep it concise, factual, and trading-focused. Do not use filler, fluff, or disclaimers."
+        f"**Instructions for a Pro Swing Trader (Detailed Analysis Requested):**\n"
+        f"1. **Trade Thesis:** One clear sentence stating the setup, directional bias, and expected move.\n"
+        f"2. **Entry Plan:** Recommend Patient, Optimal, or Aggressive style and give exact price levels for each, with rationale.\n"
+        f"3. **Positioning & Sizing:** Recommend position sizing guidance (scale-in points, % of portfolio, full size vs partial) and explain rationale.\n"
+        f"4. **Risk Management:** State stop-loss, invalidation point, and calculate risk per share and % risk vs suggested position size.\n"
+        f"5. **Exit Plan & Targets:** Provide at least two profit target levels and what market events or indicator changes would invalidate them.\n"
+        f"6. **Scenario Analysis:** Provide 2-3 short scenarios (Bull case, Base case, Bear case) with approximate probabilities and numeric price ranges.\n"
+        f"7. **Confirmation Signals & Timing:** Name specific near-term triggers (e.g., retest of EMA20, breakout volume) and an expected time horizon (1-3 sessions, 3-10 sessions).\n"
+        f"8. **Supporting Evidence:** Cite 3 concrete data points from the provided inputs (e.g., RSI value, EMA alignment, top headline) that justify the recommendation.\n"
+        f"9. **Format:** Output with clear labeled sections and short bullet points. Use numeric values where possible and avoid generic filler."
     )
 
     generator = init_llm_generator()
@@ -405,6 +407,19 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
 
     # Fallback if the AI model fails for any reason
     return _get_fallback_reason()
+
+
+def truncate_text(text, limit=350):
+    if not text:
+        return text
+    if len(text) <= limit:
+        return text
+    # Prefer to cut at sentence boundary
+    cut = text[:limit]
+    last_period = cut.rfind('. ')
+    if last_period != -1 and last_period > limit - 100:
+        return cut[:last_period + 1] + '...'
+    return cut.rstrip() + '...'
 
 
 def get_date_with_suffix(d):
@@ -472,7 +487,7 @@ def send_email(report_html, mode):
         traceback.print_exc()
 
 
-def process_stock(stock_name, ticker, use_llm=True):
+def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
     try:
         # fetch data and compute scores
         df = fetch_data(ticker)
@@ -554,6 +569,11 @@ def process_stock(stock_name, ticker, use_llm=True):
             entry_context,
         )
 
+        # If user requested concise output, truncate the LLM reasoning server-side
+        llm_display = llm_reason
+        if llm_reason and not detailed_llm:
+            llm_display = truncate_text(llm_reason, limit=350)
+
         if "sell" in signal.lower():
             priority = 3
         elif "hold" in signal.lower() or "buy / hold" in signal.lower():
@@ -570,7 +590,7 @@ def process_stock(stock_name, ticker, use_llm=True):
                         <tr>
                             <td style="vertical-align:top;">
                                 <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
-                                <p style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">{llm_reason}</p>
+                                <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
                             </td>
                             <td style="width:110px;text-align:right;vertical-align:top;">
                                 <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
@@ -655,8 +675,8 @@ def get_section_html(title, count, items):
 # -----------------------------
 # Main
 # -----------------------------
-def main(mode, use_llm):
-    log.info(f"Starting stock analysis run. Mode: {mode}, LLM Enabled: {use_llm}")
+def main(mode, use_llm, detailed_llm=False):
+    log.info(f"Starting stock analysis run. Mode: {mode}, LLM Enabled: {use_llm}, Detailed LLM: {detailed_llm}")
     report_html = """
 <html>
   <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#111827;">
@@ -683,7 +703,7 @@ def main(mode, use_llm):
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_stock = {
-            executor.submit(process_stock, name, ticker, use_llm): (name, ticker)
+            executor.submit(process_stock, name, ticker, use_llm, detailed_llm): (name, ticker)
             for name, ticker in STOCKS.items()
         }
         for future in as_completed(future_to_stock):
@@ -792,5 +812,10 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable AI-powered reasoning to speed up execution."
     )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Include full detailed LLM analysis in the report (can increase size)."
+    )
     args = parser.parse_args()
-    main(args.mode, use_llm=not args.no_llm)
+    main(args.mode, use_llm=not args.no_llm, detailed_llm=args.detailed)
