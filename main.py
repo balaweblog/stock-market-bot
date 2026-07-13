@@ -327,6 +327,65 @@ def get_signal(score):
         return "RED -> SELL / REDUCE"
 
 
+def get_conviction_rating(score):
+    try:
+        numeric_score = float(score)
+    except (TypeError, ValueError):
+        numeric_score = 0.0
+
+    numeric_score = max(0.0, min(100.0, numeric_score))
+
+    if numeric_score >= 90:
+        filled_icons = 5
+        label = "Elite"
+        fill_color = "#15803d"
+    elif numeric_score >= 75:
+        filled_icons = 4
+        label = "High"
+        fill_color = "#047857"
+    elif numeric_score >= 60:
+        filled_icons = 3
+        label = "Strong"
+        fill_color = "#0f766e"
+    elif numeric_score >= 45:
+        filled_icons = 2
+        label = "Mixed"
+        fill_color = "#d97706"
+    elif numeric_score >= 30:
+        filled_icons = 1
+        label = "Low"
+        fill_color = "#dc2626"
+    else:
+        filled_icons = 0
+        label = "Very Low"
+        fill_color = "#b91c1c"
+
+    icons = []
+    icons_text = []
+    for index in range(5):
+        active = index < filled_icons
+        icon_background = fill_color if active else "#f8fafc"
+        icon_border = fill_color if active else "#dbe3ea"
+        icon_color = "#ffffff" if active else "#cbd5e1"
+        glyph = "★" if active else "☆"
+        icons_text.append(glyph)
+        icons.append(
+            f'<span style="display:inline-block;width:26px;height:26px;'
+            f'line-height:26px;text-align:center;border-radius:999px;'
+            f'margin-left:2px;margin-right:2px;font-size:15px;font-weight:900;'
+            f'background:{icon_background};border:1px solid {icon_border};'
+            f'color:{icon_color};box-shadow:0 1px 2px rgba(15,23,42,0.08);">'
+            f'{glyph}</span>'
+        )
+
+    return {
+        "label": label,
+        "fill_color": fill_color,
+        "icons_html": "".join(icons),
+        "icons_text": "".join(icons_text),
+    }
+
+
 def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamentals, market_context):
     # Use the existing final_score weighting and fold advanced fundamentals into total score.
     combined_fund = fundamentals + (adv_fundamentals * 0.4)
@@ -554,6 +613,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         risk_data["recommended_entry"] = recommended_entry
         risk_data["recommended_entry_label"] = recommended_entry.replace("_", " ").title()
         risk_data["recommended_buy_level"] = risk_data["buy_levels"][recommended_entry]
+        conviction_rating = get_conviction_rating(total_score)
 
         llm_reason = generate_llm_reasoning(
             stock_name,
@@ -655,9 +715,11 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                                     <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
                                     <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
                                 </td>
-                                <td style="width:110px;text-align:right;vertical-align:top;">
+                                <td style="width:150px;text-align:right;vertical-align:top;">
                                     <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
-                                    <div style="margin-top:8px;font-size:13px;color:#334155;">Score: <strong>{total_score}</strong></div>
+                                    <div style="margin-top:10px;font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:#64748b;">Conviction</div>
+                                    <div style="margin-top:6px;white-space:nowrap;">{conviction_rating['icons_html']}</div>
+                                    <div style="margin-top:6px;font-size:12px;font-weight:700;color:{conviction_rating['fill_color']};">{conviction_rating['label']}</div>
                                 </td>
                             </tr>
                         </table>
@@ -717,8 +779,17 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                 </tr>
             </table>
             """
-        print(f"{stock_name} ({ticker}) -> {signal} | Score: {total_score}")
-        return (priority, total_score, stock_name, row_html) 
+        summary_entry = {
+            "stock_name": stock_name,
+            "signal": signal,
+            "current_price": round(latest["close"], 2),
+            "recommended_buy_level": risk_data.get("recommended_buy_level"),
+            "ema20": latest.get("ema20"),
+            "upcoming_events": events,
+        }
+
+        print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']}")
+        return (priority, total_score, stock_name, row_html, summary_entry) 
     
     except Exception as e:
         error_text = f"Error processing {ticker}: {str(e)}"
@@ -732,7 +803,100 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                 </tr>
             </table>
             """
-    return (4, 0, ticker, err_html)
+    return (4, 0, ticker, err_html, {
+        "stock_name": ticker,
+        "signal": "ERROR",
+        "current_price": None,
+        "recommended_buy_level": None,
+        "ema20": None,
+        "upcoming_events": {},
+    })
+
+
+def _format_short_date(value):
+    if not value or str(value).upper() == "NA":
+        return None
+
+    text = str(value).strip()
+    for fmt in ("%d %b %Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d %b")
+        except ValueError:
+            continue
+    return text
+
+
+def _relative_day_label(value):
+    if not value or str(value).upper() == "NA":
+        return None
+
+    text = str(value).strip()
+    for fmt in ("%d %b %Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            event_date = datetime.strptime(text, fmt).date()
+            break
+        except ValueError:
+            event_date = None
+
+    if event_date is None:
+        return None
+
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    delta_days = (event_date - today).days
+    if delta_days == 0:
+        return "today"
+    if delta_days == 1:
+        return "in 1 day"
+    if delta_days > 1:
+        return f"in {delta_days} days"
+    if delta_days == -1:
+        return "1 day ago"
+    return f"{abs(delta_days)} days ago"
+
+
+def build_quick_summary(rows):
+    """
+    Builds compact, human-readable summary bullets for the top of the report.
+    """
+    if not rows:
+        return ""
+
+    items = []
+    for row in rows:
+        stock_name = row.get("stock_name") or ""
+        signal = str(row.get("signal") or "").upper()
+        current_price = row.get("current_price")
+        recommended_buy_level = row.get("recommended_buy_level")
+        ema20 = row.get("ema20")
+        upcoming_events = row.get("upcoming_events") or {}
+
+        if "BUY" in signal and current_price is not None and recommended_buy_level is not None and current_price < recommended_buy_level:
+            items.append(f"✅ Buy: {stock_name} below ₹{recommended_buy_level}")
+            continue
+
+        results_date = upcoming_events.get("results_announcement_date")
+        if results_date and str(results_date).upper() != "NA":
+            short_date = _format_short_date(results_date)
+            relative_label = _relative_day_label(results_date)
+            if relative_label == "today":
+                items.append(f"✅ Watch: {stock_name} results today")
+            else:
+                items.append(f"✅ Watch: {stock_name} results on {short_date or results_date}")
+            continue
+
+        dividend_date = upcoming_events.get("dividend_record_date")
+        if dividend_date and str(dividend_date).upper() != "NA":
+            relative_label = _relative_day_label(dividend_date)
+            if relative_label == "today":
+                items.append(f"📅 {stock_name} dividend record today")
+            else:
+                items.append(f"📅 {stock_name} dividend record {relative_label or 'soon'}")
+            continue
+
+        if current_price is not None and ema20 is not None and current_price < ema20:
+            items.append(f"⚠ {stock_name} below EMA20—avoid adding")
+
+    return "\n".join(items)
 
 
 def get_section_html(title, count, items):
@@ -773,6 +937,7 @@ def main(mode, use_llm, detailed_llm=False):
 """
 
     rows = []
+    summary_rows = []
     if use_llm:
         init_llm_generator()
 
@@ -787,6 +952,7 @@ def main(mode, use_llm, detailed_llm=False):
                 result = future.result()
                 if result:
                     rows.append(result)
+                    summary_rows.append(result[4])
             except Exception as exc:
                 log.error(f"Error processing {stock_name} ({ticker}) in executor: {exc}")
                 err_html = f"""
@@ -796,11 +962,18 @@ def main(mode, use_llm, detailed_llm=False):
                     </tr>
                 </table>
                 """
-                rows.append((4, 0, ticker, err_html))
+                rows.append((4, 0, ticker, err_html, {
+                    "stock_name": stock_name,
+                    "signal": "ERROR",
+                    "current_price": None,
+                    "recommended_buy_level": None,
+                    "ema20": None,
+                    "upcoming_events": {},
+                }))
 
     # This block is now correctly dedented and will run only once
     groups = {"Buy": [], "Hold": [], "Sell": [], "Errors": []}
-    for pr, score, name, html in rows:
+    for pr, score, name, html, _ in rows:
         if pr == 1:
             groups["Buy"].append((score, name, html))
         elif pr == 2:
@@ -839,12 +1012,30 @@ def main(mode, use_llm, detailed_llm=False):
         </tr>
     """
 
+    quick_summary_text = build_quick_summary(summary_rows)
+    quick_summary_html = ""
+    if quick_summary_text:
+        bullet_html = "".join(
+            f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
+            for item in quick_summary_text.splitlines()
+        )
+        quick_summary_html = f"""
+            <tr>
+              <td style="padding:0 20px 12px;">
+                <div style="border:1px solid #dbeafe;border-left:4px solid #2563eb;border-radius:10px;background:#f8fbff;padding:10px 12px;">
+                  <div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:0.04em;">Quick Summary</div>
+                  {bullet_html}
+                </div>
+              </td>
+            </tr>
+        """
+
     section_html = get_section_html("Buy", buy_count, groups["Buy"])
     section_html += get_section_html("Hold", hold_count, groups["Hold"])
     section_html += get_section_html("Sell", sell_count, groups["Sell"])
     section_html += get_section_html("Errors", err_count, groups["Errors"])
 
-    report_html += summary_html + section_html
+    report_html += quick_summary_html + summary_html + section_html
     report_html += """
           </table>
         </td>

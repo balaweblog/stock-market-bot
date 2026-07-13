@@ -3,9 +3,68 @@ import unittest
 from commodity_tracker import CommodityTracker
 from position_sizing import apply_risk_management
 from recommendation_logic import derive_commodity_buy_levels
+from main import build_quick_summary
 
 
 class RecommendationLogicTests(unittest.TestCase):
+    def test_build_quick_summary_collects_buy_watch_caution_and_event_items(self):
+        rows = [
+            {
+                "stock_name": "SBIN",
+                "signal": "BUY / HOLD",
+                "recommended_buy_level": 1030,
+                "current_price": 1028,
+                "ema20": 1045,
+                "upcoming_events": {
+                    "has_event": False,
+                },
+            },
+            {
+                "stock_name": "ICICI Bank",
+                "signal": "HOLD",
+                "recommended_buy_level": 1200,
+                "current_price": 1210,
+                "ema20": 1215,
+                "upcoming_events": {
+                    "has_event": True,
+                    "results_announcement_date": "18 Jul 2026",
+                    "next_upcoming_event_label": "Results",
+                    "next_upcoming_event_date": "18 Jul 2026",
+                },
+            },
+            {
+                "stock_name": "ITC",
+                "signal": "SELL",
+                "recommended_buy_level": 400,
+                "current_price": 390,
+                "ema20": 395,
+                "upcoming_events": {
+                    "has_event": False,
+                },
+            },
+            {
+                "stock_name": "TCS",
+                "signal": "HOLD",
+                "recommended_buy_level": 3500,
+                "current_price": 3498,
+                "ema20": 3502,
+                "upcoming_events": {
+                    "has_event": True,
+                    "dividend_record_date": "15 Jul 2026",
+                    "results_announcement_date": "NA",
+                    "next_upcoming_event_label": "Dividend Record",
+                    "next_upcoming_event_date": "15 Jul 2026",
+                },
+            },
+        ]
+
+        summary = build_quick_summary(rows)
+
+        self.assertIn("✅ Buy: SBIN below ₹1030", summary)
+        self.assertIn("✅ Watch: ICICI Bank results on 18 Jul", summary)
+        self.assertIn("⚠ ITC below EMA20—avoid adding", summary)
+        self.assertIn("📅 TCS dividend record in 2 days", summary)
+
     def test_stock_buy_levels_adjust_for_live_price_distance(self):
         entry_context = {
             "price_vs_ema20_pct": -6,
