@@ -642,7 +642,10 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                                 <div style="font-size:13px;color:#475569;"><strong>Upcoming Events</strong></div>
                                 <div style="margin-top:6px;padding:8px 10px;border-radius:8px;background:#fef3c7;border:1px solid #f59e0b;">
                                     <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">{upcoming_events.get('next_upcoming_event_label', 'Upcoming Event')}</div>
-                                    <div style="margin-top:3px;font-size:15px;font-weight:800;color:#b45309;">{upcoming_events.get('next_upcoming_event_date', 'Not available')}</div>
+                                    <div style="margin-top:3px;font-size:15px;font-weight:800;color:#b45309;">{upcoming_events.get('next_upcoming_event_date', 'NA')}</div>
+                                    <div style="margin-top:4px;font-size:12px;color:#78350f;">
+                                        Dividend Record: <strong>{upcoming_events.get('dividend_record_date', 'NA')}</strong> &bull; Results Announcement: <strong>{upcoming_events.get('results_announcement_date', 'NA')}</strong>
+                                    </div>
                                 </div>
                             </td>
                         </tr>
