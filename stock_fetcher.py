@@ -44,68 +44,171 @@ def format_event_date(value):
     return str(value)
 
 
-def build_upcoming_event_summary(info):
-    if not info:
-        return {
-            "dividend_record_date": "NA",
-            "results_announcement_date": "NA",
-            "next_upcoming_event_label": "Upcoming Event",
-            "next_upcoming_event_date": "NA",
-        }
+from datetime import datetime, date
+import pandas as pd
 
-    def _pick(*keys):
+
+def build_upcoming_event_summary(ticker, info=None):
+    """
+    Returns the next upcoming dividend and earnings events.
+
+    Priority:
+    Earnings:
+        1. ticker.calendar
+        2. info['earningsDate']
+        3. info['earningsTimestamp']
+        4. info['nextEarningsDate']
+
+    Dividend:
+        1. ticker.calendar
+        2. info['exDividendDate']
+        3. info['dividendDate']
+
+    Historical fields like lastDividendDate are intentionally ignored.
+    """
+
+    if info is None:
+        info = {}
+
+    today = pd.Timestamp.today().normalize()
+
+    def pick(*keys):
         for key in keys:
             value = info.get(key)
-            if value in (None, ""):
-                continue
-            return value
+            if value not in (None, "", [], {}):
+                return value
         return None
 
-    def _parse_date(value):
-        if value in (None, "", "Not available"):
+    def parse(value):
+        if value is None:
             return None
+
+        # Yahoo sometimes returns list of earnings dates
+        if isinstance(value, (list, tuple)):
+            dates = [parse(v) for v in value]
+            dates = [d for d in dates if d is not None]
+            return min(dates) if dates else None
+
+        # dictionary
+        if isinstance(value, dict):
+            for k in ("date", "value", "raw"):
+                if k in value:
+                    return parse(value[k])
+
+        # datetime/date
+        if isinstance(value, (datetime, date)):
+            return pd.Timestamp(value).normalize()
+
+        # unix timestamp
+        if isinstance(value, (int, float)):
+            try:
+                return pd.to_datetime(value, unit="s").normalize()
+            except Exception:
+                pass
+
         try:
-            return pd.Timestamp(value)
+            return pd.Timestamp(value).normalize()
         except Exception:
             return None
 
-    dividend_value = _pick("dividendDate", "exDividendDate", "lastDividendDate")
-    results_value = _pick("earningsDate", "earningsTimestamp", "nextEarningsDate")
+    #########################################################
+    # Try calendar first
+    #########################################################
 
-    today = pd.Timestamp(datetime.now().date())
-    max_window = today + pd.Timedelta(days=60)
+    earnings_date = None
+    dividend_date = None
 
-    dividend_date = _parse_date(dividend_value)
-    results_date = _parse_date(results_value)
+    try:
+        cal = ticker.calendar
 
-    def _within_window(value):
-        return value is not None and today.normalize() <= value.normalize() <= max_window.normalize()
+        if isinstance(cal, pd.DataFrame):
 
-    dividend_display = format_event_date(dividend_value) if _within_window(dividend_date) else "NA"
-    results_display = format_event_date(results_value) if _within_window(results_date) else "NA"
+            if "Value" in cal.columns:
 
-    candidates = []
-    if dividend_display != "NA":
-        candidates.append(("Dividend Record", dividend_date, dividend_display))
-    if results_display != "NA":
-        candidates.append(("Results Announcement", results_date, results_display))
+                if "Earnings Date" in cal.index:
+                    earnings_date = parse(cal.loc["Earnings Date", "Value"])
 
-    if candidates:
-        next_event = min(candidates, key=lambda item: item[1])
+                if "Ex-Dividend Date" in cal.index:
+                    dividend_date = parse(cal.loc["Ex-Dividend Date", "Value"])
+
+    except Exception:
+        pass
+
+    #########################################################
+    # Fallback to info
+    #########################################################
+
+    if earnings_date is None:
+        earnings_date = parse(
+            pick(
+                "earningsDate",
+                "earningsTimestamp",
+                "nextEarningsDate",
+            )
+        )
+
+    if dividend_date is None:
+        dividend_date = parse(
+            pick(
+                "exDividendDate",
+                "dividendDate",
+            )
+        )
+
+    #########################################################
+    # Ignore historical events
+    #########################################################
+
+    if earnings_date is not None and earnings_date < today:
+        earnings_date = None
+
+    if dividend_date is not None and dividend_date < today:
+        dividend_date = None
+
+    earnings_display = (
+        earnings_date.strftime("%d %b %Y")
+        if earnings_date is not None
+        else "NA"
+    )
+
+    dividend_display = (
+        dividend_date.strftime("%d %b %Y")
+        if dividend_date is not None
+        else "NA"
+    )
+
+    #########################################################
+    # Next event
+    #########################################################
+
+    events = []
+
+    if dividend_date is not None:
+        events.append(
+            ("Dividend", dividend_date)
+        )
+
+    if earnings_date is not None:
+        events.append(
+            ("Results Announcement", earnings_date)
+        )
+
+    if events:
+        label, dt = min(events, key=lambda x: x[1])
+
         return {
             "dividend_record_date": dividend_display,
-            "results_announcement_date": results_display,
-            "next_upcoming_event_label": next_event[0],
-            "next_upcoming_event_date": next_event[2],
+            "results_announcement_date": earnings_display,
+            "next_upcoming_event_label": label,
+            "next_upcoming_event_date": dt.strftime("%d %b %Y"),
         }
 
     return {
-        "dividend_record_date": dividend_display,
-        "results_announcement_date": results_display,
+        "dividend_record_date": "NA",
+        "results_announcement_date": "NA",
         "next_upcoming_event_label": "Upcoming Event",
         "next_upcoming_event_date": "NA",
     }
-
 
 def fetch_stock_data(symbol):
     df = yf.download(
@@ -159,5 +262,8 @@ def fetch_fundamentals(symbol):
         "roe": info.get("returnOnEquity"),
         "debtToEquity": info.get("debtToEquity"),
         "dividendYield": info.get("dividendYield"),
-        "upcomingEvents": build_upcoming_event_summary(info),
+        "upcomingEvents": build_upcoming_event_summary(
+            ticker,
+            info,
+        ),
     }
