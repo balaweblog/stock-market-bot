@@ -48,8 +48,9 @@ def build_upcoming_event_summary(info):
     if not info:
         return {
             "dividend_record_date": "Not available",
-            "dividend_deposit_date": "Not available",
             "results_announcement_date": "Not available",
+            "next_upcoming_event_label": "Upcoming Event",
+            "next_upcoming_event_date": "Not available",
         }
 
     def _pick(*keys):
@@ -60,10 +61,51 @@ def build_upcoming_event_summary(info):
             return value
         return None
 
+    def _parse_date(value):
+        if value in (None, "", "Not available"):
+            return None
+        try:
+            return pd.Timestamp(value)
+        except Exception:
+            return None
+
+    dividend_value = _pick("dividendDate", "exDividendDate", "lastDividendDate")
+    results_value = _pick("earningsDate", "earningsTimestamp", "nextEarningsDate")
+
+    candidates = []
+    dividend_date = _parse_date(dividend_value)
+    if dividend_date is not None:
+        candidates.append(("Dividend Record", dividend_date, format_event_date(dividend_value)))
+
+    results_date = _parse_date(results_value)
+    if results_date is not None:
+        candidates.append(("Results Announcement", results_date, format_event_date(results_value)))
+
+    today = pd.Timestamp(datetime.now().date())
+    upcoming = [item for item in candidates if item[1].normalize() >= today.normalize()]
+    if upcoming:
+        next_event = min(upcoming, key=lambda item: item[1])
+        return {
+            "dividend_record_date": format_event_date(dividend_value),
+            "results_announcement_date": format_event_date(results_value),
+            "next_upcoming_event_label": next_event[0],
+            "next_upcoming_event_date": next_event[2],
+        }
+
+    if candidates:
+        next_event = min(candidates, key=lambda item: item[1])
+        return {
+            "dividend_record_date": format_event_date(dividend_value),
+            "results_announcement_date": format_event_date(results_value),
+            "next_upcoming_event_label": next_event[0],
+            "next_upcoming_event_date": next_event[2],
+        }
+
     return {
-        "dividend_record_date": format_event_date(_pick("dividendDate", "exDividendDate", "lastDividendDate")),
-        "dividend_deposit_date": format_event_date(_pick("dividendPayDate", "dividendPaymentDate", "paymentDate")),
-        "results_announcement_date": format_event_date(_pick("earningsDate", "earningsTimestamp", "nextEarningsDate")),
+        "dividend_record_date": format_event_date(dividend_value),
+        "results_announcement_date": format_event_date(results_value),
+        "next_upcoming_event_label": "Upcoming Event",
+        "next_upcoming_event_date": "Not available",
     }
 
 

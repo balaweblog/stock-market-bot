@@ -640,10 +640,9 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                         <tr>
                             <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
                                 <div style="font-size:13px;color:#475569;"><strong>Upcoming Events</strong></div>
-                                <div style="font-size:12px;color:#0f172a;margin-top:4px;line-height:1.6;">
-                                    <span>Dividend Record: <strong>{upcoming_events.get('dividend_record_date', 'Not available')}</strong></span> &bull;
-                                    <span>Dividend Deposit: <strong>{upcoming_events.get('dividend_deposit_date', 'Not available')}</strong></span> &bull;
-                                    <span>Results Announcement: <strong>{upcoming_events.get('results_announcement_date', 'Not available')}</strong></span>
+                                <div style="margin-top:6px;padding:8px 10px;border-radius:8px;background:#fef3c7;border:1px solid #f59e0b;">
+                                    <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">{upcoming_events.get('next_upcoming_event_label', 'Upcoming Event')}</div>
+                                    <div style="margin-top:3px;font-size:15px;font-weight:800;color:#b45309;">{upcoming_events.get('next_upcoming_event_date', 'Not available')}</div>
                                 </div>
                             </td>
                         </tr>
