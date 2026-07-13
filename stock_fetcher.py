@@ -1,5 +1,71 @@
+from datetime import date, datetime
+
 import yfinance as yf
 import pandas as pd
+
+
+def format_event_date(value):
+    if value in (None, "", "Not available"):
+        return "Not available"
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            formatted = format_event_date(item)
+            if formatted != "Not available":
+                return formatted
+        return "Not available"
+
+    if isinstance(value, dict):
+        for key in ("date", "value", "raw"):
+            if key in value:
+                formatted = format_event_date(value[key])
+                if formatted != "Not available":
+                    return formatted
+        return "Not available"
+
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%d %b %Y")
+
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value)).strftime("%d %b %Y")
+        except (OverflowError, ValueError, OSError):
+            return "Not available"
+
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return "Not available"
+        try:
+            return pd.Timestamp(text).strftime("%d %b %Y")
+        except Exception:
+            return text
+
+    return str(value)
+
+
+def build_upcoming_event_summary(info):
+    if not info:
+        return {
+            "dividend_record_date": "Not available",
+            "dividend_deposit_date": "Not available",
+            "results_announcement_date": "Not available",
+        }
+
+    def _pick(*keys):
+        for key in keys:
+            value = info.get(key)
+            if value in (None, ""):
+                continue
+            return value
+        return None
+
+    return {
+        "dividend_record_date": format_event_date(_pick("dividendDate", "exDividendDate", "lastDividendDate")),
+        "dividend_deposit_date": format_event_date(_pick("dividendPayDate", "dividendPaymentDate", "paymentDate")),
+        "results_announcement_date": format_event_date(_pick("earningsDate", "earningsTimestamp", "nextEarningsDate")),
+    }
+
 
 def fetch_stock_data(symbol):
     df = yf.download(
@@ -52,5 +118,6 @@ def fetch_fundamentals(symbol):
         "marketCap": info.get("marketCap"),
         "roe": info.get("returnOnEquity"),
         "debtToEquity": info.get("debtToEquity"),
-        "dividendYield": info.get("dividendYield")
+        "dividendYield": info.get("dividendYield"),
+        "upcomingEvents": build_upcoming_event_summary(info),
     }

@@ -320,8 +320,7 @@ class CommodityTracker:
                             </table>
                             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
                                 <tr>
-                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                        <div style="margin-top:4px;padding:12px 12px;border-radius:12px;background:linear-gradient(135deg,#fef3c7,#fff7ed);border:1px solid #fcd34d;box-shadow:0 1px 2px rgba(15,23,42,0.06);">
+                                    <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;                                        <div style="margin-top:4px;padding:12px 12px;border-radius:12px;background:linear-gradient(135deg,#fef3c7,#fff7ed);border:1px solid #fcd34d;box-shadow:0 1px 2px rgba(15,23,42,0.06);">
                                             <div style="font-size:11px;font-weight:800;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">Recommendation</div>
                                             <div style="margin-top:6px;font-size:12px;color:#0f172a;line-height:1.5;">
                                                 <span style="display:inline-block;padding:4px 8px;border-radius:999px;background:#fff7ed;color:#b45309;font-weight:700;">Recommended {gold_levels['recommended_entry_label']}: ₹{gold_levels['recommended_buy_level']:.2f}</span>

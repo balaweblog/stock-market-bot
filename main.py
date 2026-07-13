@@ -499,6 +499,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
 
         fund_raw = fetch_fundamentals(ticker)
         fund_score = score_fundamentals(fund_raw)
+        upcoming_events = fund_raw.get("upcomingEvents", {})
 
         adv_raw = fetch_advanced_fundamentals(ticker)
         adv_fund_score = score_advanced_fundamentals(adv_raw)
@@ -633,6 +634,16 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                                         Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
                                         Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
                                     </div>
+                                </div>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                <div style="font-size:13px;color:#475569;"><strong>Upcoming Events</strong></div>
+                                <div style="font-size:12px;color:#0f172a;margin-top:4px;line-height:1.6;">
+                                    <span>Dividend Record: <strong>{upcoming_events.get('dividend_record_date', 'Not available')}</strong></span> &bull;
+                                    <span>Dividend Deposit: <strong>{upcoming_events.get('dividend_deposit_date', 'Not available')}</strong></span> &bull;
+                                    <span>Results Announcement: <strong>{upcoming_events.get('results_announcement_date', 'Not available')}</strong></span>
                                 </div>
                             </td>
                         </tr>
