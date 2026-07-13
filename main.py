@@ -1,4 +1,5 @@
 import os
+import math
 import yfinance as yf
 import pandas as pd
 import ta
@@ -386,6 +387,322 @@ def get_conviction_rating(score):
     }
 
 
+def _safe_float(value):
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if pd.isna(numeric_value):
+        return None
+
+    return numeric_value
+
+
+def _risk_level_meta(score):
+    if score <= 1.5:
+        return {
+            "label": "Low",
+            "emoji": "🟢",
+            "color": "#047857",
+            "background": "#dcfce7",
+            "border": "#86efac",
+        }
+    if score <= 2.25:
+        return {
+            "label": "Medium",
+            "emoji": "🟡",
+            "color": "#a16207",
+            "background": "#fef3c7",
+            "border": "#fcd34d",
+        }
+    return {
+        "label": "High",
+        "emoji": "🔴",
+        "color": "#b91c1c",
+        "background": "#fee2e2",
+        "border": "#fca5a5",
+    }
+
+
+def _risk_component_score(value, low_threshold, medium_threshold, reverse=False):
+    if value is None:
+        return 2
+
+    if reverse:
+        if value >= low_threshold:
+            return 1
+        if value >= medium_threshold:
+            return 2
+        return 3
+
+    if value <= low_threshold:
+        return 1
+    if value <= medium_threshold:
+        return 2
+    return 3
+
+
+def calculate_risk_meter(df, latest, beta=None):
+    close = _safe_float(latest.get("close"))
+    atr = _safe_float(latest.get("atr"))
+    adx = _safe_float(latest.get("adx"))
+    beta_value = _safe_float(beta)
+
+    atr_pct = round((atr / close) * 100, 2) if atr is not None and close not in (None, 0) else None
+
+    volatility_pct = None
+    recent_returns = df["close"].pct_change().dropna().tail(20)
+    if len(recent_returns) >= 2:
+        recent_volatility = recent_returns.std()
+        if pd.notna(recent_volatility):
+            volatility_pct = round(float(recent_volatility) * math.sqrt(252) * 100, 2)
+
+    atr_score = _risk_component_score(atr_pct, 2.0, 4.0)
+    volatility_score = _risk_component_score(volatility_pct, 20.0, 35.0)
+    beta_score = _risk_component_score(beta_value, 0.9, 1.2)
+    adx_score = _risk_component_score(adx, 25.0, 18.0, reverse=True)
+
+    overall_score = round((atr_score + volatility_score + beta_score + adx_score) / 4, 2)
+    overall_meta = _risk_level_meta(overall_score)
+
+    factor_rows = [
+        {
+            "label": "ATR",
+            "value": f"{atr_pct:.2f}%" if atr_pct is not None else "n/a",
+            "meta": _risk_level_meta(atr_score),
+        },
+        {
+            "label": "Volatility",
+            "value": f"{volatility_pct:.2f}%" if volatility_pct is not None else "n/a",
+            "meta": _risk_level_meta(volatility_score),
+        },
+        {
+            "label": "Beta",
+            "value": f"{beta_value:.2f}" if beta_value is not None else "n/a",
+            "meta": _risk_level_meta(beta_score),
+        },
+        {
+            "label": "ADX",
+            "value": f"{adx:.2f}" if adx is not None else "n/a",
+            "meta": _risk_level_meta(adx_score),
+        },
+    ]
+
+    return {
+        "label": overall_meta["label"],
+        "emoji": overall_meta["emoji"],
+        "color": overall_meta["color"],
+        "background": overall_meta["background"],
+        "border": overall_meta["border"],
+        "score": overall_score,
+        "factors": factor_rows,
+    }
+
+
+def build_risk_meter_html(risk_meter):
+    legend_cells = []
+    for option in ("Low", "Medium", "High"):
+        meta = _risk_level_meta(1 if option == "Low" else 2 if option == "Medium" else 3)
+        active = option == risk_meter["label"]
+        background = meta["background"] if active else "#f8fafc"
+        border = meta["border"] if active else "#e2e8f0"
+        color = meta["color"] if active else "#94a3b8"
+        opacity = "1" if active else "0.5"
+        legend_cells.append(
+            f'<td style="padding:0 3px;vertical-align:top;width:33.33%;">'
+            f'<div style="padding:8px 10px;border-radius:10px;text-align:center;'
+            f'background:{background};border:1px solid {border};color:{color};'
+            f'font-size:12px;font-weight:800;opacity:{opacity};white-space:nowrap;">'
+            f'{meta["emoji"]} {option}</div></td>'
+        )
+
+    factor_rows = []
+    for factor in risk_meter["factors"]:
+        factor_rows.append(
+            f'<td style="padding:6px 6px 0 0;width:50%;vertical-align:top;">'
+            f'<div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">'
+            f'{factor["label"]}</div>'
+            f'<div style="margin-top:3px;color:#0f172a;font-size:12px;font-weight:700;">'
+            f'{factor["value"]}</div>'
+            f'<div style="margin-top:3px;font-size:11px;color:{factor["meta"]["color"]};font-weight:700;">'
+            f'{factor["meta"]["emoji"]} {factor["meta"]["label"]}</div></td>'
+        )
+
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                                        <div>
+                                            <div style="font-size:13px;color:#475569;font-weight:700;">Risk Meter</div>
+                                            <div style="margin-top:3px;font-size:12px;color:#64748b;">Based on ATR, Volatility, Beta and ADX</div>
+                                        </div>
+                                        <div style="display:inline-block;padding:6px 12px;border-radius:999px;background:{risk_meter['background']};border:1px solid {risk_meter['border']};color:{risk_meter['color']};font-size:12px;font-weight:800;white-space:nowrap;">
+                                            {risk_meter['emoji']} {risk_meter['label']} Risk
+                                        </div>
+                                    </div>
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:10px;border-collapse:separate;border-spacing:0;">
+                                        <tr>
+                                            {''.join(legend_cells)}
+                                        </tr>
+                                    </table>
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
+                                        <tr>
+                                            {factor_rows[0]}
+                                            {factor_rows[1]}
+                                        </tr>
+                                        <tr>
+                                            {factor_rows[2]}
+                                            {factor_rows[3]}
+                                        </tr>
+                                    </table>
+                                </td>
+                            </tr>
+    """
+
+
+def calculate_52_week_range(df, latest):
+    current_price = _safe_float(latest.get("close"))
+    recent_history = df.tail(252)
+
+    high_52w = _safe_float(recent_history["high"].max()) if "high" in recent_history else None
+    low_52w = _safe_float(recent_history["low"].min()) if "low" in recent_history else None
+
+    below_high_pct = None
+    if current_price is not None and high_52w not in (None, 0):
+        below_high_pct = round(((current_price - high_52w) / high_52w) * 100, 2)
+
+    above_low_pct = None
+    if current_price is not None and low_52w not in (None, 0):
+        above_low_pct = round(((current_price - low_52w) / low_52w) * 100, 2)
+
+    if below_high_pct is None:
+        high_distance_text = "n/a"
+        high_distance_color = "#64748b"
+    elif below_high_pct <= 0:
+        high_distance_text = f"↓ {abs(below_high_pct):.1f}% below high"
+        high_distance_color = "#dc2626" if below_high_pct <= -15 else "#d97706"
+    else:
+        high_distance_text = f"↑ {below_high_pct:.1f}% above high"
+        high_distance_color = "#047857"
+
+    if above_low_pct is None:
+        low_distance_text = "n/a"
+        low_distance_color = "#64748b"
+    elif above_low_pct >= 0:
+        low_distance_text = f"↑ {above_low_pct:.1f}% above low"
+        low_distance_color = "#047857" if above_low_pct >= 20 else "#d97706"
+    else:
+        low_distance_text = f"↓ {abs(above_low_pct):.1f}% below low"
+        low_distance_color = "#dc2626"
+
+    return {
+        "current_price": current_price,
+        "high_52w": high_52w,
+        "low_52w": low_52w,
+        "high_distance_text": high_distance_text,
+        "high_distance_color": high_distance_color,
+        "low_distance_text": low_distance_text,
+        "low_distance_color": low_distance_color,
+    }
+
+
+def _format_rupee(value):
+    if value is None:
+        return "n/a"
+    return f"₹{value:.2f}"
+
+
+def build_52_week_range_html(range_data):
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                    <div style="font-size:13px;color:#475569;font-weight:700;">52-Week Range</div>
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
+                                        <tr>
+                                            <td style="padding:6px 8px 6px 0;width:33.33%;vertical-align:top;">
+                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">52W High</div>
+                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['high_52w'])}</div>
+                                            </td>
+                                            <td style="padding:6px 8px;width:33.33%;vertical-align:top;">
+                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">Current</div>
+                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['current_price'])}</div>
+                                            </td>
+                                            <td style="padding:6px 0 6px 8px;width:33.33%;vertical-align:top;">
+                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">52W Low</div>
+                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['low_52w'])}</div>
+                                            </td>
+                                        </tr>
+                                    </table>
+                                    <div style="margin-top:6px;font-size:12px;font-weight:800;color:{range_data['high_distance_color']};">{range_data['high_distance_text']}</div>
+                                    <div style="margin-top:3px;font-size:12px;font-weight:700;color:{range_data['low_distance_color']};">{range_data['low_distance_text']}</div>
+                                </td>
+                            </tr>
+    """
+
+
+def _format_ratio(value, decimals=1):
+    numeric_value = _safe_float(value)
+    if numeric_value is None:
+        return "n/a"
+    return f"{numeric_value:.{decimals}f}"
+
+
+def _format_percent(value, decimals=1):
+    numeric_value = _safe_float(value)
+    if numeric_value is None:
+        return "n/a"
+    if abs(numeric_value) <= 1:
+        numeric_value *= 100
+    return f"{numeric_value:.{decimals}f}%"
+
+
+def build_fundamentals_html(fundamentals, fund_score):
+    metrics = [
+        ("PE", _format_ratio(fundamentals.get("pe"), 1)),
+        ("PB", _format_ratio(fundamentals.get("pb"), 1)),
+        ("Dividend Yield", _format_percent(fundamentals.get("dividendYield"), 1)),
+        ("ROE", _format_percent(fundamentals.get("roe"), 1)),
+        ("Debt/Equity", _format_ratio(fundamentals.get("debtToEquity"), 1)),
+    ]
+
+    metric_cells = []
+    for label, value in metrics:
+        metric_cells.append(
+            f'<td style="padding:6px 8px 6px 0;width:50%;vertical-align:top;">'
+            f'<div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">{label}</div>'
+            f'<div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{value}</div>'
+            f'</td>'
+        )
+
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                                        <div style="font-size:13px;color:#475569;font-weight:700;">Fundamentals</div>
+                                        <div style="display:inline-block;padding:5px 10px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:12px;font-weight:800;white-space:nowrap;">
+                                            Score {fund_score}
+                                        </div>
+                                    </div>
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
+                                        <tr>
+                                            {metric_cells[0]}
+                                            {metric_cells[1]}
+                                        </tr>
+                                        <tr>
+                                            {metric_cells[2]}
+                                            {metric_cells[3]}
+                                        </tr>
+                                        <tr>
+                                            {metric_cells[4]}
+                                            <td style="padding:6px 8px 6px 0;width:50%;vertical-align:top;"></td>
+                                        </tr>
+                                    </table>
+                                </td>
+                            </tr>
+    """
+
+
 def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamentals, market_context):
     # Use the existing final_score weighting and fold advanced fundamentals into total score.
     combined_fund = fundamentals + (adv_fundamentals * 0.4)
@@ -600,6 +917,8 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         
         # Get risk management data
         risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
+        risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
+        range_52w = calculate_52_week_range(df, latest)
 
         entry_context = {
             "current_price": round(latest["close"], 2),
@@ -741,13 +1060,16 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                                 <td style="padding:6px 0;"><strong>Volume / RR</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['volume_vs_avg_pct']:+.1f}% vol / {entry_context['risk_reward_ratio']}:1 RR</div></td>
                             </tr>
                             <tr>
-                                <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
-                                <td style="padding:6px 0;"><strong>AdvFund / Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{adv_fund_score} / {sentiment_score} ({sentiment_label})</div></td>
+                                <td style="padding:6px 0;"><strong>Technical Score</strong><div style="color:#0f172a;margin-top:4px;">{tech_score}</div></td>
+                                <td style="padding:6px 0;"><strong>Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{sentiment_score} ({sentiment_label})</div></td>
                             </tr>
                             <tr>
                                 <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
                                 <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
                             </tr>
+                            {build_fundamentals_html(fund_raw, fund_score)}
+                            {build_52_week_range_html(range_52w)}
+                            {build_risk_meter_html(risk_meter)}
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
                                     <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
@@ -788,7 +1110,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
             "upcoming_events": events,
         }
 
-        print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']}")
+        print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']} | Risk: {risk_meter['label']}")
         return (priority, total_score, stock_name, row_html, summary_entry) 
     
     except Exception as e:

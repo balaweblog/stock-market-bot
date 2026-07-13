@@ -216,9 +216,11 @@ def fetch_fundamentals(symbol):
 
     return {
         "pe": info.get("trailingPE"),
+        "pb": info.get("priceToBook"),
         "marketCap": info.get("marketCap"),
         "roe": info.get("returnOnEquity"),
         "debtToEquity": info.get("debtToEquity"),
         "dividendYield": info.get("dividendYield"),
+        "beta": info.get("beta") if info.get("beta") is not None else info.get("beta3Year"),
         "upcomingEvents": build_upcoming_event_summary(ticker,info),
     }
