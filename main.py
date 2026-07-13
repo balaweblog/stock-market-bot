@@ -582,6 +582,68 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         else:
             priority = 1
 
+            events = upcoming_events
+
+    if events.get("has_event"):
+
+        details = []
+
+        if events["dividend_record_date"] != "NA":
+            details.append(
+                f"<div><strong>Dividend Record:</strong> {events['dividend_record_date']}</div>"
+            )
+
+        if events["results_announcement_date"] != "NA":
+            details.append(
+                f"<div><strong>Results Announcement:</strong> {events['results_announcement_date']}</div>"
+            )
+
+        events_html = f"""
+        <div style="margin-top:6px;padding:10px 12px;
+                    border-radius:8px;
+                    background:#FEF3C7;
+                    border-left:4px solid #F59E0B;">
+
+            <div style="font-size:12px;
+                        color:#92400E;
+                        font-weight:bold;
+                        text-transform:uppercase;">
+                Next Upcoming Event
+            </div>
+
+            <div style="font-size:16px;
+                        color:#92400E;
+                        font-weight:bold;
+                        margin-top:3px;">
+                {events['next_upcoming_event_label']}
+            </div>
+
+            <div style="font-size:14px;
+                        color:#B45309;
+                        margin-top:3px;">
+                {events['next_upcoming_event_date']}
+            </div>
+
+            <hr style="margin:8px 0;border:none;border-top:1px solid #FCD34D;">
+
+            {''.join(details)}
+
+        </div>
+        """
+
+    else:
+
+        events_html = """
+        <div style="margin-top:6px;
+                    padding:10px;
+                    border-radius:8px;
+                    background:#F8FAFC;
+                    border:1px solid #CBD5E1;
+                    color:#475569;
+                    font-size:13px;">
+            No dividend or earnings announcements are scheduled in the next 60 days.
+        </div>
+        """
         # card-style HTML for each stock (email-safe)
         row_html = f"""
         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
@@ -639,13 +701,11 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                         </tr>
                         <tr>
                             <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                <div style="font-size:13px;color:#475569;"><strong>Upcoming Events</strong></div>
-                                <div style="margin-top:6px;padding:8px 10px;border-radius:8px;background:#fef3c7;border:1px solid #f59e0b;">
-                                    <div style="font-size:13px;font-weight:700;color:#92400e;text-transform:uppercase;letter-spacing:0.04em;">{upcoming_events.get('next_upcoming_event_label', 'Upcoming Event')}</div>
-                                    <div style="margin-top:3px;font-size:15px;font-weight:800;color:#b45309;">{upcoming_events.get('next_upcoming_event_date', 'NA')}</div>
-                                    <div style="margin-top:4px;font-size:12px;color:#78350f;">
-                                        Dividend Record: <strong>{upcoming_events.get('dividend_record_date', 'NA')}</strong> &bull; Results Announcement: <strong>{upcoming_events.get('results_announcement_date', 'NA')}</strong>
-                                    </div>
+                        <div style="font-size:13px;color:#475569;">
+                        <strong>Upcoming Events</strong>
+                    </div>
+
+                    {events_html}
                                 </div>
                             </td>
                         </tr>
