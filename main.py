@@ -582,155 +582,157 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         else:
             priority = 1
 
-            events = upcoming_events
+        events = upcoming_events
+        
+        if events.get("has_event"):
+        
+            details = []
 
-    if events.get("has_event"):
+            if events["dividend_record_date"] != "NA":
+                details.append(
+                    f"<div><strong>Dividend Record:</strong> {events['dividend_record_date']}</div>"
+                )
 
-        details = []
+            if events["results_announcement_date"] != "NA":
+                details.append(
+                    f"<div><strong>Results Announcement:</strong> {events['results_announcement_date']}</div>"
+                )
 
-        if events["dividend_record_date"] != "NA":
-            details.append(
-                f"<div><strong>Dividend Record:</strong> {events['dividend_record_date']}</div>"
-            )
+            events_html = f"""
+            <div style="margin-top:6px;padding:10px 12px;
+                        border-radius:8px;
+                        background:#FEF3C7;
+                        border-left:4px solid #F59E0B;">
 
-        if events["results_announcement_date"] != "NA":
-            details.append(
-                f"<div><strong>Results Announcement:</strong> {events['results_announcement_date']}</div>"
-            )
+                <div style="font-size:12px;
+                            color:#92400E;
+                            font-weight:bold;
+                            text-transform:uppercase;">
+                    Next Upcoming Event
+                </div>
 
-        events_html = f"""
-        <div style="margin-top:6px;padding:10px 12px;
-                    border-radius:8px;
-                    background:#FEF3C7;
-                    border-left:4px solid #F59E0B;">
+                <div style="font-size:16px;
+                            color:#92400E;
+                            font-weight:bold;
+                            margin-top:3px;">
+                    {events['next_upcoming_event_label']}
+                </div>
 
-            <div style="font-size:12px;
-                        color:#92400E;
-                        font-weight:bold;
-                        text-transform:uppercase;">
-                Next Upcoming Event
+                <div style="font-size:14px;
+                            color:#B45309;
+                            margin-top:3px;">
+                    {events['next_upcoming_event_date']}
+                </div>
+
+                <hr style="margin:8px 0;border:none;border-top:1px solid #FCD34D;">
+
+                {''.join(details)}
+
             </div>
+            """
 
-            <div style="font-size:16px;
-                        color:#92400E;
-                        font-weight:bold;
-                        margin-top:3px;">
-                {events['next_upcoming_event_label']}
+        else:
+
+            events_html = """
+            <div style="margin-top:6px;
+                        padding:10px;
+                        border-radius:8px;
+                        background:#F8FAFC;
+                        border:1px solid #CBD5E1;
+                        color:#475569;
+                        font-size:13px;">
+                No dividend or earnings announcements are scheduled in the next 60 days.
             </div>
-
-            <div style="font-size:14px;
-                        color:#B45309;
-                        margin-top:3px;">
-                {events['next_upcoming_event_date']}
-            </div>
-
-            <hr style="margin:8px 0;border:none;border-top:1px solid #FCD34D;">
-
-            {''.join(details)}
-
-        </div>
-        """
-
-    else:
-
-        events_html = """
-        <div style="margin-top:6px;
-                    padding:10px;
-                    border-radius:8px;
-                    background:#F8FAFC;
-                    border:1px solid #CBD5E1;
-                    color:#475569;
-                    font-size:13px;">
-            No dividend or earnings announcements are scheduled in the next 60 days.
-        </div>
-        """
-        # card-style HTML for each stock (email-safe)
+            """
+            # card-style HTML for each stock (email-safe)
         row_html = f"""
-        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
-            <tr>
-                <td style="padding:14px;">
-                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
-                        <tr>
-                            <td style="vertical-align:top;">
-                                <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
-                                <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
-                            </td>
-                            <td style="width:110px;text-align:right;vertical-align:top;">
-                                <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
-                                <div style="margin-top:8px;font-size:13px;color:#334155;">Score: <strong>{total_score}</strong></div>
-                            </td>
-                        </tr>
-                    </table>
-                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
-                        <tr>
-                            <td style="padding:6px 0;width:50%;"><strong>Current Price</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
-                            <td style="padding:6px 0;width:50%;"><strong>EMA20 / EMA50</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema20'],2)} / {round(latest['ema50'],2)}</div></td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
-                            <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 0;"><strong>Prev Close</strong><div style="color:#0f172a;margin-top:4px;">{prev_close if prev_close is not None else 'n/a'}</div></td>
-                            <td style="padding:6px 0;"><strong>Change vs Prev</strong><div style="color:{prev_close_change_color};margin-top:4px;">{prev_close_change_text}</div></td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 0;"><strong>Entry Edge</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['price_vs_ema20_pct']:+.1f}% vs EMA20 / {entry_context['price_vs_ema50_pct']:+.1f}% vs EMA50</div></td>
-                            <td style="padding:6px 0;"><strong>Volume / RR</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['volume_vs_avg_pct']:+.1f}% vol / {entry_context['risk_reward_ratio']}:1 RR</div></td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
-                            <td style="padding:6px 0;"><strong>AdvFund / Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{adv_fund_score} / {sentiment_score} ({sentiment_label})</div></td>
-                        </tr>
-                        <tr>
-                            <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
-                            <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
-                        </tr>
-                        <tr>
-                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
-                                <div style="font-size:12px;color:#0f172a;margin-top:4px;">
-                                    <span style="color:#047857;font-weight:700;">Recommended {risk_data['recommended_entry_label']}: <strong>{risk_data['recommended_buy_level']}</strong></span>
-                                    <div style="margin-top:4px;color:#64748b;">
-                                        Patient: <strong>{risk_data['buy_levels']['patient_entry']}</strong> &bull;
-                                        Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
-                                        Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
+                <tr>
+                    <td style="padding:14px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                            <tr>
+                                <td style="vertical-align:top;">
+                                    <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
+                                    <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
+                                </td>
+                                <td style="width:110px;text-align:right;vertical-align:top;">
+                                    <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
+                                    <div style="margin-top:8px;font-size:13px;color:#334155;">Score: <strong>{total_score}</strong></div>
+                                </td>
+                            </tr>
+                        </table>
+                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
+                            <tr>
+                                <td style="padding:6px 0;width:50%;"><strong>Current Price</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
+                                <td style="padding:6px 0;width:50%;"><strong>EMA20 / EMA50</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema20'],2)} / {round(latest['ema50'],2)}</div></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0;"><strong>EMA100 / EMA200</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['ema100'],2)} / {round(latest['ema200'],2)}</div></td>
+                                <td style="padding:6px 0;"><strong>RSI / ADX</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['rsi'],2)} / {round(latest['adx'],2)}</div></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0;"><strong>Prev Close</strong><div style="color:#0f172a;margin-top:4px;">{prev_close if prev_close is not None else 'n/a'}</div></td>
+                                <td style="padding:6px 0;"><strong>Change vs Prev</strong><div style="color:{prev_close_change_color};margin-top:4px;">{prev_close_change_text}</div></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0;"><strong>Entry Edge</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['price_vs_ema20_pct']:+.1f}% vs EMA20 / {entry_context['price_vs_ema50_pct']:+.1f}% vs EMA50</div></td>
+                                <td style="padding:6px 0;"><strong>Volume / RR</strong><div style="color:#0f172a;margin-top:4px;">{entry_context['volume_vs_avg_pct']:+.1f}% vol / {entry_context['risk_reward_ratio']}:1 RR</div></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0;"><strong>Tech / Fund</strong><div style="color:#0f172a;margin-top:4px;">{tech_score} / {fund_score}</div></td>
+                                <td style="padding:6px 0;"><strong>AdvFund / Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{adv_fund_score} / {sentiment_score} ({sentiment_label})</div></td>
+                            </tr>
+                            <tr>
+                                <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
+                                <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
+                            </tr>
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                    <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
+                                    <div style="font-size:12px;color:#0f172a;margin-top:4px;">
+                                        <span style="color:#047857;font-weight:700;">Recommended {risk_data['recommended_entry_label']}: <strong>{risk_data['recommended_buy_level']}</strong></span>
+                                        <div style="margin-top:4px;color:#64748b;">
+                                            Patient: <strong>{risk_data['buy_levels']['patient_entry']}</strong> &bull;
+                                            Optimal: <strong>{risk_data['buy_levels']['optimal_entry']}</strong> &bull;
+                                            Aggressive: <strong>{risk_data['buy_levels']['aggressive_entry']}</strong>
+                                        </div>
                                     </div>
-                                </div>
-                            </td>
-                        </tr>
-                        <tr>
-                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                        <div style="font-size:13px;color:#475569;">
-                        <strong>Upcoming Events</strong>
-                    </div>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                            <div style="font-size:13px;color:#475569;">
+                            <strong>Upcoming Events</strong>
+                        </div>
 
-                    {events_html}
-                                </div>
-                            </td>
-                        </tr>
-                        <tr>
-                            <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
-                        </tr>
-                    </table>
-                </td>
-            </tr>
-        </table>
-        """
+                        {events_html}
+                                   
+                                </td>
+                            </tr>
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+            </table>
+            """
         print(f"{stock_name} ({ticker}) -> {signal} | Score: {total_score}")
-        return (priority, total_score, stock_name, row_html)
+        return (priority, total_score, stock_name, row_html) 
+    
     except Exception as e:
         error_text = f"Error processing {ticker}: {str(e)}"
         print(error_text)
         traceback.print_exc()
+        
         err_html = f"""
-        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
-            <tr>
-                <td style="padding:12px;color:#721c24;font-size:13px;"><strong>Error:</strong> {error_text}</td>
-            </tr>
-        </table>
-        """
-        return (4, 0, ticker, err_html)
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 20px;border-radius:8px;background:#fff7f7;border:1px solid #f5c2c7;">
+                <tr>
+                    <td style="padding:12px;color:#721c24;font-size:13px;"><strong>Error:</strong> {error_text}</td>
+                </tr>
+            </table>
+            """
+    return (4, 0, ticker, err_html)
 
 
 def get_section_html(title, count, items):
@@ -860,10 +862,21 @@ def main(mode, use_llm, detailed_llm=False):
         try:
          tracker = CommodityTracker()
          commodity_html = tracker.generate_html()
-         report_html += commodity_html
         except Exception as e:
          log.error(f"Commodity tracker failed: {e}")
          traceback.print_exc()
+
+        report_html += commodity_html
+
+        report_html += """
+                    </table>
+                    </td>
+                </tr>
+                </table>
+            </body>
+            </html>
+            """
+
 
         # Continue even if commodity API fails
         send_email(report_html, mode)
