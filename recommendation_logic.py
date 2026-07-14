@@ -95,11 +95,14 @@ def choose_stock_entry(signal, total_score, latest, market_context, entry_contex
 
 def derive_commodity_buy_levels(current_price, history):
     """Create dynamic buy levels for gold/silver based on the live current price."""
-    if not history:
+    if not history or len(history) < 3:
         return {
             "patient_entry": round(current_price * 0.98, 2),
             "optimal_entry": round(current_price, 2),
             "aggressive_entry": round(current_price * 1.02, 2),
+            "recommended_entry": "optimal_entry",
+            "recommended_entry_label": "Optimal Entry",
+            "recommended_buy_level": round(current_price, 2),
         }
 
     recent_changes = [row["change"] for row in history[-3:]]

@@ -224,3 +224,188 @@ def fetch_fundamentals(symbol):
         "beta": info.get("beta") if info.get("beta") is not None else info.get("beta3Year"),
         "upcomingEvents": build_upcoming_event_summary(ticker,info),
     }
+
+
+def _safe_pct(value):
+    """Return float percentage (0-100 scale) or None."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        # yfinance returns fractions (0.12 = 12%) for major_holders breakdown
+        return round(v * 100 if v <= 1.0 else v, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _direction_arrow(current, previous):
+    """Return (arrow, color) comparing two percentage values."""
+    if current is None or previous is None:
+        return "→", "#64748b"
+    diff = current - previous
+    if diff > 0.3:
+        return "↑", "#16a34a"
+    if diff < -0.3:
+        return "↓", "#dc2626"
+    return "→", "#64748b"
+
+
+def fetch_ownership_activity(symbol):
+    """
+    Fetches institutional, mutual-fund, insider ownership data from yfinance.
+
+    Returns a dict with:
+      institutional_pct      – % held by FII/institutional investors (latest)
+      institutional_prev_pct – % held previous quarter (for direction)
+      institutional_arrow    – ↑ / ↓ / →
+      institutional_color
+      mutualfund_pct         – % held by domestic MF/DII (latest)
+      mutualfund_prev_pct
+      mutualfund_arrow
+      mutualfund_color
+      insider_pct            – % held by insiders/promoters
+      insider_arrow
+      insider_color
+      net_insider_activity   – "Net Buy", "Net Sell", or "Neutral" from netSharePurchaseActivity
+      net_insider_shares     – raw net shares int or None
+      available              – bool, False if all data missing
+    """
+    result = {
+        "institutional_pct": None,
+        "institutional_prev_pct": None,
+        "institutional_arrow": "→",
+        "institutional_color": "#64748b",
+        "mutualfund_pct": None,
+        "mutualfund_prev_pct": None,
+        "mutualfund_arrow": "→",
+        "mutualfund_color": "#64748b",
+        "insider_pct": None,
+        "insider_arrow": "→",
+        "insider_color": "#64748b",
+        "net_insider_activity": "Neutral",
+        "net_insider_shares": None,
+        "available": False,
+    }
+
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info or {}
+
+        # ── Insider / Promoter % ──────────────────────────────────────────
+        insider_pct = _safe_pct(info.get("heldPercentInsiders"))
+        result["insider_pct"] = insider_pct
+
+        # ── Institutional (FII proxy) % ───────────────────────────────────
+        ih = ticker.institutional_holders
+        if ih is not None and not ih.empty:
+            # Sum pctHeld across all institutional holders for latest two report dates
+            pct_col = next((c for c in ih.columns if "pct" in c.lower() or "percent" in c.lower()), None)
+            date_col = next((c for c in ih.columns if "date" in c.lower()), None)
+
+            if pct_col and date_col:
+                ih = ih.sort_values(date_col, ascending=False)
+                dates = ih[date_col].dropna().unique()
+                if len(dates) >= 1:
+                    latest_rows = ih[ih[date_col] == dates[0]]
+                    result["institutional_pct"] = round(
+                        float(latest_rows[pct_col].apply(
+                            lambda x: float(x) * 100 if float(x) <= 1.0 else float(x)
+                        ).sum()), 2
+                    )
+                if len(dates) >= 2:
+                    prev_rows = ih[ih[date_col] == dates[1]]
+                    result["institutional_prev_pct"] = round(
+                        float(prev_rows[pct_col].apply(
+                            lambda x: float(x) * 100 if float(x) <= 1.0 else float(x)
+                        ).sum()), 2
+                    )
+            else:
+                # Fallback: use info field
+                result["institutional_pct"] = _safe_pct(info.get("heldPercentInstitutions"))
+
+        else:
+            result["institutional_pct"] = _safe_pct(info.get("heldPercentInstitutions"))
+
+        arrow, color = _direction_arrow(
+            result["institutional_pct"], result["institutional_prev_pct"]
+        )
+        result["institutional_arrow"] = arrow
+        result["institutional_color"] = color
+
+        # ── Mutual Fund / DII % ───────────────────────────────────────────
+        mf = ticker.mutualfund_holders
+        if mf is not None and not mf.empty:
+            pct_col = next((c for c in mf.columns if "pct" in c.lower() or "percent" in c.lower()), None)
+            date_col = next((c for c in mf.columns if "date" in c.lower()), None)
+
+            if pct_col and date_col:
+                mf = mf.sort_values(date_col, ascending=False)
+                dates = mf[date_col].dropna().unique()
+                if len(dates) >= 1:
+                    latest_rows = mf[mf[date_col] == dates[0]]
+                    result["mutualfund_pct"] = round(
+                        float(latest_rows[pct_col].apply(
+                            lambda x: float(x) * 100 if float(x) <= 1.0 else float(x)
+                        ).sum()), 2
+                    )
+                if len(dates) >= 2:
+                    prev_rows = mf[mf[date_col] == dates[1]]
+                    result["mutualfund_prev_pct"] = round(
+                        float(prev_rows[pct_col].apply(
+                            lambda x: float(x) * 100 if float(x) <= 1.0 else float(x)
+                        ).sum()), 2
+                    )
+
+        arrow, color = _direction_arrow(
+            result["mutualfund_pct"], result["mutualfund_prev_pct"]
+        )
+        result["mutualfund_arrow"] = arrow
+        result["mutualfund_color"] = color
+
+        # ── Net insider purchase activity ─────────────────────────────────
+        try:
+            ip = ticker.insider_purchases
+            if ip is not None and not ip.empty:
+                # Row index labels vary; look for "Net Shares Purchased (Sold)" row
+                shares_col = next((c for c in ip.columns if "share" in str(c).lower()), None)
+                label_col = ip.columns[0]  # first col is the label
+                if shares_col:
+                    net_row = ip[ip[label_col].astype(str).str.contains("Net Shares", case=False, na=False)]
+                    if not net_row.empty:
+                        net_val = net_row[shares_col].iloc[0]
+                        try:
+                            net_val = int(float(net_val))
+                            result["net_insider_shares"] = net_val
+                            if net_val > 0:
+                                result["net_insider_activity"] = "Net Buy"
+                            elif net_val < 0:
+                                result["net_insider_activity"] = "Net Sell"
+                            else:
+                                result["net_insider_activity"] = "Neutral"
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:
+            pass
+
+        # Insider direction arrow based on net activity
+        if result["net_insider_activity"] == "Net Buy":
+            result["insider_arrow"] = "↑"
+            result["insider_color"] = "#16a34a"
+        elif result["net_insider_activity"] == "Net Sell":
+            result["insider_arrow"] = "↓"
+            result["insider_color"] = "#dc2626"
+        else:
+            result["insider_arrow"] = "→"
+            result["insider_color"] = "#64748b"
+
+        # Mark available if we got at least one meaningful data point
+        result["available"] = any([
+            result["institutional_pct"] is not None,
+            result["mutualfund_pct"] is not None,
+            result["insider_pct"] is not None,
+        ])
+
+    except Exception:
+        pass  # Return default result with available=False
+
+    return result
