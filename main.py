@@ -506,54 +506,60 @@ def build_risk_meter_html(risk_meter):
         meta = _risk_level_meta(1 if option == "Low" else 2 if option == "Medium" else 3)
         active = option == risk_meter["label"]
         background = meta["background"] if active else "#f8fafc"
-        border = meta["border"] if active else "#e2e8f0"
-        color = meta["color"] if active else "#94a3b8"
-        opacity = "1" if active else "0.5"
+        border     = meta["border"]     if active else "#e2e8f0"
+        color      = meta["color"]      if active else "#94a3b8"
+        opacity    = "1"                if active else "0.5"
         legend_cells.append(
-            f'<td style="padding:0 3px;vertical-align:top;width:33.33%;">'
-            f'<div style="padding:8px 10px;border-radius:10px;text-align:center;'
+            f'<td style="padding:0 4px 0 0;vertical-align:top;width:33.33%;">'
+            f'<div style="padding:7px 6px;border-radius:8px;text-align:center;'
             f'background:{background};border:1px solid {border};color:{color};'
             f'font-size:12px;font-weight:800;opacity:{opacity};white-space:nowrap;">'
             f'{meta["emoji"]} {option}</div></td>'
         )
+    # Remove trailing right-padding on last cell
+    legend_cells[-1] = legend_cells[-1].replace('padding:0 4px 0 0;', 'padding:0;')
 
-    factor_rows = []
-    for factor in risk_meter["factors"]:
-        factor_rows.append(
-            f'<td style="padding:6px 6px 0 0;width:50%;vertical-align:top;">'
-            f'<div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">'
+    def _factor_cell(factor, right=False):
+        pad = "padding:8px 0 0 10px;" if right else "padding:8px 10px 0 0;"
+        return (
+            f'<td style="{pad}width:50%;vertical-align:top;">'
+            f'<div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">'
             f'{factor["label"]}</div>'
-            f'<div style="margin-top:3px;color:#0f172a;font-size:12px;font-weight:700;">'
+            f'<div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:700;">'
             f'{factor["value"]}</div>'
-            f'<div style="margin-top:3px;font-size:11px;color:{factor["meta"]["color"]};font-weight:700;">'
+            f'<div style="margin-top:2px;font-size:11px;color:{factor["meta"]["color"]};font-weight:700;">'
             f'{factor["meta"]["emoji"]} {factor["meta"]["label"]}</div></td>'
         )
+
+    factors = risk_meter["factors"]
 
     return f"""
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-                                        <div>
-                                            <div style="font-size:13px;color:#475569;font-weight:700;">Risk Meter</div>
-                                            <div style="margin-top:3px;font-size:12px;color:#64748b;">Based on ATR, Volatility, Beta and ADX</div>
-                                        </div>
-                                        <div style="display:inline-block;padding:6px 12px;border-radius:999px;background:{risk_meter['background']};border:1px solid {risk_meter['border']};color:{risk_meter['color']};font-size:12px;font-weight:800;white-space:nowrap;">
-                                            {risk_meter['emoji']} {risk_meter['label']} Risk
-                                        </div>
-                                    </div>
-                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:10px;border-collapse:separate;border-spacing:0;">
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                                         <tr>
-                                            {''.join(legend_cells)}
+                                            <td style="vertical-align:middle;">
+                                                <div style="font-size:13px;color:#475569;font-weight:700;">Risk Meter</div>
+                                                <div style="margin-top:2px;font-size:11px;color:#94a3b8;">ATR &bull; Volatility &bull; Beta &bull; ADX</div>
+                                            </td>
+                                            <td style="text-align:right;vertical-align:middle;">
+                                                <span style="display:inline-block;padding:5px 12px;border-radius:999px;background:{risk_meter['background']};border:1px solid {risk_meter['border']};color:{risk_meter['color']};font-size:12px;font-weight:800;white-space:nowrap;">{risk_meter['emoji']} {risk_meter['label']} Risk</span>
+                                            </td>
                                         </tr>
                                     </table>
                                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
                                         <tr>
-                                            {factor_rows[0]}
-                                            {factor_rows[1]}
+                                            {''.join(legend_cells)}
+                                        </tr>
+                                    </table>
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:4px;border-collapse:collapse;">
+                                        <tr>
+                                            {_factor_cell(factors[0])}
+                                            {_factor_cell(factors[1], right=True)}
                                         </tr>
                                         <tr>
-                                            {factor_rows[2]}
-                                            {factor_rows[3]}
+                                            {_factor_cell(factors[2])}
+                                            {_factor_cell(factors[3], right=True)}
                                         </tr>
                                     </table>
                                 </td>
@@ -617,25 +623,51 @@ def build_52_week_range_html(range_data):
     return f"""
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="font-size:13px;color:#475569;font-weight:700;">52-Week Range</div>
-                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
+                                    <!-- Section heading row -->
+                                    <div style="font-size:13px;color:#475569;font-weight:700;">Distance from 52-Week High / Low</div>
+                                    <!-- High | Current | Low three-column price display -->
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:10px;border-collapse:collapse;">
                                         <tr>
-                                            <td style="padding:6px 8px 6px 0;width:33.33%;vertical-align:top;">
-                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">52W High</div>
-                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['high_52w'])}</div>
+                                            <!-- 52W High -->
+                                            <td style="width:33.33%;vertical-align:top;padding-right:6px;">
+                                                <div style="padding:10px;border-radius:10px;background:#f0fdf4;border:1px solid #bbf7d0;text-align:center;">
+                                                    <div style="font-size:10px;color:#16a34a;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">52W High</div>
+                                                    <div style="margin-top:5px;color:#0f172a;font-size:14px;font-weight:800;">{_format_rupee(range_data['high_52w'])}</div>
+                                                </div>
                                             </td>
-                                            <td style="padding:6px 8px;width:33.33%;vertical-align:top;">
-                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">Current</div>
-                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['current_price'])}</div>
+                                            <!-- Current Price -->
+                                            <td style="width:33.33%;vertical-align:top;padding:0 3px;">
+                                                <div style="padding:10px;border-radius:10px;background:#f8fafc;border:1px solid #e2e8f0;text-align:center;">
+                                                    <div style="font-size:10px;color:#475569;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">Current</div>
+                                                    <div style="margin-top:5px;color:#0f172a;font-size:14px;font-weight:800;">{_format_rupee(range_data['current_price'])}</div>
+                                                </div>
                                             </td>
-                                            <td style="padding:6px 0 6px 8px;width:33.33%;vertical-align:top;">
-                                                <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">52W Low</div>
-                                                <div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{_format_rupee(range_data['low_52w'])}</div>
+                                            <!-- 52W Low -->
+                                            <td style="width:33.33%;vertical-align:top;padding-left:6px;">
+                                                <div style="padding:10px;border-radius:10px;background:#fef2f2;border:1px solid #fecaca;text-align:center;">
+                                                    <div style="font-size:10px;color:#dc2626;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">52W Low</div>
+                                                    <div style="margin-top:5px;color:#0f172a;font-size:14px;font-weight:800;">{_format_rupee(range_data['low_52w'])}</div>
+                                                </div>
                                             </td>
                                         </tr>
                                     </table>
-                                    <div style="margin-top:6px;font-size:12px;font-weight:800;color:{range_data['high_distance_color']};">{range_data['high_distance_text']}</div>
-                                    <div style="margin-top:3px;font-size:12px;font-weight:700;color:{range_data['low_distance_color']};">{range_data['low_distance_text']}</div>
+                                    <!-- Distance badges -->
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
+                                        <tr>
+                                            <td style="width:50%;padding-right:4px;vertical-align:top;">
+                                                <div style="padding:7px 10px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;">
+                                                    <div style="font-size:10px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">vs 52W High</div>
+                                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:{range_data['high_distance_color']};">{range_data['high_distance_text']}</div>
+                                                </div>
+                                            </td>
+                                            <td style="width:50%;padding-left:4px;vertical-align:top;">
+                                                <div style="padding:7px 10px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;">
+                                                    <div style="font-size:10px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">vs 52W Low</div>
+                                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:{range_data['low_distance_color']};">{range_data['low_distance_text']}</div>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </table>
                                 </td>
                             </tr>
     """
@@ -657,45 +689,127 @@ def _format_percent(value, decimals=1):
     return f"{numeric_value:.{decimals}f}%"
 
 
-def build_fundamentals_html(fundamentals, fund_score):
-    metrics = [
-        ("PE", _format_ratio(fundamentals.get("pe"), 1)),
-        ("PB", _format_ratio(fundamentals.get("pb"), 1)),
-        ("Dividend Yield", _format_percent(fundamentals.get("dividendYield"), 1)),
-        ("ROE", _format_percent(fundamentals.get("roe"), 1)),
-        ("Debt/Equity", _format_ratio(fundamentals.get("debtToEquity"), 1)),
-    ]
+def _fund_color(label, raw_value):
+    """Return (value_color, hint_text, hint_color) based on metric health."""
+    v = _safe_float(raw_value)
+    if v is None:
+        return "#64748b", "No data", "#94a3b8"
 
-    metric_cells = []
-    for label, value in metrics:
-        metric_cells.append(
-            f'<td style="padding:6px 8px 6px 0;width:50%;vertical-align:top;">'
-            f'<div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;">{label}</div>'
-            f'<div style="margin-top:3px;color:#0f172a;font-size:13px;font-weight:800;">{value}</div>'
-            f'</td>'
+    if label == "PE":
+        if v < 15:
+            return "#047857", "Undervalued", "#047857"
+        if v < 25:
+            return "#0f172a", "Fair", "#64748b"
+        if v < 40:
+            return "#d97706", "Stretched", "#d97706"
+        return "#dc2626", "Expensive", "#dc2626"
+
+    if label == "PB":
+        if v < 1:
+            return "#047857", "Below book", "#047857"
+        if v < 3:
+            return "#0f172a", "Reasonable", "#64748b"
+        if v < 6:
+            return "#d97706", "Premium", "#d97706"
+        return "#dc2626", "Very high", "#dc2626"
+
+    if label == "Dividend Yield":
+        # raw_value comes in as a fraction (e.g. 0.023) or percent
+        pct = v * 100 if v <= 1 else v
+        if pct >= 3:
+            return "#047857", "High yield", "#047857"
+        if pct >= 1:
+            return "#0f172a", "Moderate", "#64748b"
+        if pct > 0:
+            return "#d97706", "Low yield", "#d97706"
+        return "#94a3b8", "No dividend", "#94a3b8"
+
+    if label == "ROE":
+        pct = v * 100 if v <= 1 else v
+        if pct >= 20:
+            return "#047857", "Strong", "#047857"
+        if pct >= 12:
+            return "#0f172a", "Decent", "#64748b"
+        if pct >= 0:
+            return "#d97706", "Weak", "#d97706"
+        return "#dc2626", "Negative", "#dc2626"
+
+    if label == "Debt / Equity":
+        if v < 30:
+            return "#047857", "Low debt", "#047857"
+        if v < 100:
+            return "#0f172a", "Manageable", "#64748b"
+        if v < 200:
+            return "#d97706", "High debt", "#d97706"
+        return "#dc2626", "Very high", "#dc2626"
+
+    return "#0f172a", "", "#64748b"
+
+
+def build_fundamentals_html(fundamentals, fund_score):
+    # Score pill color based on score value
+    if fund_score >= 70:
+        score_bg, score_border, score_color = "#f0fdf4", "#bbf7d0", "#15803d"
+    elif fund_score >= 40:
+        score_bg, score_border, score_color = "#fffbeb", "#fde68a", "#b45309"
+    else:
+        score_bg, score_border, score_color = "#fef2f2", "#fecaca", "#b91c1c"
+
+    def _tile(label, raw_value, formatted_value, right=False):
+        val_color, hint, hint_color = _fund_color(label, raw_value)
+        pad = "padding:0 0 6px 6px;" if right else "padding:0 6px 6px 0;"
+        hint_html = (
+            f'<div style="margin-top:3px;font-size:10px;font-weight:700;color:{hint_color};">{hint}</div>'
+            if hint else ""
         )
+        return (
+            f'<td style="{pad}width:50%;vertical-align:top;">'
+            f'<div style="padding:9px 10px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;">'
+            f'<div style="font-size:10px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{label}</div>'
+            f'<div style="margin-top:5px;font-size:15px;font-weight:800;color:{val_color};">{formatted_value}</div>'
+            f'{hint_html}'
+            f'</div></td>'
+        )
+
+    pe_raw   = fundamentals.get("pe")
+    pb_raw   = fundamentals.get("pb")
+    div_raw  = fundamentals.get("dividendYield")
+    roe_raw  = fundamentals.get("roe")
+    debt_raw = fundamentals.get("debtToEquity")
+
+    pe_fmt   = _format_ratio(pe_raw, 1)
+    pb_fmt   = _format_ratio(pb_raw, 1)
+    div_fmt  = _format_percent(div_raw, 1)
+    roe_fmt  = _format_percent(roe_raw, 1)
+    debt_fmt = _format_ratio(debt_raw, 1)
 
     return f"""
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-                                        <div style="font-size:13px;color:#475569;font-weight:700;">Fundamentals</div>
-                                        <div style="display:inline-block;padding:5px 10px;border-radius:999px;background:#eff6ff;border:1px solid #bfdbfe;color:#1d4ed8;font-size:12px;font-weight:800;white-space:nowrap;">
-                                            Score {fund_score}
-                                        </div>
-                                    </div>
+                                    <!-- Header: title + score pill -->
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                                        <tr>
+                                            <td style="vertical-align:middle;">
+                                                <div style="font-size:13px;color:#475569;font-weight:700;">Fundamentals</div>
+                                            </td>
+                                            <td style="text-align:right;vertical-align:middle;">
+                                                <span style="display:inline-block;padding:4px 10px;border-radius:999px;background:{score_bg};border:1px solid {score_border};color:{score_color};font-size:12px;font-weight:800;white-space:nowrap;">Score {fund_score}</span>
+                                            </td>
+                                        </tr>
+                                    </table>
+                                    <!-- Metric tiles grid -->
                                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
                                         <tr>
-                                            {metric_cells[0]}
-                                            {metric_cells[1]}
+                                            {_tile("PE",   pe_raw,   pe_fmt)}
+                                            {_tile("PB",   pb_raw,   pb_fmt,  right=True)}
                                         </tr>
                                         <tr>
-                                            {metric_cells[2]}
-                                            {metric_cells[3]}
+                                            {_tile("ROE",            roe_raw,  roe_fmt)}
+                                            {_tile("Dividend Yield", div_raw,  div_fmt, right=True)}
                                         </tr>
                                         <tr>
-                                            {metric_cells[4]}
-                                            <td style="padding:6px 8px 6px 0;width:50%;vertical-align:top;"></td>
+                                            {_tile("Debt / Equity",  debt_raw, debt_fmt)}
+                                            <td style="width:50%;padding:0 0 6px 6px;vertical-align:top;"></td>
                                         </tr>
                                     </table>
                                 </td>
@@ -1358,6 +1472,35 @@ def main(mode, use_llm, detailed_llm=False):
     section_html += get_section_html("Errors", err_count, groups["Errors"])
 
     report_html += quick_summary_html + summary_html + section_html
+
+    # Commodity section (Gold & Silver) — always included, with graceful fallback
+    try:
+        tracker = CommodityTracker()
+        commodity_html = tracker.generate_html()
+        report_html += f"""
+            <tr>
+              <td style="padding:0 20px 20px;">
+                {commodity_html}
+              </td>
+            </tr>
+        """
+    except Exception as e:
+        log.error(f"Commodity tracker failed: {e}")
+        traceback.print_exc()
+        report_html += """
+            <tr>
+              <td style="padding:0 20px 20px;">
+                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
+                  <tr>
+                    <td style="padding:14px;color:#721c24;font-size:13px;">
+                      <strong>Commodities Unavailable:</strong> Could not fetch Gold &amp; Silver prices at this time.
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+        """
+
     report_html += """
           </table>
         </td>
@@ -1372,26 +1515,6 @@ def main(mode, use_llm, detailed_llm=False):
             f.write(report_html)
         log.info("Report saved to report.html (DRY_RUN enabled)")
     else:
-        try:
-         tracker = CommodityTracker()
-         commodity_html = tracker.generate_html()
-        except Exception as e:
-         log.error(f"Commodity tracker failed: {e}")
-         traceback.print_exc()
-
-        report_html += commodity_html
-
-        report_html += """
-                    </table>
-                    </td>
-                </tr>
-                </table>
-            </body>
-            </html>
-            """
-
-
-        # Continue even if commodity API fails
         send_email(report_html, mode)
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
