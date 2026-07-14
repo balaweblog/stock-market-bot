@@ -1544,9 +1544,9 @@ def main(mode, use_llm, detailed_llm=False):
     section_html += get_section_html("Sell", sell_count, groups["Sell"])
     section_html += get_section_html("Errors", err_count, groups["Errors"])
 
-    report_html += quick_summary_html + summary_html + section_html
-
-    # Commodity section (Gold & Silver) — reuse already-fetched data, no second API call
+    # Commodity section (Gold & Silver) — built BEFORE stock sections so it appears
+    # near the top of the email and is never clipped by Gmail's 102 KB limit.
+    commodity_row_html = ""
     if commodity_data is not None:
         try:
             gold_levels   = tracker.derive_buy_levels(commodity_data["gold"]["current"],   commodity_data["gold"]["history"])
@@ -1578,7 +1578,7 @@ def main(mode, use_llm, detailed_llm=False):
                 </table>
                 {gold_card}
                 {silver_card}"""
-            report_html += f"""
+            commodity_row_html = f"""
                 <tr>
                   <td style="padding:0 20px 20px;">
                     {commodity_section_html}
@@ -1588,7 +1588,7 @@ def main(mode, use_llm, detailed_llm=False):
         except Exception as e:
             log.error(f"Commodity card render failed: {e}")
             traceback.print_exc()
-            report_html += """
+            commodity_row_html = """
                 <tr>
                   <td style="padding:0 20px 20px;">
                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
@@ -1602,7 +1602,7 @@ def main(mode, use_llm, detailed_llm=False):
                 </tr>
             """
     else:
-        report_html += """
+        commodity_row_html = """
             <tr>
               <td style="padding:0 20px 20px;">
                 <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
@@ -1615,6 +1615,9 @@ def main(mode, use_llm, detailed_llm=False):
               </td>
             </tr>
         """
+
+    # Commodities first, then stock sections — ensures commodities are never clipped
+    report_html += quick_summary_html + summary_html + commodity_row_html + section_html
 
     report_html += """
           </table>
