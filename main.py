@@ -1449,18 +1449,91 @@ def main(mode, use_llm, detailed_llm=False):
     """
 
     quick_summary_text = build_quick_summary(summary_rows)
+
+    # Fetch commodity data early so we can include it in the quick summary
+    # and reuse the same data object when rendering the full section below.
+    commodity_data = None
+    commodity_fetch_error = None
+    try:
+        tracker = CommodityTracker()
+        commodity_data = tracker.get_commodity_data()
+    except Exception as e:
+        commodity_fetch_error = e
+        log.error(f"Commodity tracker failed during data fetch: {e}")
+        traceback.print_exc()
+
+    # Build commodity summary bullets
+    commodity_bullets = []
+    if commodity_data:
+        for metal, key in [("Gold (22K)", "gold"), ("Silver", "silver")]:
+            metal_data = commodity_data[key]
+            change = metal_data.get("change", 0)
+            current = metal_data.get("current", 0)
+            history = metal_data.get("history", [])
+
+            change_sign = "+" if change > 0 else ""
+            direction = "↑" if change > 0 else ("↓" if change < 0 else "→")
+
+            # Check if a buy signal is triggered
+            buy_triggered = False
+            if len(history) >= 3:
+                recent = [r["change"] for r in history[-3:]]
+                latest_c, prev_c, older_c = recent[-1], recent[-2], recent[-3]
+                score = 0
+                if latest_c <= -1.5: score += 4
+                if latest_c <= -2.5: score += 4
+                if prev_c <= -1.0:   score += 2
+                if older_c <= -1.0:  score += 1
+                if latest_c < prev_c: score += 2
+                if latest_c < 0:     score += 1
+                buy_triggered = score >= 8
+
+            if buy_triggered:
+                commodity_bullets.append(
+                    f"✅ Buy Signal: {metal} at &#8377;{current:.2f} ({change_sign}{change}%)"
+                )
+            elif change <= -1.5:
+                commodity_bullets.append(
+                    f"📉 {metal} {direction} {change_sign}{change}% — watching for entry"
+                )
+            elif change >= 1.5:
+                commodity_bullets.append(
+                    f"📈 {metal} {direction} {change_sign}{change}% — momentum up"
+                )
+            else:
+                commodity_bullets.append(
+                    f"⬛ {metal} {direction} {change_sign}{change}% — stable"
+                )
+
+    # Merge stock bullets + commodity bullets into one quick summary block
+    all_bullets = (quick_summary_text.splitlines() if quick_summary_text else []) + commodity_bullets
+
     quick_summary_html = ""
-    if quick_summary_text:
-        bullet_html = "".join(
+    if all_bullets:
+        stock_bullet_html = "".join(
             f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
-            for item in quick_summary_text.splitlines()
+            for item in (quick_summary_text.splitlines() if quick_summary_text else [])
         )
+        commodity_bullet_html = ""
+        if commodity_bullets:
+            commodity_bullet_html = (
+                '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #dbeafe;">'
+                '<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;'
+                'letter-spacing:0.04em;margin-bottom:4px;">Commodities</div>'
+                + "".join(
+                    f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
+                    for item in commodity_bullets
+                )
+                + '</div>'
+            )
+
         quick_summary_html = f"""
             <tr>
               <td style="padding:0 20px 12px;">
                 <div style="border:1px solid #dbeafe;border-left:4px solid #2563eb;border-radius:10px;background:#f8fbff;padding:10px 12px;">
                   <div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:0.04em;">Quick Summary</div>
-                  {bullet_html}
+                  {stock_bullet_html}
+                  {commodity_bullet_html}
                 </div>
               </td>
             </tr>
@@ -1473,20 +1546,62 @@ def main(mode, use_llm, detailed_llm=False):
 
     report_html += quick_summary_html + summary_html + section_html
 
-    # Commodity section (Gold & Silver) — always included, with graceful fallback
-    try:
-        tracker = CommodityTracker()
-        commodity_html = tracker.generate_html()
-        report_html += f"""
-            <tr>
-              <td style="padding:0 20px 20px;">
-                {commodity_html}
-              </td>
-            </tr>
-        """
-    except Exception as e:
-        log.error(f"Commodity tracker failed: {e}")
-        traceback.print_exc()
+    # Commodity section (Gold & Silver) — reuse already-fetched data, no second API call
+    if commodity_data is not None:
+        try:
+            gold_levels   = tracker.derive_buy_levels(commodity_data["gold"]["current"],   commodity_data["gold"]["history"])
+            silver_levels = tracker.derive_buy_levels(commodity_data["silver"]["current"], commodity_data["silver"]["history"])
+            gold_plan   = tracker.build_trade_plan(commodity_data["gold"]["current"],   commodity_data["gold"]["history"],   gold_levels)
+            silver_plan = tracker.build_trade_plan(commodity_data["silver"]["current"], commodity_data["silver"]["history"], silver_levels)
+
+            gold_card = tracker._commodity_card_html(
+                name="Gold (22K)", ticker_label="XAU/INR",
+                current_price=commodity_data["gold"]["current"],
+                change=commodity_data["gold"]["change"],
+                history=commodity_data["gold"]["history"],
+                levels=gold_levels, plan=gold_plan,
+            )
+            silver_card = tracker._commodity_card_html(
+                name="Silver", ticker_label="XAG/INR",
+                current_price=commodity_data["silver"]["current"],
+                change=commodity_data["silver"]["change"],
+                history=commodity_data["silver"]["history"],
+                levels=silver_levels, plan=silver_plan,
+            )
+            commodity_section_html = f"""
+                <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+                    <tr>
+                        <td style="padding:12px 0 0;">
+                            <h2 style="margin:0;font-size:15px;color:#111827;">Commodities (2)</h2>
+                        </td>
+                    </tr>
+                </table>
+                {gold_card}
+                {silver_card}"""
+            report_html += f"""
+                <tr>
+                  <td style="padding:0 20px 20px;">
+                    {commodity_section_html}
+                  </td>
+                </tr>
+            """
+        except Exception as e:
+            log.error(f"Commodity card render failed: {e}")
+            traceback.print_exc()
+            report_html += """
+                <tr>
+                  <td style="padding:0 20px 20px;">
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
+                      <tr>
+                        <td style="padding:14px;color:#721c24;font-size:13px;">
+                          <strong>Commodities Unavailable:</strong> Could not render Gold &amp; Silver cards.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+            """
+    else:
         report_html += """
             <tr>
               <td style="padding:0 20px 20px;">

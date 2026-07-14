@@ -1,8 +1,9 @@
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import yfinance as yf
 
 from recommendation_logic import derive_commodity_buy_levels
+
 
 class CommodityTracker:
     BASE_URL = "https://api.gold-api.com"
@@ -13,16 +14,14 @@ class CommodityTracker:
     GOLD_KARAT = 22
 
     def __init__(self, api_key=None):
-       pass
+        pass
 
     # ---------------- API ----------------
     def call_api(self, endpoint):
         url = f"{self.BASE_URL}/{endpoint}"
         response = requests.get(url, timeout=10)
-
         if response.status_code != 200:
             raise Exception(f"API Error: {response.status_code}, {response.text}")
-
         return response.json()
 
     def adjust_gold_purity(self, price):
@@ -48,6 +47,16 @@ class CommodityTracker:
         suffix = self.get_day_suffix(dt.day)
         return f"{dt.day}{suffix} {dt.strftime('%b (%a)')}"
 
+    # ---------------- FX ----------------
+    def usd_to_inr(self):
+        url = "https://open.er-api.com/v6/latest/USD"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        if "rates" not in data:
+            raise Exception(f"FX API Error: {data}")
+        return data["rates"]["INR"]
+
     # ---------------- Prices ----------------
     def fetch_current_prices(self):
         usd_inr = self.usd_to_inr()
@@ -58,7 +67,6 @@ class CommodityTracker:
         gold_price = gold["price"] * usd_inr
         silver_price = silver["price"] * usd_inr
 
-        # Convert ounce -> gram
         gold_per_gram = self.oz_to_gram(gold_price)
         silver_per_gram = self.oz_to_gram(silver_price)
 
@@ -69,34 +77,20 @@ class CommodityTracker:
 
         return {
             "gold": {"current": gold_per_gram},
-            "silver": {"current": silver_per_gram}
+            "silver": {"current": silver_per_gram},
         }
-
-    def usd_to_inr(self):
-        url = "https://open.er-api.com/v6/latest/USD"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-
-        data = response.json()
-
-        if "rates" not in data:
-            raise Exception(f"FX API Error: {data}")
-
-        return data["rates"]["INR"]
 
     # ---------------- Historical ----------------
     def fetch_history(self, symbol, days=7):
         history = []
-
         usd_inr = self.usd_to_inr()
-
         ticker = "GC=F" if symbol == "XAU" else "SI=F"
 
         df = yf.download(
             ticker,
             period=f"{days + 2}d",
             interval="1d",
-            progress=False
+            progress=False,
         )
 
         close_series = df["Close"].squeeze().dropna().tail(days)
@@ -105,7 +99,6 @@ class CommodityTracker:
             price_inr = close.item() * usd_inr if hasattr(close, "item") else float(close) * usd_inr
             price_per_gram = self.oz_to_gram(price_inr)
 
-            # Adjust to Indian retail market
             if symbol == "XAU":
                 price_per_gram *= self.GOLD_MARKUP
                 price_per_gram = self.adjust_gold_purity(price_per_gram)
@@ -113,57 +106,41 @@ class CommodityTracker:
                 price_per_gram *= self.SILVER_MARKUP
 
             price_per_gram = round(price_per_gram, 2)
-
             history.append({
                 "date": self.format_date_short(date.strftime("%Y%m%d")),
-                "price": price_per_gram
+                "price": price_per_gram,
             })
 
         return history
 
     def calculate_pct_change(self, history):
         prev = None
-
         for row in history:
             if prev is None:
-                row["change"] = 0
+                row["change"] = 0.0
             else:
-                row["change"] = round(
-                    ((row["price"] - prev) / prev) * 100, 2
-                )
+                row["change"] = round(((row["price"] - prev) / prev) * 100, 2)
             prev = row["price"]
-
         return history
 
     # ---------------- Sparkline ----------------
     def generate_sparkline(self, prices):
         blocks = "▁▂▃▄▅▆▇█"
-
-        min_p = min(prices)
-        max_p = max(prices)
-
+        min_p, max_p = min(prices), max(prices)
         if min_p == max_p:
             return "▅" * len(prices)
-
         spark = ""
         for p in prices:
-            normalized = (p - min_p) / (max_p - min_p)
-            index = int(normalized * (len(blocks) - 1))
-            spark += blocks[index]
-
+            idx = int((p - min_p) / (max_p - min_p) * (len(blocks) - 1))
+            spark += blocks[idx]
         return spark
 
     # ---------------- Aggregation ----------------
     def get_commodity_data(self):
         current = self.fetch_current_prices()
 
-        gold_history = self.calculate_pct_change(
-            self.fetch_history("XAU")
-        )
-
-        silver_history = self.calculate_pct_change(
-            self.fetch_history("XAG")
-        )
+        gold_history = self.calculate_pct_change(self.fetch_history("XAU"))
+        silver_history = self.calculate_pct_change(self.fetch_history("XAG"))
 
         current["gold"]["history"] = gold_history
         current["silver"]["history"] = silver_history
@@ -209,23 +186,21 @@ class CommodityTracker:
         if len(history) < 3:
             return ""
 
-        recent_changes = [row["change"] for row in history[-3:]]
-        latest_change = recent_changes[-1]
-        prev_change = recent_changes[-2]
-        older_change = recent_changes[-3]
+        recent = [row["change"] for row in history[-3:]]
+        latest, prev, older = recent[-1], recent[-2], recent[-3]
 
         score = 0
-        if latest_change <= -1.5:
+        if latest <= -1.5:
             score += 4
-        if latest_change <= -2.5:
+        if latest <= -2.5:
             score += 4
-        if prev_change <= -1.0:
+        if prev <= -1.0:
             score += 2
-        if older_change <= -1.0:
+        if older <= -1.0:
             score += 1
-        if latest_change < prev_change:
+        if latest < prev:
             score += 2
-        if latest_change < 0:
+        if latest < 0:
             score += 1
 
         if score >= 8:
@@ -259,15 +234,18 @@ class CommodityTracker:
         change_sign  = "+" if change > 0 else ""
         history_rows = self._history_rows_html(history)
 
+        bias_color = "#047857" if plan["bias"] == "Bullish" else "#dc2626" if plan["bias"] == "Bearish" else "#64748b"
+
         return f"""
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
                 <tr>
                     <td style="padding:14px;">
+                        <!-- Header: name + price -->
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
                                 <td style="vertical-align:top;">
                                     <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{name} <span style="font-size:13px;color:#64748b;">{ticker_label}</span></h3>
-                                    <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;">
+                                    <div style="margin:6px 0 0;">
                                         <span style="display:inline-block;padding:4px 10px;border-radius:999px;font-weight:700;font-size:13px;background:{change_bg};color:{change_color};">{change_sign}{change}%</span>{buy_signal_html}
                                     </div>
                                 </td>
@@ -278,21 +256,35 @@ class CommodityTracker:
                                 </td>
                             </tr>
                         </table>
+                        <!-- Metrics table -->
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
                             <tr>
-                                <td style="padding:6px 0;width:50%;"><strong>Bias</strong><div style="color:#0f172a;margin-top:4px;">{plan['bias']}</div></td>
-                                <td style="padding:6px 0;width:50%;"><strong>Entry Zone</strong><div style="color:#0f172a;margin-top:4px;">&#8377;{plan['entry_low']:.2f} &ndash; &#8377;{plan['entry_high']:.2f}</div></td>
+                                <td style="padding:6px 10px 6px 0;width:50%;vertical-align:top;">
+                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Bias</div>
+                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:{bias_color};">{plan['bias']}</div>
+                                </td>
+                                <td style="padding:6px 0 6px 10px;width:50%;vertical-align:top;">
+                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Entry Zone</div>
+                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#0f172a;">&#8377;{plan['entry_low']:.2f} &ndash; &#8377;{plan['entry_high']:.2f}</div>
+                                </td>
                             </tr>
                             <tr>
-                                <td style="padding:6px 0;"><strong>Stop Loss</strong><div style="color:#dc2626;margin-top:4px;">&#8377;{plan['stop_loss']:.2f}</div></td>
-                                <td style="padding:6px 0;"><strong>Target</strong><div style="color:#047857;margin-top:4px;">&#8377;{plan['target']:.2f}</div></td>
+                                <td style="padding:6px 10px 6px 0;width:50%;vertical-align:top;">
+                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Stop Loss</div>
+                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#dc2626;">&#8377;{plan['stop_loss']:.2f}</div>
+                                </td>
+                                <td style="padding:6px 0 6px 10px;width:50%;vertical-align:top;">
+                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Target</div>
+                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#047857;">&#8377;{plan['target']:.2f}</div>
+                                </td>
                             </tr>
+                            <!-- Buy Levels -->
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="font-size:13px;color:#475569;"><strong>Buy Levels</strong></div>
-                                    <div style="font-size:12px;color:#0f172a;margin-top:4px;">
+                                    <div style="font-size:13px;color:#475569;font-weight:700;">Buy Levels</div>
+                                    <div style="margin-top:6px;font-size:12px;">
                                         <span style="color:#047857;font-weight:700;">Recommended {levels['recommended_entry_label']}: <strong>&#8377;{levels['recommended_buy_level']:.2f}</strong></span>
-                                        <div style="margin-top:4px;color:#64748b;">
+                                        <div style="margin-top:5px;color:#64748b;">
                                             Patient: <strong>&#8377;{levels['patient_entry']:.2f}</strong> &bull;
                                             Optimal: <strong>&#8377;{levels['optimal_entry']:.2f}</strong> &bull;
                                             Aggressive: <strong>&#8377;{levels['aggressive_entry']:.2f}</strong>
@@ -300,6 +292,7 @@ class CommodityTracker:
                                     </div>
                                 </td>
                             </tr>
+                            <!-- Price History -->
                             <tr>
                                 <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
                                     <div style="font-size:13px;color:#475569;font-weight:700;">Price History (7 days)</div>
@@ -344,7 +337,7 @@ class CommodityTracker:
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
                 <tr>
                     <td style="padding:12px 0 0;">
-                        <h2 style="margin:0;font-size:15px;">Commodities (2)</h2>
+                        <h2 style="margin:0;font-size:15px;color:#111827;">Commodities (2)</h2>
                     </td>
                 </tr>
             </table>
