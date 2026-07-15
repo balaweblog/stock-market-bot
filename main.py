@@ -1361,6 +1361,8 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
             "priority": priority,
             "total_score": total_score,
             "swing_setup": swing_setup,
+            "day_change_pct": prev_close_change_pct,
+            "trend": market_context.get("trend"),
         }
 
         print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']} | Risk: {risk_meter['label']}")
@@ -1392,6 +1394,8 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         "priority": 4,
         "total_score": 0,
         "swing_setup": False,
+        "day_change_pct": None,
+        "trend": None,
     })
 
 
@@ -1599,31 +1603,66 @@ def build_stock_enrichment_html(summary_entry, prior_entry):
     return f'<div style="margin:12px 0 -6px;">{"".join(badges)}</div>'
 
 
+def _heatmap_signal_style(pr):
+    """Maps a priority tier to (dot emoji, text color, action label)."""
+    if pr == 1:
+        return "🟢", "#047857", "Add"
+    if pr == 2:
+        return "🟡", "#d97706", "Wait"
+    if pr == 3:
+        return "🔴", "#dc2626", "Exit"
+    return "⚪", "#6b7280", "—"
+
+
+def _heatmap_trend_label(raw_trend):
+    """Normalizes whatever string market_context returns into a short,
+    consistent label + icon (source strings aren't guaranteed to be
+    exactly 'Bullish'/'Bearish', so this matches loosely on keywords)."""
+    text = str(raw_trend or "").strip().lower()
+    if not text or text == "unknown":
+        return "➖ Unknown"
+    if "up" in text or "bull" in text or "positive" in text:
+        return "📈 Bullish"
+    if "down" in text or "bear" in text or "negative" in text:
+        return "📉 Bearish"
+    return "➖ Weak"
+
+
+def _heatmap_move_html(day_change_pct):
+    """Formats the day's % move with color; blank (not 'n/a') when missing."""
+    if day_change_pct is None:
+        return ""
+    color = "#047857" if day_change_pct >= 0 else "#dc2626"
+    return f'<span style="color:{color};font-weight:700;">{day_change_pct:+.2f}%</span>'
+
+
 def build_quick_jump_table_html(rows):
     """
-    Compact scan-friendly table of every ticker + market + signal, placed
-    above the full stock cards so the report can be read at a glance
-    before scrolling through the detailed sections. Grouped into explicit
-    US / India sub-sections (rather than just sorted together) so each
-    market's tickers are visually separated.
+    Portfolio Heatmap: a single scannable table (Symbol / Signal / Today's
+    Move / Trend / Action) covering every ticker across both markets,
+    placed above the full stock cards so the report can be read at a
+    glance before scrolling through the detailed sections. Grouped into
+    explicit US / India sub-sections (rather than just sorted together)
+    so each market's tickers are visually separated.
     """
     if not rows:
         return ""
-
-    def _signal_color(pr):
-        if pr == 1:
-            return "#047857"
-        if pr == 2:
-            return "#d97706"
-        if pr == 3:
-            return "#dc2626"
-        return "#6b7280"
 
     by_market = {"US": [], "India": []}
     for pr, score, name, _html, summary_entry, market in rows:
         by_market.setdefault(market, []).append((pr, score, name, summary_entry))
 
     market_sections = [("US", "🇺🇸 US Stocks"), ("India", "🇮🇳 India Stocks")]
+
+    col_header = (
+        '<tr>'
+        '<td style="padding:5px 8px 5px 14px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.03em;">Symbol</td>'
+        '<td style="padding:5px 8px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.03em;">Signal</td>'
+        '<td style="padding:5px 8px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.03em;text-align:right;">Today\'s Move</td>'
+        '<td style="padding:5px 8px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.03em;">Trend</td>'
+        '<td style="padding:5px 8px 5px 8px;font-size:10px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.03em;text-align:right;">Action</td>'
+        '</tr>'
+    )
 
     body = ""
     for market_key, market_label in market_sections:
@@ -1632,17 +1671,23 @@ def build_quick_jump_table_html(rows):
             continue
         entries.sort(key=lambda e: (e[0], -e[1]))  # priority, score desc
         body += (
-            f'<tr><td colspan="2" style="padding:6px 10px;background:#eef2f7;'
+            f'<tr><td colspan="5" style="padding:6px 10px;background:#eef2f7;'
             f'font-size:11px;font-weight:700;color:#334155;text-transform:uppercase;'
             f'letter-spacing:0.03em;">{market_label} ({len(entries)})</td></tr>'
         )
+        body += col_header
         for pr, score, name, summary_entry in entries:
             signal = summary_entry.get("signal", "n/a")
-            color = _signal_color(pr)
+            dot, color, action = _heatmap_signal_style(pr)
+            move_html = _heatmap_move_html(summary_entry.get("day_change_pct"))
+            trend_html = _heatmap_trend_label(summary_entry.get("trend"))
             body += (
                 f'<tr>'
-                f'<td style="padding:5px 8px 5px 14px;font-size:12px;color:#0f172a;border-bottom:1px solid #f1f5f9;">{name}</td>'
-                f'<td style="padding:5px 8px;font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #f1f5f9;text-align:right;">{signal}</td>'
+                f'<td style="padding:6px 8px 6px 14px;font-size:12px;font-weight:600;color:#0f172a;border-bottom:1px solid #f1f5f9;">{name}</td>'
+                f'<td style="padding:6px 8px;font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #f1f5f9;white-space:nowrap;">{dot} {signal}</td>'
+                f'<td style="padding:6px 8px;font-size:12px;border-bottom:1px solid #f1f5f9;text-align:right;">{move_html}</td>'
+                f'<td style="padding:6px 8px;font-size:12px;color:#334155;border-bottom:1px solid #f1f5f9;white-space:nowrap;">{trend_html}</td>'
+                f'<td style="padding:6px 8px;font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #f1f5f9;text-align:right;">{action}</td>'
                 f'</tr>'
             )
 
@@ -1650,7 +1695,7 @@ def build_quick_jump_table_html(rows):
         <tr>
           <td style="padding:0 20px 12px;" class="email-padding">
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
-              <tr><td colspan="2" style="padding:8px 10px;background:#f8fafc;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">At a Glance</td></tr>
+              <tr><td colspan="5" style="padding:8px 10px;background:#f8fafc;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">📊 Portfolio Heatmap</td></tr>
               {body}
             </table>
           </td>
