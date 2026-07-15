@@ -27,20 +27,35 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 STOCKS = {}
 
+
+def _parse_stocks_csv(csv_value):
+    parsed = {}
+    pairs = [item.strip() for item in csv_value.split(",") if item.strip()]
+    for pair in pairs:
+        if "=" not in pair:
+            raise ValueError(f"Each STOCKS entry must be name=ticker, got: '{pair}'")
+        name, ticker = pair.split("=", 1)
+        parsed[name.strip()] = ticker.strip()
+    return parsed
+
+
+# NOTE: these are merged (not if/elif). Previously STOCKS_JSON, when set,
+# silently took over and STOCKS_CSV was ignored entirely -- if a user kept
+# e.g. Indian tickers only in STOCKS (CSV) and US tickers in STOCKS_JSON,
+# the Indian half would vanish from every report with no error or warning.
+# Merging means both env vars can be used together; on a name collision the
+# STOCKS_CSV entry wins since it's applied last.
 if STOCKS_JSON:
     try:
-        STOCKS = json.loads(STOCKS_JSON)
-        if not isinstance(STOCKS, dict):
+        parsed_json = json.loads(STOCKS_JSON)
+        if not isinstance(parsed_json, dict):
             raise ValueError("STOCKS_JSON must decode to a dict of name:ticker pairs")
+        STOCKS.update(parsed_json)
     except Exception as exc:
         raise ValueError(f"Invalid STOCKS_JSON environment variable: {exc}")
-elif STOCKS_CSV:
+
+if STOCKS_CSV:
     try:
-        pairs = [item.strip() for item in STOCKS_CSV.split(",") if item.strip()]
-        for pair in pairs:
-            if "=" not in pair:
-                raise ValueError("Each STOCKS entry must be name=ticker")
-            name, ticker = pair.split("=", 1)
-            STOCKS[name.strip()] = ticker.strip()
+        STOCKS.update(_parse_stocks_csv(STOCKS_CSV))
     except Exception as exc:
         raise ValueError(f"Invalid STOCKS environment variable: {exc}")

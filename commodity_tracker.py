@@ -139,13 +139,18 @@ class CommodityTracker:
     def get_commodity_data(self):
         current = self.fetch_current_prices()
 
-        gold_history = self.calculate_pct_change(self.fetch_history("XAU"))
-        silver_history = self.calculate_pct_change(self.fetch_history("XAG"))
+        # Fetch a full 30-day window for each metal. The sparkline needs the
+        # whole 30 days; the price table only ever shows the most recent 7,
+        # so we keep both around rather than fetching twice.
+        gold_history_30d = self.calculate_pct_change(self.fetch_history("XAU", days=30))
+        silver_history_30d = self.calculate_pct_change(self.fetch_history("XAG", days=30))
 
-        current["gold"]["history"] = gold_history
-        current["silver"]["history"] = silver_history
-        current["gold"]["change"] = gold_history[-1]["change"]
-        current["silver"]["change"] = silver_history[-1]["change"]
+        current["gold"]["history"] = gold_history_30d[-7:]
+        current["silver"]["history"] = silver_history_30d[-7:]
+        current["gold"]["sparkline_history"] = gold_history_30d
+        current["silver"]["sparkline_history"] = silver_history_30d
+        current["gold"]["change"] = gold_history_30d[-1]["change"]
+        current["silver"]["change"] = silver_history_30d[-1]["change"]
 
         return current
 
@@ -226,7 +231,7 @@ class CommodityTracker:
             )
         return rows
 
-    def _commodity_card_html(self, name, ticker_label, current_price, change, history, levels, plan):
+    def _commodity_card_html(self, name, ticker_label, current_price, change, history, levels, plan, sparkline_history=None):
         """Renders one commodity card using the exact same table/card structure as stock cards."""
         buy_signal_html = self.buy_signal(history, name)
         change_color = "#16a34a" if change >= 0 else "#dc2626"
@@ -235,6 +240,21 @@ class CommodityTracker:
         history_rows = self._history_rows_html(history)
 
         bias_color = "#047857" if plan["bias"] == "Bullish" else "#dc2626" if plan["bias"] == "Bearish" else "#64748b"
+
+        # 30-day sparkline. Falls back to the 7-day history if a longer
+        # window wasn't provided, so this stays backward compatible.
+        spark_source = sparkline_history if sparkline_history else history
+        spark_prices = [row["price"] for row in spark_source]
+        spark_days = len(spark_prices)
+        sparkline_text = self.generate_sparkline(spark_prices) if spark_days >= 2 else ""
+        spark_trend_color = "#16a34a" if (spark_prices and spark_prices[-1] >= spark_prices[0]) else "#dc2626"
+        sparkline_html = ""
+        if sparkline_text:
+            sparkline_html = f"""
+                                    <div style="margin-top:8px;">
+                                        <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:#64748b;">{spark_days}-Day Trend</div>
+                                        <div style="margin-top:4px;font-size:18px;line-height:1;letter-spacing:1px;color:{spark_trend_color};font-family:'SF Mono',Menlo,Consolas,'Courier New',monospace;">{sparkline_text}</div>
+                                    </div>"""
 
         return f"""
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
@@ -252,7 +272,7 @@ class CommodityTracker:
                                 <td style="width:150px;text-align:right;vertical-align:top;">
                                     <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:#64748b;">Current Price</div>
                                     <div style="margin-top:6px;font-size:16px;font-weight:800;color:#111827;">&#8377;{current_price:.2f}</div>
-                                    <div style="margin-top:4px;font-size:11px;color:#64748b;">per gram</div>
+                                    <div style="margin-top:4px;font-size:11px;color:#64748b;">per gram</div>{sparkline_html}
                                 </td>
                             </tr>
                         </table>
@@ -326,11 +346,13 @@ class CommodityTracker:
             name="Gold (22K)", ticker_label="XAU/INR",
             current_price=gold["current"], change=gold["change"],
             history=gold["history"], levels=gold_levels, plan=gold_plan,
+            sparkline_history=gold.get("sparkline_history"),
         )
         silver_card = self._commodity_card_html(
             name="Silver", ticker_label="XAG/INR",
             current_price=silver["current"], change=silver["change"],
             history=silver["history"], levels=silver_levels, plan=silver_plan,
+            sparkline_history=silver.get("sparkline_history"),
         )
 
         return f"""

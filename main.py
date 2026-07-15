@@ -1,11 +1,16 @@
 import os
 import math
+import json
+import csv
+import io
 import yfinance as yf
 import pandas as pd
 import ta
 import smtplib
 import traceback
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from datetime import datetime
 from zoneinfo import ZoneInfo
 try:
@@ -13,7 +18,7 @@ try:
 except ImportError:
     pipeline = None
 try:
-    import google.generativeai as genai
+    from google import genai
 except ImportError:
     genai = None
 from config import *
@@ -37,27 +42,75 @@ model_lock = threading.Lock()
 
 llm_pipeline = None
 use_gemini_flash = False
+gemini_client = None
+
+# -----------------------------
+# Run-history persistence (enables signal-change tracking, stop/target
+# breach alerts, and commodity buy-signal streaks across runs)
+# -----------------------------
+RUN_HISTORY_PATH = os.getenv("RUN_HISTORY_PATH", "run_history.json")
+
+# How much (in INR) a hypothetical monthly silver savings scheme puts in,
+# used purely to illustrate "how much silver would this buy today".
+SILVER_MONTHLY_BUDGET = float(os.getenv("SILVER_MONTHLY_BUDGET", "5000"))
+
+# If a single sector accounts for more than this % of a market's current
+# Buy list, a concentration alert card is shown.
+SECTOR_CONCENTRATION_THRESHOLD_PCT = float(os.getenv("SECTOR_CONCENTRATION_THRESHOLD_PCT", "40"))
+
+
+def load_run_history():
+    """
+    Loads the previous run's state (per-stock signal/price/target/stop-loss,
+    per-commodity buy-streak info) so the current run can diff against it.
+    Returns a safe default structure if the file is missing or unreadable.
+    """
+    try:
+        with open(RUN_HISTORY_PATH, "r") as f:
+            data = json.load(f)
+            data.setdefault("stocks", {})
+            data.setdefault("commodities", {})
+            return data
+    except Exception:
+        return {"stocks": {}, "commodities": {}}
+
+
+def save_run_history(history):
+    """
+    Persists the current run's state to disk so the next run can diff
+    against it. NOTE: if this script runs on an ephemeral CI runner
+    (e.g. GitHub Actions) without a persistent volume or cache step, this
+    file will not survive between runs and change-tracking features will
+    silently reset each time. Point RUN_HISTORY_PATH at a mounted/cached
+    location in that case.
+    """
+    try:
+        with open(RUN_HISTORY_PATH, "w") as f:
+            json.dump(history, f, indent=2, default=str)
+    except Exception as e:
+        log.error(f"Failed to save run history to {RUN_HISTORY_PATH}: {e}")
 
 def init_llm_generator():
     """
     Initializes the AI model.
-    Prioritizes Gemini 1.5 Flash (Free Cloud Tier) if GOOGLE_API_KEY is present.
+    Prioritizes Gemini 2.5 Flash (Free Cloud Tier) if GOOGLE_API_KEY is present.
     Otherwise, falls back to the ultra-lightweight and highly smart Qwen2.5-1.5B local model.
     """
-    global llm_pipeline, use_gemini_flash
-    
+    global llm_pipeline, use_gemini_flash, gemini_client
+
     # 1. Check for Gemini API key
     api_key = os.getenv("GOOGLE_API_KEY") or globals().get("GOOGLE_API_KEY")
     if api_key and genai is not None:
         try:
-            log.info("Google API key detected. Initializing Gemini 1.5 Flash (Free Cloud Tier)...")
-            genai.configure(api_key=api_key)
+            log.info("Google API key detected. Initializing Gemini 2.5 Flash (Free Cloud Tier)...")
+            gemini_client = genai.Client(api_key=api_key)
             use_gemini_flash = True
-            log.info("Gemini 1.5 Flash initialized successfully.")
+            log.info("Gemini 2.5 Flash initialized successfully.")
             return "gemini"
         except Exception as exc:
             log.warning(f"Failed to initialize Gemini, falling back to local model: {exc}")
             use_gemini_flash = False
+            gemini_client = None
 
     # 2. Fallback to local model
     if pipeline is None:
@@ -99,13 +152,15 @@ def init_llm_generator():
 
 def generate_gemini_reasoning(prompt):
     """
-    Generates text using the Gemini 1.5 Flash model.
+    Generates text using the Gemini 2.5 Flash model via the google-genai Client SDK.
     """
-    if genai is None:
+    if genai is None or gemini_client is None:
         return None
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
         return response.text.strip()
     except Exception as e:
         log.error(f"Gemini generation failed: {e}")
@@ -501,24 +556,6 @@ def calculate_risk_meter(df, latest, beta=None):
 
 
 def build_risk_meter_html(risk_meter):
-    legend_cells = []
-    for option in ("Low", "Medium", "High"):
-        meta = _risk_level_meta(1 if option == "Low" else 2 if option == "Medium" else 3)
-        active = option == risk_meter["label"]
-        background = meta["background"] if active else "#f8fafc"
-        border     = meta["border"]     if active else "#e2e8f0"
-        color      = meta["color"]      if active else "#94a3b8"
-        opacity    = "1"                if active else "0.5"
-        legend_cells.append(
-            f'<td style="padding:0 4px 0 0;vertical-align:top;width:33.33%;">'
-            f'<div style="padding:7px 6px;border-radius:8px;text-align:center;'
-            f'background:{background};border:1px solid {border};color:{color};'
-            f'font-size:12px;font-weight:800;opacity:{opacity};white-space:nowrap;">'
-            f'{meta["emoji"]} {option}</div></td>'
-        )
-    # Remove trailing right-padding on last cell
-    legend_cells[-1] = legend_cells[-1].replace('padding:0 4px 0 0;', 'padding:0;')
-
     def _factor_cell(factor, right=False):
         pad = "padding:8px 0 0 10px;" if right else "padding:8px 10px 0 0;"
         return (
@@ -548,11 +585,6 @@ def build_risk_meter_html(risk_meter):
                                         </tr>
                                     </table>
                                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;">
-                                        <tr>
-                                            {''.join(legend_cells)}
-                                        </tr>
-                                    </table>
-                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:4px;border-collapse:collapse;">
                                         <tr>
                                             {_factor_cell(factors[0])}
                                             {_factor_cell(factors[1], right=True)}
@@ -924,7 +956,7 @@ def get_date_with_suffix(d):
 # -----------------------------
 # Email
 # -----------------------------
-def send_email(report_html, mode):
+def send_email(report_html, mode, csv_attachment=None, csv_filename="stock_report.csv"):
     if not all([EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO]):
         print(
             "Email credentials not found. "
@@ -952,7 +984,15 @@ def send_email(report_html, mode):
     formatted_time = now_ist.strftime("%I:%M %p")
     subject += f" - {formatted_date} {formatted_time} IST"
 
-    msg = MIMEText(report_html, "html")
+    if csv_attachment:
+        msg = MIMEMultipart("mixed")
+        msg.attach(MIMEText(report_html, "html"))
+        attachment_part = MIMEApplication(csv_attachment.encode("utf-8"), Name=csv_filename)
+        attachment_part["Content-Disposition"] = f'attachment; filename="{csv_filename}"'
+        msg.attach(attachment_part)
+    else:
+        msg = MIMEText(report_html, "html")
+
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
@@ -1023,10 +1063,14 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         latest = df.iloc[-1]
         prev_close = df.iloc[-2]["close"] if len(df) >= 2 else None
         prev_close_change_pct = None
-        if prev_close is not None and prev_close != 0:
-            prev_close_change_pct = round(((latest["close"] - prev_close) / prev_close) * 100, 2)
+        if prev_close is not None and prev_close != 0 and pd.notna(prev_close) and pd.notna(latest["close"]):
+            computed_pct = ((latest["close"] - prev_close) / prev_close) * 100
+            if pd.notna(computed_pct):
+                prev_close_change_pct = round(computed_pct, 2)
         prev_close_change_color = "#16a34a" if prev_close_change_pct is not None and prev_close_change_pct >= 0 else "#dc2626"
-        prev_close_change_text = f"{prev_close_change_pct:+.2f}%" if prev_close_change_pct is not None else "n/a"
+        # Blank (not "n/a"/"+nan%") when the value is missing or NaN -- a
+        # blank cell reads as "no data" without the ugly literal "nan" text.
+        prev_close_change_text = f"{prev_close_change_pct:+.2f}%" if prev_close_change_pct is not None else ""
         news_text = ", ".join(headlines[:3])
         
         # Get risk management data
@@ -1047,6 +1091,11 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         risk_data["recommended_entry_label"] = recommended_entry.replace("_", " ").title()
         risk_data["recommended_buy_level"] = risk_data["buy_levels"][recommended_entry]
         conviction_rating = get_conviction_rating(total_score)
+
+        # "Swing setup" tag: near a 20-day breakout with a confirmed strong
+        # trend (ADX >= 25) mirrors the recurring high-conviction setups
+        # already used for stocks like BEL / ICICI Bank.
+        swing_setup = ("Near 20-day breakout" in reasons) and ("ADX strong trend" in reasons)
 
         llm_reason = generate_llm_reasoning(
             stock_name,
@@ -1076,19 +1125,33 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
             priority = 1
 
         events = upcoming_events
-        
-        if events.get("has_event"):
-        
-            details = []
 
-            if events["dividend_record_date"] != "NA":
+        if events.get("has_event"):
+
+            next_label = events.get("next_upcoming_event_label") or ""
+            next_date = events.get("next_upcoming_event_date")
+
+            # Only list an event here if it isn't the same one already
+            # featured above as "Next Upcoming Event" -- previously both
+            # were shown, duplicating the same date/label twice.
+            details = []
+            dividend_is_featured = "dividend" in next_label.lower() and events.get("dividend_record_date") == next_date
+            if events["dividend_record_date"] != "NA" and not dividend_is_featured:
                 details.append(
                     f"<div><strong>Dividend Record:</strong> {events['dividend_record_date']}</div>"
                 )
 
-            if events["results_announcement_date"] != "NA":
+            results_is_featured = "results" in next_label.lower() and events.get("results_announcement_date") == next_date
+            if events["results_announcement_date"] != "NA" and not results_is_featured:
                 details.append(
                     f"<div><strong>Results Announcement:</strong> {events['results_announcement_date']}</div>"
+                )
+
+            extra_details_html = ""
+            if details:
+                extra_details_html = (
+                    '<hr style="margin:8px 0;border:none;border-top:1px solid #FCD34D;">'
+                    + "".join(details)
                 )
 
             events_html = f"""
@@ -1117,9 +1180,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                     {events['next_upcoming_event_date']}
                 </div>
 
-                <hr style="margin:8px 0;border:none;border-top:1px solid #FCD34D;">
-
-                {''.join(details)}
+                {extra_details_html}
 
             </div>
             """
@@ -1217,11 +1278,18 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
             """
         summary_entry = {
             "stock_name": stock_name,
+            "ticker": ticker,
             "signal": signal,
             "current_price": round(latest["close"], 2),
             "recommended_buy_level": risk_data.get("recommended_buy_level"),
             "ema20": latest.get("ema20"),
             "upcoming_events": events,
+            "target": risk_data.get("target"),
+            "stop_loss": risk_data.get("stop_loss"),
+            "sector": market_context.get("sector"),
+            "priority": priority,
+            "total_score": total_score,
+            "swing_setup": swing_setup,
         }
 
         print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']} | Risk: {risk_meter['label']}")
@@ -1241,11 +1309,18 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
             """
     return (4, 0, ticker, err_html, {
         "stock_name": ticker,
+        "ticker": ticker,
         "signal": "ERROR",
         "current_price": None,
         "recommended_buy_level": None,
         "ema20": None,
         "upcoming_events": {},
+        "target": None,
+        "stop_loss": None,
+        "sector": None,
+        "priority": 4,
+        "total_score": 0,
+        "swing_setup": False,
     })
 
 
@@ -1292,13 +1367,22 @@ def _relative_day_label(value):
 
 def build_quick_summary(rows):
     """
-    Builds compact, human-readable summary bullets for the top of the report.
+    Builds compact, human-readable summary bullets for the top of the
+    report, grouped by recommendation (Buy / Hold / Sell) so the reader can
+    scan "what should I do" rather than an undifferentiated flat list.
+    Returns a dict: {"Buy": [...], "Hold": [...], "Sell": [...]}.
     """
+    groups = {"Buy": [], "Hold": [], "Sell": []}
     if not rows:
-        return ""
+        return groups
 
-    items = []
+    priority_to_group = {1: "Buy", 2: "Hold", 3: "Sell"}
+
     for row in rows:
+        group_key = priority_to_group.get(row.get("priority"))
+        if group_key is None:
+            continue  # errors aren't actionable in the quick summary
+
         stock_name = row.get("stock_name") or ""
         signal = str(row.get("signal") or "").upper()
         current_price = row.get("current_price")
@@ -1307,7 +1391,7 @@ def build_quick_summary(rows):
         upcoming_events = row.get("upcoming_events") or {}
 
         if "BUY" in signal and current_price is not None and recommended_buy_level is not None and current_price < recommended_buy_level:
-            items.append(f"✅ Buy: {stock_name} below ₹{recommended_buy_level}")
+            groups[group_key].append(f"✅ {stock_name} below ₹{recommended_buy_level}")
             continue
 
         results_date = upcoming_events.get("results_announcement_date")
@@ -1315,24 +1399,38 @@ def build_quick_summary(rows):
             short_date = _format_short_date(results_date)
             relative_label = _relative_day_label(results_date)
             if relative_label == "today":
-                items.append(f"✅ Watch: {stock_name} results today")
+                groups[group_key].append(f"📊 {stock_name} results today")
             else:
-                items.append(f"✅ Watch: {stock_name} results on {short_date or results_date}")
+                groups[group_key].append(f"📊 {stock_name} results on {short_date or results_date}")
             continue
 
         dividend_date = upcoming_events.get("dividend_record_date")
         if dividend_date and str(dividend_date).upper() != "NA":
             relative_label = _relative_day_label(dividend_date)
             if relative_label == "today":
-                items.append(f"📅 {stock_name} dividend record today")
+                groups[group_key].append(f"📅 {stock_name} dividend record today")
             else:
-                items.append(f"📅 {stock_name} dividend record {relative_label or 'soon'}")
+                groups[group_key].append(f"📅 {stock_name} dividend record {relative_label or 'soon'}")
             continue
 
         if current_price is not None and ema20 is not None and current_price < ema20:
-            items.append(f"⚠ {stock_name} below EMA20—avoid adding")
+            groups[group_key].append(f"⚠ {stock_name} below EMA20—avoid adding")
 
-    return "\n".join(items)
+    return groups
+
+
+def classify_market(ticker):
+    """
+    Classifies a ticker as India or US based on its exchange suffix.
+    Indian tickers pulled via yfinance carry a '.NS' (NSE) or '.BO' (BSE) suffix;
+    US tickers (e.g. AAPL, GOOG, AMZN, QQQ) have no suffix.
+    """
+    if not ticker:
+        return "US"
+    upper_ticker = ticker.upper().strip()
+    if upper_ticker.endswith(".NS") or upper_ticker.endswith(".BO"):
+        return "India"
+    return "US"
 
 
 def get_section_html(title, count, items):
@@ -1342,9 +1440,245 @@ def get_section_html(title, count, items):
     if not items:
         return ""
 
-    header = f'<tr><td style="padding:12px 20px 0;"><h2 style="margin:0;font-size:15px;">{title} ({count})</h2></td></tr>'
-    rows_html = "".join([f'<tr><td style="padding:0 20px;">{html}</td></tr>' for _, _, html in items])
+    header = f'<tr><td style="padding:12px 20px 0;" class="email-padding"><h2 style="margin:0;font-size:15px;">{title} ({count})</h2></td></tr>'
+    rows_html = "".join([f'<tr><td style="padding:0 20px;" class="email-padding">{html}</td></tr>' for _, _, html in items])
     return header + rows_html
+
+
+def get_market_section_html(market_label, market_groups):
+    """
+    Generates the HTML for an entire market block (e.g. US Stocks / India Stocks),
+    with its own Buy / Hold / Sell / Errors sub-sections nested inside.
+    """
+    total = sum(len(items) for items in market_groups.values())
+    if total == 0:
+        return ""
+
+    header = f"""
+        <tr>
+          <td style="padding:18px 20px 4px;" class="email-padding">
+            <h2 style="margin:0;font-size:17px;color:#111827;border-bottom:2px solid #2563eb;padding-bottom:6px;">{market_label} ({total})</h2>
+          </td>
+        </tr>
+    """
+    body = ""
+    for title in ["Buy", "Hold", "Sell", "Errors"]:
+        body += get_section_html(title, len(market_groups[title]), market_groups[title])
+
+    return header + body
+
+
+# -----------------------------
+# Report enhancements: change tracking, breach alerts, swing tags,
+# quick-jump table, concentration alerts, error banner, CSV export
+# -----------------------------
+def build_stock_enrichment_html(summary_entry, prior_entry):
+    """
+    Builds a small badge row shown above a stock's card:
+    - signal-change badge (vs the previous run)
+    - stop-loss / target breach badge (current price vs the previous run's levels)
+    - swing-setup tag
+    """
+    badges = []
+
+    signal = summary_entry.get("signal") or ""
+    if prior_entry:
+        prior_signal = prior_entry.get("signal")
+        if prior_signal and prior_signal != signal and prior_signal != "ERROR":
+            prior_priority = prior_entry.get("priority")
+            current_priority = summary_entry.get("priority")
+            if current_priority is not None and prior_priority is not None and current_priority < prior_priority:
+                arrow, color, bg = "⬆", "#047857", "#dcfce7"
+            elif current_priority is not None and prior_priority is not None and current_priority > prior_priority:
+                arrow, color, bg = "⬇", "#dc2626", "#fee2e2"
+            else:
+                arrow, color, bg = "↔", "#a16207", "#fef3c7"
+            badges.append(
+                f'<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:999px;'
+                f'font-size:11px;font-weight:700;color:{color};background:{bg};border:1px solid {color}33;">'
+                f'{arrow} {prior_signal} &rarr; {signal}</span>'
+            )
+
+        current_price = summary_entry.get("current_price")
+        prior_stop = prior_entry.get("stop_loss")
+        prior_target = prior_entry.get("target")
+        if current_price is not None and prior_stop is not None and current_price <= prior_stop:
+            badges.append(
+                '<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:999px;'
+                'font-size:11px;font-weight:700;color:#dc2626;background:#fee2e2;border:1px solid #dc262633;">'
+                f'🛑 Below prior stop-loss ({prior_stop})</span>'
+            )
+        elif current_price is not None and prior_target is not None and current_price >= prior_target:
+            badges.append(
+                '<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:999px;'
+                'font-size:11px;font-weight:700;color:#047857;background:#dcfce7;border:1px solid #04785733;">'
+                f'🎯 Target reached ({prior_target})</span>'
+            )
+
+    if summary_entry.get("swing_setup"):
+        badges.append(
+            '<span style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:999px;'
+            'font-size:11px;font-weight:700;color:#1d4ed8;background:#dbeafe;border:1px solid #1d4ed833;">'
+            '⚡ Swing Setup</span>'
+        )
+
+    if not badges:
+        return ""
+
+    return f'<div style="margin:12px 0 -6px;">{"".join(badges)}</div>'
+
+
+def build_quick_jump_table_html(rows):
+    """
+    Compact scan-friendly table of every ticker + market + signal, placed
+    above the full stock cards so the report can be read at a glance
+    before scrolling through the detailed sections. Grouped into explicit
+    US / India sub-sections (rather than just sorted together) so each
+    market's tickers are visually separated.
+    """
+    if not rows:
+        return ""
+
+    def _signal_color(pr):
+        if pr == 1:
+            return "#047857"
+        if pr == 2:
+            return "#d97706"
+        if pr == 3:
+            return "#dc2626"
+        return "#6b7280"
+
+    by_market = {"US": [], "India": []}
+    for pr, score, name, _html, summary_entry, market in rows:
+        by_market.setdefault(market, []).append((pr, score, name, summary_entry))
+
+    market_sections = [("US", "🇺🇸 US Stocks"), ("India", "🇮🇳 India Stocks")]
+
+    body = ""
+    for market_key, market_label in market_sections:
+        entries = by_market.get(market_key) or []
+        if not entries:
+            continue
+        entries.sort(key=lambda e: (e[0], -e[1]))  # priority, score desc
+        body += (
+            f'<tr><td colspan="2" style="padding:6px 10px;background:#eef2f7;'
+            f'font-size:11px;font-weight:700;color:#334155;text-transform:uppercase;'
+            f'letter-spacing:0.03em;">{market_label} ({len(entries)})</td></tr>'
+        )
+        for pr, score, name, summary_entry in entries:
+            signal = summary_entry.get("signal", "n/a")
+            color = _signal_color(pr)
+            body += (
+                f'<tr>'
+                f'<td style="padding:5px 8px 5px 14px;font-size:12px;color:#0f172a;border-bottom:1px solid #f1f5f9;">{name}</td>'
+                f'<td style="padding:5px 8px;font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #f1f5f9;text-align:right;">{signal}</td>'
+                f'</tr>'
+            )
+
+    return f"""
+        <tr>
+          <td style="padding:0 20px 12px;" class="email-padding">
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;">
+              <tr><td colspan="2" style="padding:8px 10px;background:#f8fafc;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">At a Glance</td></tr>
+              {body}
+            </table>
+          </td>
+        </tr>
+    """
+
+
+def build_concentration_alert_html(rows):
+    """
+    Flags when a single sector dominates the current Buy list within a
+    market (US or India), to surface concentration risk early.
+    """
+    by_market = {"US": {}, "India": {}}
+    for pr, _score, _name, _html, summary_entry, market in rows:
+        if pr != 1:  # only look at current Buy signals
+            continue
+        raw_sector = (summary_entry.get("sector") or "").strip()
+        # Normalize so "unknown" / "Unknown" / "" / None are all treated the
+        # same -- market_context's fallback returns lowercase "unknown",
+        # which previously slipped past the "!= 'Unknown'" check below and
+        # showed up in the email as a literal "unknown is 100%..." alert.
+        sector = raw_sector if raw_sector and raw_sector.lower() != "unknown" else "Unknown"
+        by_market.setdefault(market, {})
+        by_market[market][sector] = by_market[market].get(sector, 0) + 1
+
+    alerts = []
+    for market, sector_counts in by_market.items():
+        total = sum(sector_counts.values())
+        # A single Buy signal being "100% of the list" isn't a meaningful
+        # concentration risk -- require at least a couple of positions
+        # before flagging it.
+        if total < 2:
+            continue
+        top_sector, top_count = max(sector_counts.items(), key=lambda kv: kv[1])
+        pct = round((top_count / total) * 100)
+        if pct >= SECTOR_CONCENTRATION_THRESHOLD_PCT and top_sector != "Unknown":
+            flag = "🇮🇳" if market == "India" else "🇺🇸"
+            alerts.append(
+                f'<div style="margin:4px 0 0;font-size:13px;color:#92400e;">'
+                f'{flag} <strong>{top_sector}</strong> is {pct}% of your {market} Buy list ({top_count}/{total})</div>'
+            )
+
+    if not alerts:
+        return ""
+
+    return f"""
+        <tr>
+          <td style="padding:0 20px 12px;" class="email-padding">
+            <div style="border:1px solid #fcd34d;border-left:4px solid #d97706;border-radius:10px;background:#fffbeb;padding:10px 12px;">
+              <div style="font-size:12px;font-weight:700;color:#d97706;text-transform:uppercase;letter-spacing:0.04em;">Concentration Watch</div>
+              {''.join(alerts)}
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_error_summary_html(groups):
+    """
+    One-line banner near the top of the report summarizing fetch failures,
+    instead of only showing them buried in the Errors sections.
+    """
+    failed_names = []
+    for market in groups.values():
+        failed_names.extend(name for _score, name, _html in market["Errors"])
+
+    if not failed_names:
+        return ""
+
+    names_text = ", ".join(failed_names)
+    return f"""
+        <tr>
+          <td style="padding:0 20px 12px;" class="email-padding">
+            <div style="border:1px solid #f5c2c7;border-left:4px solid #dc2626;border-radius:10px;background:#fff7f7;padding:10px 12px;">
+              <div style="font-size:12px;font-weight:700;color:#dc2626;text-transform:uppercase;letter-spacing:0.04em;">
+                {len(failed_names)} stock{'s' if len(failed_names) != 1 else ''} failed to fetch
+              </div>
+              <div style="margin:4px 0 0;font-size:13px;color:#721c24;">{names_text}</div>
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_csv_attachment(summary_rows):
+    """
+    Builds a CSV summary (one row per stock) for attaching to the email
+    or saving alongside the HTML report in DRY_RUN mode.
+    """
+    buffer = io.StringIO()
+    fieldnames = [
+        "ticker", "stock_name", "signal", "current_price",
+        "recommended_buy_level", "target", "stop_loss", "sector",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for entry in summary_rows:
+        writer.writerow(entry)
+    return buffer.getvalue()
 
 
 # -----------------------------
@@ -1352,21 +1686,78 @@ def get_section_html(title, count, items):
 # -----------------------------
 def main(mode, use_llm, detailed_llm=False):
     log.info(f"Starting stock analysis run. Mode: {mode}, LLM Enabled: {use_llm}, Detailed LLM: {detailed_llm}")
-    report_html = """
-<html>
-  <body style="margin:0;padding:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#111827;">
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f6f8;width:100%;min-width:100%;">
-      <tr>
-        <td align="center" style="padding:16px;">
-          <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="max-width:680px;min-width:320px;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+
+    # Diagnostic breakdown so a missing market (e.g. India) shows up in the
+    # logs immediately instead of only being noticed once the email arrives.
+    # classify_market only recognizes a ticker as "India" if it carries a
+    # .NS (NSE) or .BO (BSE) suffix -- anything else silently falls back to
+    # "US". A ticker like "RELIANCE" (no suffix) will both fail to fetch
+    # from yfinance AND get bucketed under US Stocks > Errors, not India.
+    _us_tickers = [f"{n} ({t})" for n, t in STOCKS.items() if classify_market(t) == "US"]
+    _in_tickers = [f"{n} ({t})" for n, t in STOCKS.items() if classify_market(t) == "India"]
+    log.info(
+        f"Loaded {len(STOCKS)} stocks from config -> "
+        f"US: {len(_us_tickers)} {_us_tickers} | India: {len(_in_tickers)} {_in_tickers}"
+    )
+    if STOCKS and not _in_tickers:
+        log.warning(
+            "No India tickers detected. Indian stock tickers must end in "
+            "'.NS' (NSE) or '.BO' (BSE), e.g. 'RELIANCE.NS', or they will "
+            "be treated as US tickers and likely fail to fetch."
+        )
+
+    report_html = """<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<title>Stock &amp; Commodity Report</title>
+<!--[if mso]>
+<noscript>
+<xml>
+<o:OfficeDocumentSettings>
+<o:PixelsPerInch>96</o:PixelsPerInch>
+</o:OfficeDocumentSettings>
+</xml>
+</noscript>
+<style>table {border-collapse:collapse;} td, h1, h2, h3, p {font-family:Arial, sans-serif;}</style>
+<![endif]-->
+<style>
+  body, table, td, a { -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }
+  table, td { mso-table-lspace:0pt; mso-table-rspace:0pt; }
+  img { border:0; line-height:100%; outline:none; text-decoration:none; -ms-interpolation-mode:bicubic; }
+  table { border-collapse:collapse !important; }
+  body { height:100% !important; margin:0 !important; padding:0 !important; width:100% !important; background:#f4f6f8; }
+  @media screen and (max-width:600px) {
+    .email-container { width:100% !important; max-width:100% !important; border-radius:0 !important; border-left:0 !important; border-right:0 !important; }
+    .email-padding { padding-left:14px !important; padding-right:14px !important; }
+    h1 { font-size:20px !important; }
+    h2 { font-size:15px !important; }
+  }
+</style>
+</head>
+<body style="margin:0;padding:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;mso-hide:all;">Latest Buy/Hold/Sell signals, Gold &amp; Silver levels, and your portfolio snapshot are ready.&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;</div>
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f6f8;width:100%;min-width:100%;">
+    <tr>
+      <td align="center" style="padding:16px;" class="email-padding">
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="email-container" style="max-width:680px;min-width:280px;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+          <tr>
+            <td style="background:linear-gradient(135deg,#2563eb,#1d4ed8);background-color:#2563eb;padding:4px;font-size:0;line-height:0;">&nbsp;</td>
+          </tr>
             <tr>
-              <td style="padding:18px 20px 12px;">
-                <h1 style="margin:0;font-size:22px;line-height:1.2;color:#111827;"> Stock Report</h1>
-                <p style="margin:10px 0 0;font-size:14px;line-height:1.6;color:#4b5563;">A clean mobile-friendly stock update with color-coded signal cards and compact metrics optimized for Gmail and Outlook.</p>
+              <td style="padding:18px 20px 12px;" class="email-padding">
+                <h1 style="margin:0;font-size:22px;line-height:1.25;color:#111827;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">📊 Stock Report</h1>
+                <p style="margin:10px 0 0;font-size:14px;line-height:1.6;color:#4b5563;">A clean, mobile-friendly stock update with color-coded signal cards and compact metrics — optimized for iPhone, iPad, Gmail and Outlook.</p>
               </td>
             </tr>
             <tr>
-              <td style="padding:0 20px 18px;border-top:1px solid #e5e7eb;">
+              <td style="padding:0 20px 18px;border-top:1px solid #e5e7eb;" class="email-padding">
                 <p style="margin:0;font-size:12px;color:#6b7280;line-height:1.5;">Each stock is shown in its own card, with the most important metrics and a short insight summary. Scroll vertically on mobile for the best view.</p>
               </td>
             </tr>
@@ -1377,6 +1768,10 @@ def main(mode, use_llm, detailed_llm=False):
     if use_llm:
         init_llm_generator()
 
+    run_history = load_run_history()
+    prev_stock_history = run_history.get("stocks", {})
+    new_stock_history = {}
+
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_stock = {
             executor.submit(process_stock, name, ticker, use_llm, detailed_llm): (name, ticker)
@@ -1384,11 +1779,29 @@ def main(mode, use_llm, detailed_llm=False):
         }
         for future in as_completed(future_to_stock):
             stock_name, ticker = future_to_stock[future]
+            market = classify_market(ticker)
             try:
                 result = future.result()
                 if result:
-                    rows.append(result)
-                    summary_rows.append(result[4])
+                    pr, score, name, row_html, summary_entry = result
+                    prior_entry = prev_stock_history.get(ticker)
+                    enrichment_html = build_stock_enrichment_html(summary_entry, prior_entry)
+                    enriched_html = enrichment_html + row_html
+                    rows.append((pr, score, name, enriched_html, summary_entry, market))
+                    summary_rows.append(summary_entry)
+                    if summary_entry.get("signal") != "ERROR":
+                        new_stock_history[ticker] = {
+                            "signal": summary_entry.get("signal"),
+                            "priority": pr,
+                            "price": summary_entry.get("current_price"),
+                            "target": summary_entry.get("target"),
+                            "stop_loss": summary_entry.get("stop_loss"),
+                            "last_run_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+                        }
+                    elif prior_entry:
+                        # Keep the last known-good entry so a single failed
+                        # run doesn't wipe out change-tracking history.
+                        new_stock_history[ticker] = prior_entry
             except Exception as exc:
                 log.error(f"Error processing {stock_name} ({ticker}) in executor: {exc}")
                 err_html = f"""
@@ -1398,34 +1811,52 @@ def main(mode, use_llm, detailed_llm=False):
                     </tr>
                 </table>
                 """
-                rows.append((4, 0, ticker, err_html, {
+                error_summary_entry = {
                     "stock_name": stock_name,
+                    "ticker": ticker,
                     "signal": "ERROR",
                     "current_price": None,
                     "recommended_buy_level": None,
                     "ema20": None,
                     "upcoming_events": {},
-                }))
+                    "target": None,
+                    "stop_loss": None,
+                    "sector": None,
+                    "priority": 4,
+                    "total_score": 0,
+                    "swing_setup": False,
+                }
+                rows.append((4, 0, ticker, err_html, error_summary_entry, market))
+                summary_rows.append(error_summary_entry)
+                prior_entry = prev_stock_history.get(ticker)
+                if prior_entry:
+                    new_stock_history[ticker] = prior_entry
 
     # This block is now correctly dedented and will run only once
-    groups = {"Buy": [], "Hold": [], "Sell": [], "Errors": []}
-    for pr, score, name, html, _ in rows:
+    # Stocks are grouped first by market (US / India), then by signal (Buy/Hold/Sell/Errors)
+    groups = {
+        "US": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
+        "India": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
+    }
+    for pr, score, name, html, _, market in rows:
+        market_key = market if market in groups else "US"
         if pr == 1:
-            groups["Buy"].append((score, name, html))
+            groups[market_key]["Buy"].append((score, name, html))
         elif pr == 2:
-            groups["Hold"].append((score, name, html))
+            groups[market_key]["Hold"].append((score, name, html))
         elif pr == 3:
-            groups["Sell"].append((score, name, html))
+            groups[market_key]["Sell"].append((score, name, html))
         else:
-            groups["Errors"].append((score, name, html))
+            groups[market_key]["Errors"].append((score, name, html))
 
-    for key in groups:
-        groups[key].sort(key=lambda item: item[0], reverse=True)
+    for market_key in groups:
+        for key in groups[market_key]:
+            groups[market_key][key].sort(key=lambda item: item[0], reverse=True)
 
-    buy_count = len(groups["Buy"])
-    hold_count = len(groups["Hold"])
-    sell_count = len(groups["Sell"])
-    err_count = len(groups["Errors"])
+    buy_count = len(groups["US"]["Buy"]) + len(groups["India"]["Buy"])
+    hold_count = len(groups["US"]["Hold"]) + len(groups["India"]["Hold"])
+    sell_count = len(groups["US"]["Sell"]) + len(groups["India"]["Sell"])
+    err_count = len(groups["US"]["Errors"]) + len(groups["India"]["Errors"])
 
     # Format date for the report header
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -1434,7 +1865,7 @@ def main(mode, use_llm, detailed_llm=False):
 
     summary_html = f"""
         <tr>
-          <td style="padding:16px 20px;border-top:1px solid #e5e7eb;">
+          <td style="padding:16px 20px;border-top:1px solid #e5e7eb;" class="email-padding">
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
               <tr>
                 <td>
@@ -1448,7 +1879,7 @@ def main(mode, use_llm, detailed_llm=False):
         </tr>
     """
 
-    quick_summary_text = build_quick_summary(summary_rows)
+    quick_summary_groups = build_quick_summary(summary_rows)
 
     # Fetch commodity data early so we can include it in the quick summary
     # and reuse the same data object when rendering the full section below.
@@ -1463,6 +1894,8 @@ def main(mode, use_llm, detailed_llm=False):
         traceback.print_exc()
 
     # Build commodity summary bullets
+    prev_commodity_history = run_history.get("commodities", {})
+    new_commodity_history = {}
     commodity_bullets = []
     if commodity_data:
         for metal, key in [("Gold (22K)", "gold"), ("Silver", "silver")]:
@@ -1488,9 +1921,22 @@ def main(mode, use_llm, detailed_llm=False):
                 if latest_c < 0:     score += 1
                 buy_triggered = score >= 8
 
+            # Buy-signal streak: how many consecutive runs this metal has
+            # shown a buy signal, so a single-day dip doesn't look the
+            # same as a sustained one.
+            prior_metal_history = prev_commodity_history.get(key, {})
+            prior_streak = prior_metal_history.get("buy_streak", 0)
+            current_streak = (prior_streak + 1) if buy_triggered else 0
+            new_commodity_history[key] = {
+                "buy_streak": current_streak,
+                "last_buy_triggered": buy_triggered,
+                "last_run_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+            }
+            streak_suffix = f" — {current_streak} runs in a row" if buy_triggered and current_streak > 1 else ""
+
             if buy_triggered:
                 commodity_bullets.append(
-                    f"✅ Buy Signal: {metal} at &#8377;{current:.2f} ({change_sign}{change}%)"
+                    f"✅ Buy Signal: {metal} at &#8377;{current:.2f} ({change_sign}{change}%){streak_suffix}"
                 )
             elif change <= -1.5:
                 commodity_bullets.append(
@@ -1505,15 +1951,33 @@ def main(mode, use_llm, detailed_llm=False):
                     f"⬛ {metal} {direction} {change_sign}{change}% — stable"
                 )
 
-    # Merge stock bullets + commodity bullets into one quick summary block
-    all_bullets = (quick_summary_text.splitlines() if quick_summary_text else []) + commodity_bullets
+    # Merge stock bullet groups + commodity bullets into one quick summary block
+    has_stock_bullets = any(quick_summary_groups.get(k) for k in ("Buy", "Hold", "Sell"))
 
     quick_summary_html = ""
-    if all_bullets:
-        stock_bullet_html = "".join(
-            f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
-            for item in (quick_summary_text.splitlines() if quick_summary_text else [])
-        )
+    if has_stock_bullets or commodity_bullets:
+        group_styles = {
+            "Buy":  ("#047857", "#dcfce7"),
+            "Hold": ("#a16207", "#fef3c7"),
+            "Sell": ("#dc2626", "#fee2e2"),
+        }
+        stock_bullet_html = ""
+        for group_key in ("Buy", "Hold", "Sell"):
+            bullets = quick_summary_groups.get(group_key) or []
+            if not bullets:
+                continue
+            color, bg = group_styles[group_key]
+            stock_bullet_html += (
+                '<div style="margin-top:8px;">'
+                f'<span style="display:inline-block;padding:2px 8px;border-radius:999px;'
+                f'background:{bg};color:{color};font-size:11px;font-weight:700;'
+                f'text-transform:uppercase;letter-spacing:0.03em;">{group_key}</span>'
+                + "".join(
+                    f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
+                    for item in bullets
+                )
+                + '</div>'
+            )
         commodity_bullet_html = ""
         if commodity_bullets:
             commodity_bullet_html = (
@@ -1529,7 +1993,7 @@ def main(mode, use_llm, detailed_llm=False):
 
         quick_summary_html = f"""
             <tr>
-              <td style="padding:0 20px 12px;">
+              <td style="padding:0 20px 12px;" class="email-padding">
                 <div style="border:1px solid #dbeafe;border-left:4px solid #2563eb;border-radius:10px;background:#f8fbff;padding:10px 12px;">
                   <div style="font-size:12px;font-weight:700;color:#2563eb;text-transform:uppercase;letter-spacing:0.04em;">Quick Summary</div>
                   {stock_bullet_html}
@@ -1539,10 +2003,14 @@ def main(mode, use_llm, detailed_llm=False):
             </tr>
         """
 
-    section_html = get_section_html("Buy", buy_count, groups["Buy"])
-    section_html += get_section_html("Hold", hold_count, groups["Hold"])
-    section_html += get_section_html("Sell", sell_count, groups["Sell"])
-    section_html += get_section_html("Errors", err_count, groups["Errors"])
+    # India rendered before US: on a large report (many stocks / detailed
+    # LLM mode) Gmail clips the message around ~102 KB and everything past
+    # that point is cut off entirely. India was previously appended last
+    # and could be silently truncated out of the visible email even though
+    # it was fully computed (see "At a Glance" / Quick Summary above, which
+    # are compact and always render near the top regardless of this order).
+    section_html = get_market_section_html("🇮🇳 India Stocks", groups["India"])
+    section_html += get_market_section_html("🇺🇸 US Stocks", groups["US"])
 
     # Commodity section (Gold & Silver) — built BEFORE stock sections so it appears
     # near the top of the email and is never clipped by Gmail's 102 KB limit.
@@ -1560,6 +2028,7 @@ def main(mode, use_llm, detailed_llm=False):
                 change=commodity_data["gold"]["change"],
                 history=commodity_data["gold"]["history"],
                 levels=gold_levels, plan=gold_plan,
+                sparkline_history=commodity_data["gold"].get("sparkline_history"),
             )
             silver_card = tracker._commodity_card_html(
                 name="Silver", ticker_label="XAG/INR",
@@ -1567,6 +2036,7 @@ def main(mode, use_llm, detailed_llm=False):
                 change=commodity_data["silver"]["change"],
                 history=commodity_data["silver"]["history"],
                 levels=silver_levels, plan=silver_plan,
+                sparkline_history=commodity_data["silver"].get("sparkline_history"),
             )
             commodity_section_html = f"""
                 <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
@@ -1580,7 +2050,7 @@ def main(mode, use_llm, detailed_llm=False):
                 {silver_card}"""
             commodity_row_html = f"""
                 <tr>
-                  <td style="padding:0 20px 20px;">
+                  <td style="padding:0 20px 20px;" class="email-padding">
                     {commodity_section_html}
                   </td>
                 </tr>
@@ -1590,7 +2060,7 @@ def main(mode, use_llm, detailed_llm=False):
             traceback.print_exc()
             commodity_row_html = """
                 <tr>
-                  <td style="padding:0 20px 20px;">
+                  <td style="padding:0 20px 20px;" class="email-padding">
                     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
                       <tr>
                         <td style="padding:14px;color:#721c24;font-size:13px;">
@@ -1604,7 +2074,7 @@ def main(mode, use_llm, detailed_llm=False):
     else:
         commodity_row_html = """
             <tr>
-              <td style="padding:0 20px 20px;">
+              <td style="padding:0 20px 20px;" class="email-padding">
                 <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
                   <tr>
                     <td style="padding:14px;color:#721c24;font-size:13px;">
@@ -1616,8 +2086,21 @@ def main(mode, use_llm, detailed_llm=False):
             </tr>
         """
 
+    # Build new report-enhancement blocks
+    error_summary_html = build_error_summary_html(groups)
+    quick_jump_html = build_quick_jump_table_html(rows)
+    concentration_alert_html = build_concentration_alert_html(rows)
+
     # Commodities first, then stock sections — ensures commodities are never clipped
-    report_html += quick_summary_html + summary_html + commodity_row_html + section_html
+    report_html += (
+        error_summary_html
+        + quick_jump_html
+        + quick_summary_html
+        + summary_html
+        + commodity_row_html
+        + concentration_alert_html
+        + section_html
+    )
 
     report_html += """
           </table>
@@ -1628,12 +2111,20 @@ def main(mode, use_llm, detailed_llm=False):
 </html>
     """
 
+    # Persist this run's state so the next run can diff signals/prices
+    # against it (change badges, breach alerts, commodity streaks).
+    save_run_history({"stocks": new_stock_history, "commodities": new_commodity_history})
+
+    csv_text = build_csv_attachment(summary_rows)
+
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("report.html", "w") as f:
             f.write(report_html)
-        log.info("Report saved to report.html (DRY_RUN enabled)")
+        with open("report.csv", "w") as f:
+            f.write(csv_text)
+        log.info("Report saved to report.html and report.csv (DRY_RUN enabled)")
     else:
-        send_email(report_html, mode)
+        send_email(report_html, mode, csv_attachment=csv_text, csv_filename="stock_report.csv")
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
 
