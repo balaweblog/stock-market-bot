@@ -36,5 +36,6 @@ jobs:
         run: |
           playwright install --with-deps chromium
 
+      
       - name: Run Stock Bot
         run: python main.py

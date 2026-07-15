@@ -14,3 +14,4 @@ weasyprint
 groq
 pyqt5
 pyqtwebengine
+playwright
