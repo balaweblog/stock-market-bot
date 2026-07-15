@@ -10,3 +10,7 @@ beautifulsoup4
 google-generativeai
 ratelimit
 requests-cache
+weasyprint
+groq
+pyqt5
+pyqtwebengine

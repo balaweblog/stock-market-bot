@@ -1,8 +1,7 @@
 import os
 import math
 import json
-import csv
-import io
+import time
 import yfinance as yf
 import pandas as pd
 import ta
@@ -14,9 +13,17 @@ from email.mime.application import MIMEApplication
 from datetime import datetime
 from zoneinfo import ZoneInfo
 try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
+try:
     from transformers import pipeline
 except ImportError:
     pipeline = None
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 try:
     from google import genai
 except ImportError:
@@ -43,6 +50,8 @@ model_lock = threading.Lock()
 llm_pipeline = None
 use_gemini_flash = False
 gemini_client = None
+use_groq = False
+groq_client = None
 
 # -----------------------------
 # Run-history persistence (enables signal-change tracking, stop/target
@@ -93,12 +102,29 @@ def save_run_history(history):
 def init_llm_generator():
     """
     Initializes the AI model.
-    Prioritizes Gemini 2.5 Flash (Free Cloud Tier) if GOOGLE_API_KEY is present.
-    Otherwise, falls back to the ultra-lightweight and highly smart Qwen2.5-1.5B local model.
+    Priority: Groq (free tier, fast hosted inference on Llama/DeepSeek) if
+    GROQ_API_KEY is present, then Gemini 2.5 Flash if GOOGLE_API_KEY is
+    present, then falls back to the local Qwen2.5-1.5B model.
     """
-    global llm_pipeline, use_gemini_flash, gemini_client
+    global llm_pipeline, use_gemini_flash, gemini_client, use_groq, groq_client
 
-    # 1. Check for Gemini API key
+    # 1. Check for Groq API key -- fastest option, no local compute needed,
+    # and (unlike the local model) safe to call concurrently from every
+    # worker thread since there's no shared model/GPU to serialize on.
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and Groq is not None:
+        try:
+            log.info("Groq API key detected. Initializing Groq (Free Tier)...")
+            groq_client = Groq(api_key=groq_key)
+            use_groq = True
+            log.info("Groq initialized successfully.")
+            return "groq"
+        except Exception as exc:
+            log.warning(f"Failed to initialize Groq, falling back: {exc}")
+            use_groq = False
+            groq_client = None
+
+    # 2. Check for Gemini API key
     api_key = os.getenv("GOOGLE_API_KEY") or globals().get("GOOGLE_API_KEY")
     if api_key and genai is not None:
         try:
@@ -112,7 +138,7 @@ def init_llm_generator():
             use_gemini_flash = False
             gemini_client = None
 
-    # 2. Fallback to local model
+    # 3. Fallback to local model
     if pipeline is None:
         log.warning("The 'transformers' library is not installed. LLM reasoning will be disabled.")
         return None
@@ -148,6 +174,42 @@ def init_llm_generator():
             llm_pipeline = None
             
     return "local" if llm_pipeline is not None else None
+
+
+def generate_groq_reasoning(prompt, stock_name="", model="llama-3.3-70b-versatile", max_retries=3):
+    """
+    Generates text using Groq's hosted inference (free tier). Groq's LPU
+    hardware returns completions dramatically faster than local CPU
+    inference, and -- unlike the local model -- calls are independent per
+    request, so they run cleanly in parallel across the worker threads
+    instead of needing to share a lock.
+
+    The free tier has a requests-per-minute cap; if many stocks hit it in
+    the same burst (10 worker threads), a 429 can show up. We retry a
+    couple of times with a short backoff before giving up on this stock.
+    """
+    if Groq is None or groq_client is None:
+        return None
+
+    for attempt in range(max_retries):
+        try:
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=800,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            is_rate_limit = "429" in str(e) or "rate_limit" in str(e).lower()
+            if is_rate_limit and attempt < max_retries - 1:
+                wait_s = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                log.warning(f"Groq rate limited for {stock_name}, retrying in {wait_s}s...")
+                time.sleep(wait_s)
+                continue
+            log.error(f"Groq generation failed for {stock_name}: {e}")
+            return None
+    return None
 
 
 def generate_gemini_reasoning(prompt):
@@ -922,10 +984,19 @@ def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, s
     if generator is None:
         return _get_fallback_reason()
 
-    # Use the Hugging Face model for reasoning
-    hf_text = generate_hf_reasoning(prompt, stock_name=stock_name)
-    if hf_text:
-        return hf_text
+    # Route to whichever backend actually got initialized. (Previously this
+    # always called the local HF path even when Gemini had initialized
+    # successfully, so a configured GOOGLE_API_KEY was silently never used
+    # -- every report was quietly falling back to the generic reason text.)
+    if generator == "groq":
+        text = generate_groq_reasoning(prompt, stock_name=stock_name)
+    elif generator == "gemini":
+        text = generate_gemini_reasoning(prompt)
+    else:
+        text = generate_hf_reasoning(prompt, stock_name=stock_name)
+
+    if text:
+        return text
 
     # Fallback if the AI model fails for any reason
     return _get_fallback_reason()
@@ -956,7 +1027,7 @@ def get_date_with_suffix(d):
 # -----------------------------
 # Email
 # -----------------------------
-def send_email(report_html, mode, csv_attachment=None, csv_filename="stock_report.csv"):
+def send_email(report_html, mode, pdf_attachment=None, pdf_filename="stock_report.pdf"):
     if not all([EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO]):
         print(
             "Email credentials not found. "
@@ -984,11 +1055,11 @@ def send_email(report_html, mode, csv_attachment=None, csv_filename="stock_repor
     formatted_time = now_ist.strftime("%I:%M %p")
     subject += f" - {formatted_date} {formatted_time} IST"
 
-    if csv_attachment:
+    if pdf_attachment:
         msg = MIMEMultipart("mixed")
         msg.attach(MIMEText(report_html, "html"))
-        attachment_part = MIMEApplication(csv_attachment.encode("utf-8"), Name=csv_filename)
-        attachment_part["Content-Disposition"] = f'attachment; filename="{csv_filename}"'
+        attachment_part = MIMEApplication(pdf_attachment, _subtype="pdf", Name=pdf_filename)
+        attachment_part["Content-Disposition"] = f'attachment; filename="{pdf_filename}"'
         msg.attach(attachment_part)
     else:
         msg = MIMEText(report_html, "html")
@@ -1664,21 +1735,42 @@ def build_error_summary_html(groups):
     """
 
 
-def build_csv_attachment(summary_rows):
+def build_pdf_attachment(report_html):
     """
-    Builds a CSV summary (one row per stock) for attaching to the email
-    or saving alongside the HTML report in DRY_RUN mode.
+    Renders the exact same HTML that goes into the email body to a PDF
+    file, for attaching to the email (replaces the old CSV attachment).
+
+    Uses headless Chromium via Playwright rather than WeasyPrint: Playwright
+    bundles its own browser binary, so there's no dependency on system-level
+    Pango/Cairo/GTK libraries (the source of the libpango dlopen errors seen
+    with WeasyPrint on some Mac/Anaconda setups). It also renders the report
+    exactly as a real browser would -- gradients, border-radius, and the
+    emoji in the report headers all render correctly, which WeasyPrint
+    doesn't guarantee.
+
+    Returns None (and logs why) if rendering isn't possible, so a failure
+    here never blocks the email itself from sending.
     """
-    buffer = io.StringIO()
-    fieldnames = [
-        "ticker", "stock_name", "signal", "current_price",
-        "recommended_buy_level", "target", "stop_loss", "sector",
-    ]
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
-    for entry in summary_rows:
-        writer.writerow(entry)
-    return buffer.getvalue()
+    if sync_playwright is None:
+        log.error(
+            "playwright is not installed; skipping PDF attachment. "
+            "Install it with: pip install playwright && playwright install chromium"
+        )
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            try:
+                page = browser.new_page()
+                page.set_content(report_html, wait_until="networkidle")
+                pdf_bytes = page.pdf(format="A4", print_background=True)
+            finally:
+                browser.close()
+        return pdf_bytes
+    except Exception as e:
+        log.error(f"Failed to render PDF attachment: {e}")
+        traceback.print_exc()
+        return None
 
 
 # -----------------------------
@@ -2115,16 +2207,19 @@ def main(mode, use_llm, detailed_llm=False):
     # against it (change badges, breach alerts, commodity streaks).
     save_run_history({"stocks": new_stock_history, "commodities": new_commodity_history})
 
-    csv_text = build_csv_attachment(summary_rows)
+    pdf_bytes = build_pdf_attachment(report_html)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("report.html", "w") as f:
             f.write(report_html)
-        with open("report.csv", "w") as f:
-            f.write(csv_text)
-        log.info("Report saved to report.html and report.csv (DRY_RUN enabled)")
+        if pdf_bytes:
+            with open("report.pdf", "wb") as f:
+                f.write(pdf_bytes)
+            log.info("Report saved to report.html and report.pdf (DRY_RUN enabled)")
+        else:
+            log.info("Report saved to report.html only -- PDF rendering failed or unavailable (DRY_RUN enabled)")
     else:
-        send_email(report_html, mode, csv_attachment=csv_text, csv_filename="stock_report.csv")
+        send_email(report_html, mode, pdf_attachment=pdf_bytes, pdf_filename="stock_report.pdf")
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
 
