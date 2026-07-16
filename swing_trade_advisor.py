@@ -249,7 +249,7 @@ def build_email_html(analysis_html, today_str, sources, used_live_search):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Swing Trade Idea</title>
+<title>Daily Swing Trade Idea</title>
 <style>
   body {{ margin:0; padding:0; background:#f4f6f8; }}
   table {{ border-collapse:collapse !important; }}
@@ -269,8 +269,8 @@ def build_email_html(analysis_html, today_str, sources, used_live_search):
           </tr>
           <tr>
             <td style="padding:18px 20px 6px;" class="email-padding">
-              <h1 style="margin:0;font-size:20px;color:#111827;">📈 Swing Trade Idea (3-5 Month Horizon)</h1>
-              <p style="margin:8px 0 0;font-size:13px;color:#6b7280;">Generated {today_str}{' · live web search used' if used_live_search else ''}</p>
+              <h1 style="margin:0;font-size:20px;color:#111827;">📈 Daily Swing Trade Idea (3-5 Month Horizon)</h1>
+              <p style="margin:8px 0 0;font-size:13px;color:#6b7280;">Generated {today_str} · {datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%I:%M %p IST")}{' · live web search used' if used_live_search else ''}</p>
             </td>
           </tr>
           <tr>
@@ -309,7 +309,8 @@ def send_swing_trade_email(html_body):
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
-    subject = f"📈 Swing Trade Idea - {main.get_date_with_suffix(now_ist)}"
+    time_str = now_ist.strftime("%I:%M %p IST")
+    subject = f"📈 Daily Swing Trade Idea - {main.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
@@ -348,6 +349,23 @@ def run():
         main.log.error(
             "No LLM backend produced output (no GROQ_API_KEY/GOOGLE_API_KEY set "
             "and local model unavailable/failed). Aborting without sending an email."
+        )
+        sys.exit(1)
+
+    if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
+        # Only groq/compound actually hits the live web. Every other path
+        # (Groq's plain llama fallback, Gemini, or the local model) is pure
+        # training-data reasoning with no real-time prices/news -- exactly
+        # the stale output this run is meant to avoid. Refuse to email it
+        # rather than silently sending non-verified figures. Set
+        # REQUIRE_LIVE_DATA=false to explicitly allow a stale-data fallback
+        # email instead of aborting.
+        main.log.error(
+            "Live web search was not used for this run (Groq's live-search "
+            "model was unavailable or the backend fell back to Gemini/local), "
+            "so the output would only reflect stale training-data prices/news. "
+            "Aborting without sending an email. Set REQUIRE_LIVE_DATA=false to "
+            "override and allow a clearly-labeled stale-data email instead."
         )
         sys.exit(1)
 

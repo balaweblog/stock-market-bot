@@ -1042,18 +1042,18 @@ def send_email(report_html, mode, pdf_attachment=None, pdf_filename="stock_repor
         print("No valid TO recipients found. Please set EMAIL_TO with a comma-separated list of emails.")
         return
 
-    subject = " BlueOcean Stock Report"
+    subject = "Stock Portfolio Summary"
     if mode == "real_time":
         subject = f"REAL-TIME: {subject}"
     elif mode == "eod":
-        subject = f"DAILY: {subject}"
+        subject = f"Daily {subject}"
 
     # Append the formatted date and current time in IST
     now_utc = datetime.now(ZoneInfo("UTC"))
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
     formatted_date = get_date_with_suffix(now_ist)
     formatted_time = now_ist.strftime("%I:%M %p")
-    subject += f" - {formatted_date} {formatted_time} IST"
+    subject += f" - {formatted_date} .{formatted_time} IST"
 
     if pdf_attachment:
         msg = MIMEMultipart("mixed")
