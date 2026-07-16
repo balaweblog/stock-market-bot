@@ -29,7 +29,9 @@ quote/news source yourself -- not investment advice.
 """
 
 import os
+import re
 import sys
+import time
 import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -103,33 +105,58 @@ def generate_analysis(prompt):
         # It's slower and uses more of the free-tier quota than a plain chat
         # completion (it may make several web searches per request under the
         # hood), but for a once-a-run email that's a good trade.
-        try:
-            response = main.groq_client.chat.completions.create(
-                model="groq/compound",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=3000,
-            )
-            text = response.choices[0].message.content.strip()
-            sources = _extract_groq_sources(response)
-            return text, sources, True  # True = had live web search available
-        except Exception as e:
-            main.log.error(f"Groq (compound) swing-trade generation failed: {e}")
-            # Fall back to the plain (non-search) model rather than giving up
-            # entirely if groq/compound itself errors (e.g. temporarily
-            # unavailable / not enabled on the account).
+        #
+        # groq/compound orchestrates via meta-llama/llama-4-scout, whose free
+        # tier is capped at 30,000 tokens/minute org-wide. A 429 here is
+        # usually just that minute's shared quota being briefly exhausted --
+        # not a real outage -- so retry a couple of times with the wait time
+        # Groq's own error message reports before giving up on it.
+        for attempt in range(3):
             try:
                 response = main.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
+                    model="groq/compound",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.4,
                     max_tokens=3000,
                 )
-                return response.choices[0].message.content.strip(), [], False
-            except Exception as e2:
-                main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
+                text = response.choices[0].message.content.strip()
+                sources = _extract_groq_sources(response)
+                return text, sources, True  # True = had live web search available
+            except Exception as e:
+                wait_s = _parse_groq_retry_seconds(e) or 10
+                main.log.error(
+                    f"Groq (compound) swing-trade generation failed "
+                    f"(attempt {attempt + 1}/3): {e}"
+                )
+                if attempt < 2:
+                    main.log.info(f"Retrying groq/compound in {wait_s:.1f}s...")
+                    time.sleep(wait_s)
+
+        # groq/compound is still rate-limited/unavailable after retries. Try
+        # a real live-search alternative (Gemini + Google Search grounding)
+        # before falling back to non-live generation, since that's a
+        # genuinely separate free-tier quota from Groq's.
+        grounded = _try_gemini_grounded(prompt)
+        if grounded is not None:
+            return grounded
+
+        # Last resort: plain (non-search) Groq model, so the run still
+        # produces *something* rather than giving up entirely.
+        try:
+            response = main.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=3000,
+            )
+            return response.choices[0].message.content.strip(), [], False
+        except Exception as e2:
+            main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
 
     if backend == "gemini" or main.gemini_client is not None:
+        grounded = _try_gemini_grounded(prompt)
+        if grounded is not None:
+            return grounded
         try:
             response = main.gemini_client.models.generate_content(
                 model="gemini-2.5-flash",
@@ -161,6 +188,56 @@ def generate_analysis(prompt):
             main.log.error(f"Local swing-trade generation failed: {e}")
 
     return None, [], False
+
+
+def _parse_groq_retry_seconds(exc):
+    """Groq's 429 body includes a 'Please try again in 7.342s' hint -- pull
+    that out so retries wait the right amount instead of guessing."""
+    match = re.search(r"try again in ([\d.]+)s", str(exc))
+    if match:
+        try:
+            return float(match.group(1)) + 0.5  # small buffer
+        except ValueError:
+            return None
+    return None
+
+
+def _try_gemini_grounded(prompt):
+    """
+    Genuine live-search fallback: Gemini's free tier supports real Google
+    Search grounding (separate free-tier quota from Groq entirely), so this
+    is a real second live-data path, not just another training-data model.
+    Returns (text, sources, True) on success, or None if Gemini isn't
+    configured or the call fails -- callers should fall through to their
+    next option in that case.
+    """
+    if main.gemini_client is None:
+        return None
+    try:
+        from google.genai import types
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
+        response = main.gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(tools=[grounding_tool]),
+        )
+        sources = []
+        try:
+            for candidate in response.candidates:
+                gm = getattr(candidate, "grounding_metadata", None)
+                for chunk in (getattr(gm, "grounding_chunks", None) or []):
+                    web = getattr(chunk, "web", None)
+                    if web and web.uri and (web.title, web.uri) not in sources:
+                        sources.append((web.title or web.uri, web.uri))
+        except Exception as e:
+            main.log.warning(f"Could not extract Gemini grounding sources: {e}")
+        # Only report this as "live" if grounding actually fired -- Gemini
+        # may decide a query doesn't need a search and skip it.
+        used_live = bool(sources)
+        return response.text.strip(), sources, used_live
+    except Exception as e:
+        main.log.error(f"Gemini grounded (live search) generation failed: {e}")
+        return None
 
 
 def _extract_groq_sources(response):
