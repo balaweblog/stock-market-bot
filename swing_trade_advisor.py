@@ -117,18 +117,31 @@ def generate_analysis(prompt):
                     model="groq/compound",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.4,
-                    max_tokens=3000,
+                    max_tokens=2200,
                 )
                 text = response.choices[0].message.content.strip()
                 sources = _extract_groq_sources(response)
                 return text, sources, True  # True = had live web search available
             except Exception as e:
-                wait_s = _parse_groq_retry_seconds(e) or 10
                 main.log.error(
                     f"Groq (compound) swing-trade generation failed "
                     f"(attempt {attempt + 1}/3): {e}"
                 )
+                if _is_request_too_large(e):
+                    # A 413 means this exact payload can't fit regardless of
+                    # timing -- retrying it unchanged is guaranteed to fail
+                    # again (as seen: attempt 1 got 413, then wasted 2 more
+                    # attempts and 10+ seconds turning it into 429s instead).
+                    # Stop immediately and let the Gemini fallback below
+                    # handle this run rather than burning more of the shared
+                    # per-minute token budget on retries that can't succeed.
+                    main.log.error(
+                        "Request too large for groq/compound -- skipping "
+                        "further retries of this payload."
+                    )
+                    break
                 if attempt < 2:
+                    wait_s = _parse_groq_retry_seconds(e) or 10
                     main.log.info(f"Retrying groq/compound in {wait_s:.1f}s...")
                     time.sleep(wait_s)
 
@@ -188,6 +201,14 @@ def generate_analysis(prompt):
             main.log.error(f"Local swing-trade generation failed: {e}")
 
     return None, [], False
+
+
+def _is_request_too_large(exc):
+    """True for Groq's 413 'Request Entity Too Large' -- a payload-size
+    failure, not a rate limit, so unlike a 429 it can't be fixed by waiting
+    and retrying the same request."""
+    msg = str(exc)
+    return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
 
 
 def _parse_groq_retry_seconds(exc):
