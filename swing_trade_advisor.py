@@ -71,21 +71,21 @@ For EACH stock, give: Name of the Stock; How Much Can Invest (% of total trading
 
 OUTPUT FORMAT -- respond with ONLY the HTML below, fully filled in, and nothing else (no markdown, no code fences, no commentary before or after):
 
-<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;border-collapse:collapse;">
-<tr style="background:#f8fafc;"><td style="padding:8px 10px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;">Parameter</td><td style="padding:8px 10px;font-size:11px;font-weight:700;color:#2563eb;text-transform:uppercase;">Stock A</td><td style="padding:8px 10px;font-size:11px;font-weight:700;color:#2563eb;text-transform:uppercase;">Stock B</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Name of the Stock</td><td style="padding:6px 10px;font-size:13px;font-weight:700;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:13px;font-weight:700;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Allocation (% of capital)</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Entry Date (Targeted)</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Exit Date (Expected)</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Strategy Type</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Upside Target %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;color:#047857;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;color:#047857;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Stop-Loss %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;color:#dc2626;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;color:#dc2626;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Target 1 (T1) %</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Target 2 (T2) %</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Recent Top Buyers (FII/DII)</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;color:#475569;border-top:1px solid #f1f5f9;">Broker Recommendations</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td><td style="padding:6px 10px;font-size:12px;color:#0f172a;border-top:1px solid #f1f5f9;">FILL</td></tr>
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
+<tr style="background:#14213D;"><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Parameter</td><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock A</td><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock B</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Name of the Stock</td><td style="padding:6px 10px;font-size:13px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:13px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Allocation (% of capital)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Entry Date (Targeted)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Exit Date (Expected)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Strategy Type</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Upside Target %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#2F5233;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#2F5233;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Stop-Loss %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#8B2E2E;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#8B2E2E;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Target 1 (T1) %</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Target 2 (T2) %</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Recent Top Buyers (FII/DII)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
+<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Broker Recommendations</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
 </table>
-<div style="margin-top:10px;font-size:12px;color:#475569;line-height:1.6;"><strong>Why these two:</strong> FILL two to three sentences per stock covering the fundamental + technical + sentiment rationale and the key risk to watch.</div>
+<div style="margin-top:14px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong> FILL two to three sentences per stock covering the fundamental + technical + sentiment rationale and the key risk to watch.</div>
 """
 
 
@@ -140,6 +140,20 @@ def generate_analysis(prompt):
                         "further retries of this payload."
                     )
                     break
+                if _is_daily_quota_exceeded(e):
+                    # A "tokens per day" (TPD) 429 means the org-wide daily
+                    # budget for this model is exhausted -- typically by
+                    # main.py's own per-stock Groq calls earlier the same
+                    # day, since they share the same GROQ_API_KEY/org. The
+                    # reset is measured in hours, not seconds, so the usual
+                    # short backoff-and-retry can't possibly succeed here.
+                    main.log.error(
+                        "Groq daily token quota (TPD) exhausted for this "
+                        "org -- retrying within seconds cannot help. "
+                        "Skipping remaining retries and moving to the "
+                        "Gemini/local fallback."
+                    )
+                    break
                 if attempt < 2:
                     wait_s = _parse_groq_retry_seconds(e) or 10
                     main.log.info(f"Retrying groq/compound in {wait_s:.1f}s...")
@@ -149,12 +163,19 @@ def generate_analysis(prompt):
         # a real live-search alternative (Gemini + Google Search grounding)
         # before falling back to non-live generation, since that's a
         # genuinely separate free-tier quota from Groq's.
-        grounded = _try_gemini_grounded(prompt)
-        if grounded is not None:
-            return grounded
+        if main.gemini_client is None and not (os.getenv("GOOGLE_API_KEY") and main.genai is not None):
+            main.log.info(
+                "Gemini live-search fallback skipped: GOOGLE_API_KEY is not "
+                "configured (or the google-genai package isn't installed), "
+                "so there is no second live-data path available for this run."
+            )
+        else:
+            grounded = _try_gemini_grounded(prompt)
+            if grounded is not None:
+                return grounded
 
-        # Last resort: plain (non-search) Groq model, so the run still
-        # produces *something* rather than giving up entirely.
+        # Last resort (still "live-ish"): plain (non-search) Groq model, so
+        # the run still produces *something* rather than giving up entirely.
         try:
             response = main.groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -165,8 +186,17 @@ def generate_analysis(prompt):
             return response.choices[0].message.content.strip(), [], False
         except Exception as e2:
             main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
+            if _is_daily_quota_exceeded(e2):
+                main.log.error(
+                    "Groq's daily token quota is exhausted for this org -- "
+                    "this is shared with main.py's per-stock reasoning calls "
+                    "(same GROQ_API_KEY, same default model). If main.py ran "
+                    "earlier today against many stocks, it may have used "
+                    "most of the 100k/day budget before this script ran. "
+                    "Falling back to the local model instead of retrying Groq."
+                )
 
-    if backend == "gemini" or main.gemini_client is not None:
+    elif backend == "gemini" or main.gemini_client is not None:
         grounded = _try_gemini_grounded(prompt)
         if grounded is not None:
             return grounded
@@ -179,26 +209,51 @@ def generate_analysis(prompt):
         except Exception as e:
             main.log.error(f"Gemini swing-trade generation failed: {e}")
 
-    if backend == "local" and main.llm_pipeline is not None:
-        try:
-            messages = [{"role": "user", "content": prompt}]
-            formatted_prompt = main.llm_pipeline.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            with main.model_lock:
-                outputs = main.llm_pipeline(
-                    formatted_prompt,
-                    max_new_tokens=1200,
-                    do_sample=True,
-                    temperature=0.4,
-                    top_k=50,
-                    top_p=0.95,
-                )
-            generated_text = outputs[0]["generated_text"]
-            text = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
+    # Absolute last resort: the local Qwen2.5-1.5B model. Previously this
+    # branch only ran when `backend == "local"` -- i.e. only when neither
+    # GROQ_API_KEY nor GOOGLE_API_KEY was set at all. If Groq *was*
+    # configured (the common case) but every Groq/Gemini path above failed
+    # (rate limits, exhausted daily quota, no GOOGLE_API_KEY), the function
+    # fell straight through to `return None, [], False` without ever trying
+    # the local model -- even though it may already be loaded in memory.
+    # force_local=True here re-enters init_llm_generator() and skips
+    # straight to the local-model section regardless of which backend was
+    # originally selected, since we already know Groq/Gemini can't serve
+    # this request right now.
+    local_backend = main.init_llm_generator(force_local=True)
+    if local_backend == "local" and main.llm_pipeline is not None:
+        text = _generate_local(prompt)
+        if text:
             return text, [], False
-        except Exception as e:
-            main.log.error(f"Local swing-trade generation failed: {e}")
+
+    return None, [], False
+
+
+def _generate_local(prompt):
+    """Runs the prompt through the local Qwen2.5-1.5B pipeline. Returns the
+    generated text, or None if the local model isn't available or fails."""
+    if main.llm_pipeline is None:
+        return None
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = main.llm_pipeline.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        with main.model_lock:
+            outputs = main.llm_pipeline(
+                formatted_prompt,
+                max_new_tokens=1200,
+                do_sample=True,
+                temperature=0.4,
+                top_k=50,
+                top_p=0.95,
+            )
+        generated_text = outputs[0]["generated_text"]
+        text = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
+        return text
+    except Exception as e:
+        main.log.error(f"Local swing-trade generation failed: {e}")
+        return None
 
     return None, [], False
 
@@ -209,6 +264,18 @@ def _is_request_too_large(exc):
     and retrying the same request."""
     msg = str(exc)
     return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
+
+
+def _is_daily_quota_exceeded(exc):
+    """True for a Groq 429 that's specifically a 'tokens per day' (TPD)
+    limit, as opposed to the much shorter 'tokens per minute' (TPM) limit.
+    TPM resets within seconds and is worth retrying; TPD is an org-wide
+    daily budget that only resets after (per Groq's own error message)
+    potentially over an hour -- retrying it with a short backoff is
+    guaranteed to fail again and just wastes the run's time budget.
+    """
+    msg = str(exc)
+    return "tokens per day" in msg or "TPD" in msg
 
 
 def _parse_groq_retry_seconds(exc):
@@ -311,14 +378,15 @@ def _strip_code_fences(text):
 def _build_sources_html(sources):
     if not sources:
         return ""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     items = "".join(
-        f'<div style="margin:4px 0 0;font-size:11px;">'
-        f'<a href="{url}" style="color:#2563eb;text-decoration:none;">{title}</a></div>'
+        f'<div style="margin:5px 0 0;font-family:{sans};font-size:11px;">'
+        f'<a href="{url}" style="color:#14213D;text-decoration:none;border-bottom:1px solid #B08D57;">{title}</a></div>'
         for title, url in sources[:12]
     )
     return f"""
-        <div style="margin-top:10px;padding-top:10px;border-top:1px dashed #e5e7eb;">
-          <div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.04em;">Sources checked (live web search)</div>
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid #EDEAE2;">
+          <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;">Sources Consulted &nbsp;&middot;&nbsp; Live Web Search</div>
           {items}
         </div>
     """
@@ -341,45 +409,58 @@ def build_email_html(analysis_html, today_str, sources, used_live_search):
         )
 
     sources_html = _build_sources_html(sources)
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    serif = "Georgia,'Times New Roman',serif"
+    live_tag = (
+        '<span style="color:#B08D57;">&nbsp;&middot;&nbsp; Live web search used</span>'
+        if used_live_search else ""
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Daily Swing Trade Idea</title>
+<title>Swing Trade Research Note</title>
 <style>
-  body {{ margin:0; padding:0; background:#f4f6f8; }}
+  body {{ margin:0; padding:0; background:#F2F0EC; }}
   table {{ border-collapse:collapse !important; }}
   @media screen and (max-width:600px) {{
     .email-container {{ width:100% !important; max-width:100% !important; border-radius:0 !important; }}
-    .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}
+    .email-padding {{ padding-left:16px !important; padding-right:16px !important; }}
   }}
 </style>
 </head>
-<body style="margin:0;padding:0;background:#f4f6f8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#111827;">
-  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f6f8;width:100%;">
+<body style="margin:0;padding:0;background:#F2F0EC;font-family:{serif};color:#1B2233;">
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#F2F0EC;width:100%;">
     <tr>
-      <td align="center" style="padding:16px;" class="email-padding">
-        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="email-container" style="max-width:680px;min-width:280px;background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden;">
+      <td align="center" style="padding:20px 16px;" class="email-padding">
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="email-container" style="max-width:680px;min-width:280px;background:#ffffff;border:1px solid #DAD5CB;border-radius:4px;overflow:hidden;">
           <tr>
-            <td style="background:linear-gradient(135deg,#2563eb,#1d4ed8);padding:4px;font-size:0;line-height:0;">&nbsp;</td>
-          </tr>
-          <tr>
-            <td style="padding:18px 20px 6px;" class="email-padding">
-              <h1 style="margin:0;font-size:20px;color:#111827;">📈 Daily Swing Trade Idea (3-5 Month Horizon)</h1>
-              <p style="margin:8px 0 0;font-size:13px;color:#6b7280;">Generated {today_str} · {datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%I:%M %p IST")}{' · live web search used' if used_live_search else ''}</p>
+            <td style="background:#14213D;padding:26px 28px 22px;" class="email-padding">
+              <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#B08D57;">Market Intelligence &nbsp;&bull;&nbsp; Idea Generation</div>
+              <h1 style="margin:8px 0 0;font-family:{serif};font-weight:400;font-size:23px;line-height:1.3;color:#ffffff;letter-spacing:0.01em;">Swing Trade Research Note</h1>
+              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">3&ndash;5 Month Positioning Horizon</p>
             </td>
           </tr>
           <tr>
-            <td style="padding:0 20px 16px;" class="email-padding">
+            <td style="height:3px;line-height:3px;font-size:0;background:linear-gradient(90deg,#B08D57,#D9C393 45%,#B08D57);">&nbsp;</td>
+          </tr>
+          <tr>
+            <td style="padding:16px 28px 4px;" class="email-padding">
+              <p style="margin:0;font-family:{sans};font-size:12px;color:#8A8F9C;">Prepared {today_str} at {datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%I:%M %p IST")}{live_tag}</p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:14px 28px 18px;" class="email-padding">
               {analysis_html}
               {sources_html}
             </td>
           </tr>
           <tr>
-            <td style="padding:12px 20px 18px;border-top:1px solid #e5e7eb;" class="email-padding">
-              <p style="margin:0;font-size:11px;color:#9ca3af;line-height:1.5;">{disclaimer}</p>
+            <td style="padding:16px 28px 22px;border-top:1px solid #EDEAE2;" class="email-padding">
+              <p style="margin:0;font-family:{sans};font-size:11px;line-height:1.6;color:#9AA0AC;">{disclaimer}</p>
+              <p style="margin:10px 0 0;font-family:{sans};font-size:10px;letter-spacing:0.04em;color:#B9BEC7;">&copy; Portfolio Research Desk</p>
             </td>
           </tr>
         </table>
@@ -408,7 +489,7 @@ def send_swing_trade_email(html_body):
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"📈 Daily Swing Trade Idea - {main.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"Swing Trade Research Note — {main.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
