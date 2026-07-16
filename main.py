@@ -1516,7 +1516,7 @@ def get_section_html(title, count, items):
         return ""
 
     header = f'<tr><td style="padding:12px 20px 0;" class="email-padding"><h2 style="margin:0;font-size:15px;">{title} ({count})</h2></td></tr>'
-    rows_html = "".join([f'<tr><td style="padding:0 20px;" class="email-padding">{html}</td></tr>' for _, _, html in items])
+    rows_html = "".join([f'<tr><td style="padding:0 20px;page-break-inside:avoid;break-inside:avoid;" class="email-padding">{html}</td></tr>' for _, _, html in items])
     return header + rows_html
 
 
@@ -1807,8 +1807,18 @@ def build_pdf_attachment(report_html):
             browser = p.chromium.launch()
             try:
                 page = browser.new_page()
+                # Force "print" media explicitly (rather than relying on
+                # page.pdf()'s implicit default) so the @media print rules
+                # above -- which stop cards/rows splitting across a page
+                # break -- are guaranteed to apply.
+                page.emulate_media(media="print")
                 page.set_content(report_html, wait_until="networkidle")
-                pdf_bytes = page.pdf(format="A4", print_background=True)
+                pdf_bytes = page.pdf(
+                    format="A4",
+                    print_background=True,
+                    prefer_css_page_size=False,
+                    margin={"top": "16mm", "bottom": "16mm", "left": "12mm", "right": "12mm"},
+                )
             finally:
                 browser.close()
         return pdf_bytes
@@ -1875,6 +1885,20 @@ def main(mode, use_llm, detailed_llm=False):
     .email-padding { padding-left:14px !important; padding-right:14px !important; }
     h1 { font-size:20px !important; }
     h2 { font-size:15px !important; }
+  }
+  @media print {
+    /* Every stock card / commodity block / alert box lives in its own
+       top-level <tr>, so telling every <tr> not to split keeps each card
+       whole -- this is what stops cards and rows being cut in half across
+       a page boundary (the main source of "overlapping" torn-card artifacts
+       in the previous PDF renders). */
+    tr { page-break-inside: avoid; break-inside: avoid; }
+    h1, h2, h3 { page-break-after: avoid; break-after: avoid-page; }
+    /* Give the printed document proper page margins instead of bleeding
+       edge-to-edge -- the email's own 680px card looks cramped and
+       unfinished sitting flush against A4 page edges. */
+    body { background:#ffffff !important; }
+    .email-container { max-width:100% !important; border:none !important; border-radius:0 !important; }
   }
 </style>
 </head>
@@ -2223,11 +2247,26 @@ def main(mode, use_llm, detailed_llm=False):
             </tr>
         """
 
+    # Snapshot of the header/banner HTML built so far, so the email body can
+    # reuse it without the full per-stock "portfolio" sections that follow.
+    report_html_header = report_html
+
     # Build new report-enhancement blocks
     error_summary_html = build_error_summary_html(groups)
     quick_jump_html = build_quick_jump_table_html(rows)
     concentration_alert_html = build_concentration_alert_html(rows)
 
+    footer_html = """
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+    """
+
+    # PDF gets the full report: heatmap, quick summary, portfolio snapshot,
+    # commodities, concentration alerts, and every stock's detailed card.
     # Commodities first, then stock sections — ensures commodities are never clipped
     report_html += (
         error_summary_html
@@ -2238,15 +2277,14 @@ def main(mode, use_llm, detailed_llm=False):
         + concentration_alert_html
         + section_html
     )
+    report_html += footer_html
 
-    report_html += """
-          </table>
-        </td>
-      </tr>
-    </table>
-  </body>
-</html>
-    """
+    # Email gets only the Portfolio Heatmap + Quick Summary. The full
+    # per-stock "portfolio" breakdown (summary/commodity cards/concentration
+    # alerts/detailed stock sections) is dropped from the inline message and
+    # lives only in the attached PDF -- keeps the email short and avoids
+    # Gmail's ~102 KB body-clipping entirely rather than just working around it.
+    email_html = report_html_header + quick_jump_html + quick_summary_html + footer_html
 
     # Persist this run's state so the next run can diff signals/prices
     # against it (change badges, breach alerts, commodity streaks).
@@ -2257,14 +2295,16 @@ def main(mode, use_llm, detailed_llm=False):
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("report.html", "w") as f:
             f.write(report_html)
+        with open("email.html", "w") as f:
+            f.write(email_html)
         if pdf_bytes:
             with open("report.pdf", "wb") as f:
                 f.write(pdf_bytes)
-            log.info("Report saved to report.html and report.pdf (DRY_RUN enabled)")
+            log.info("Report saved to report.html, email.html and report.pdf (DRY_RUN enabled)")
         else:
-            log.info("Report saved to report.html only -- PDF rendering failed or unavailable (DRY_RUN enabled)")
+            log.info("Report saved to report.html and email.html only -- PDF rendering failed or unavailable (DRY_RUN enabled)")
     else:
-        send_email(report_html, mode, pdf_attachment=pdf_bytes, pdf_filename="stock_report.pdf")
+        send_email(email_html, mode, pdf_attachment=pdf_bytes, pdf_filename="stock_report.pdf")
         log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
 
