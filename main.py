@@ -1278,7 +1278,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
                             <tr>
                                 <td style="vertical-align:top;">
                                     <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{stock_name} <span style="font-size:13px;color:#64748b;">{ticker}</span></h3>
-                                    <div style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
+                                    <div class="llm-thesis" style="margin:6px 0 0;font-size:13px;color:#334155;line-height:1.4;max-height:140px;overflow:hidden;">{llm_display}</div>
                                 </td>
                                 <td style="width:150px;text-align:right;vertical-align:top;">
                                     <div style="display:inline-block;padding:6px 10px;border-radius:999px;font-weight:700;color:#fff;background:{'#dc2626' if 'sell' in signal.lower() else '#f59e0b' if 'hold' in signal.lower() else '#047857'};">{signal}</div>
@@ -1802,22 +1802,50 @@ def build_pdf_attachment(report_html):
             "Install it with: pip install playwright && playwright install chromium"
         )
         return None
+
+    # Fixed viewport/page width. The @media print rule sizes .email-container
+    # to 820px, so we give it 60px of horizontal margin (30px each side) to
+    # sit inside without ever being clipped on the right edge.
+    PAGE_WIDTH_PX = 880
+    MARGIN_PX = 30
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()
             try:
-                page = browser.new_page()
+                page = browser.new_page(viewport={"width": PAGE_WIDTH_PX, "height": 1080})
                 # Force "print" media explicitly (rather than relying on
                 # page.pdf()'s implicit default) so the @media print rules
-                # above -- which stop cards/rows splitting across a page
-                # break -- are guaranteed to apply.
+                # above apply.
                 page.emulate_media(media="print")
                 page.set_content(report_html, wait_until="networkidle")
+
+                # Render as ONE continuous page rather than paginating across
+                # repeated A4 sheets. Multi-page A4 output was what produced
+                # the broken look in earlier PDFs: cards mid-way down a page
+                # would either get sliced in half across the page boundary,
+                # or (once "avoid break" rules kicked in) get pushed whole
+                # onto the next sheet -- leaving a large blank gap at the
+                # bottom of the previous page and a badge/heading floating
+                # alone at the top of the next one. A single page sized to
+                # the actual content height removes page boundaries entirely,
+                # so nothing can be cut or pushed across one.
+                content_height = page.evaluate(
+                    "Math.ceil(document.documentElement.scrollHeight)"
+                )
+                page_height_px = content_height + (MARGIN_PX * 2)
+
                 pdf_bytes = page.pdf(
-                    format="A4",
+                    width=f"{PAGE_WIDTH_PX}px",
+                    height=f"{page_height_px}px",
                     print_background=True,
                     prefer_css_page_size=False,
-                    margin={"top": "16mm", "bottom": "16mm", "left": "12mm", "right": "12mm"},
+                    margin={
+                        "top": f"{MARGIN_PX}px",
+                        "bottom": f"{MARGIN_PX}px",
+                        "left": f"{MARGIN_PX}px",
+                        "right": f"{MARGIN_PX}px",
+                    },
                 )
             finally:
                 browser.close()
@@ -1887,18 +1915,24 @@ def main(mode, use_llm, detailed_llm=False):
     h2 { font-size:15px !important; }
   }
   @media print {
-    /* Every stock card / commodity block / alert box lives in its own
-       top-level <tr>, so telling every <tr> not to split keeps each card
-       whole -- this is what stops cards and rows being cut in half across
-       a page boundary (the main source of "overlapping" torn-card artifacts
-       in the previous PDF renders). */
+    /* The PDF is rendered as a single continuous page (see
+       build_pdf_attachment), so there are no page boundaries left to
+       protect cards from -- these rules just keep things tidy rather
+       than working around pagination. */
     tr { page-break-inside: avoid; break-inside: avoid; }
     h1, h2, h3 { page-break-after: avoid; break-after: avoid-page; }
-    /* Give the printed document proper page margins instead of bleeding
-       edge-to-edge -- the email's own 680px card looks cramped and
-       unfinished sitting flush against A4 page edges. */
     body { background:#ffffff !important; }
-    .email-container { max-width:100% !important; border:none !important; border-radius:0 !important; }
+    .email-container {
+      max-width:820px !important;
+      width:820px !important;
+      border:none !important;
+      border-radius:0 !important;
+      box-shadow:none !important;
+    }
+    /* The email view clips each stock's AI thesis to 140px so the inbox
+       message stays short; the PDF is a standalone report and should show
+       the full text instead of cutting sentences off mid-word. */
+    .llm-thesis { max-height:none !important; overflow:visible !important; }
   }
 </style>
 </head>
