@@ -202,7 +202,10 @@ def generate_analysis(prompt):
             return grounded
         try:
             response = main.gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                # See note in _try_gemini_grounded below: pinned dated model
+                # IDs can get gated/retired without warning, so use Google's
+                # auto-updated alias instead.
+                model="gemini-flash-latest",
                 contents=prompt,
             )
             return response.text.strip(), [], False
@@ -318,7 +321,10 @@ def _try_gemini_grounded(prompt):
         from google.genai import types
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         response = main.gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            # See note by the other generate_content calls: use Google's
+            # auto-updated alias instead of a pinned dated model ID that can
+            # get gated/retired for some accounts without warning.
+            model="gemini-flash-latest",
             contents=prompt,
             config=types.GenerateContentConfig(tools=[grounding_tool]),
         )

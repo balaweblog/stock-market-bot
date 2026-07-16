@@ -228,7 +228,12 @@ def generate_gemini_reasoning(prompt):
         return None
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            # "gemini-flash-latest" is Google's auto-updated alias rather
+            # than a pinned dated model -- pinning to gemini-2.5-flash broke
+            # in July 2026 when Google started returning 404s for some
+            # accounts well ahead of its official Oct 16 2026 shutdown date.
+            # The alias gets swapped by Google with >=2 weeks' notice instead.
+            model="gemini-flash-latest",
             contents=prompt,
         )
         return response.text.strip()
