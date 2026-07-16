@@ -37,6 +37,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          echo "GOOGLE_API_KEY set: $([ -n "$GOOGLE_API_KEY" ] && echo yes || echo no)"
+          pip show google-genai
+
+
 
       - name: Run Swing Trade Advisor
         run: python swing_trade_advisor.py
