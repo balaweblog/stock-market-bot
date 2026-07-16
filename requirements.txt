@@ -15,3 +15,4 @@ groq
 pyqt5
 pyqtwebengine
 playwright
+google-genai
