@@ -300,7 +300,20 @@ def _try_gemini_grounded(prompt):
     next option in that case.
     """
     if main.gemini_client is None:
-        return None
+        # main.init_llm_generator() only builds gemini_client when Gemini is
+        # chosen as the *primary* backend -- if GROQ_API_KEY was set, Groq
+        # wins that selection and the function returns before ever touching
+        # GOOGLE_API_KEY, so gemini_client stays None even when a valid
+        # GOOGLE_API_KEY exists. Build a client here on demand instead of
+        # silently giving up, so this fallback path actually gets used.
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key or main.genai is None:
+            return None
+        try:
+            main.gemini_client = main.genai.Client(api_key=api_key)
+        except Exception as e:
+            main.log.error(f"Could not lazily initialize Gemini client for grounded fallback: {e}")
+            return None
     try:
         from google.genai import types
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
