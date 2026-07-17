@@ -1,7 +1,10 @@
 import os
+import re
 import math
 import json
 import time
+import html
+import requests
 import yfinance as yf
 import pandas as pd
 import ta
@@ -184,93 +187,500 @@ def init_llm_generator(force_local=False):
     return "local" if llm_pipeline is not None else None
 
 
-def generate_groq_reasoning(prompt, stock_name="", model="llama-3.3-70b-versatile", max_retries=3):
-    """
-    Generates text using Groq's hosted inference (free tier). Groq's LPU
-    hardware returns completions dramatically faster than local CPU
-    inference, and -- unlike the local model -- calls are independent per
-    request, so they run cleanly in parallel across the worker threads
-    instead of needing to share a lock.
+# -----------------------------
+# AI Stocks Story -- one combined, live-grounded call for ALL stocks
+# -----------------------------
+# Previously process_stock() made its own individual AI call per stock (a
+# now-removed generate_llm_reasoning() that hit Groq/Gemini/local once per
+# stock) -- N stocks meant N separate AI requests, each with its own prompt
+# overhead. This section replaces every one of those individual calls with
+# ONE combined call that returns a short, bulleted "AI Stock Story" for
+# every stock in STOCKS at once, following the same live-search tiering used
+# in swing_trade_advisor.py (groq/compound -> groq/compound-mini -> Tavily
+# search + plain Groq -> Gemini + Google Search grounding -> plain Groq ->
+# local model), just aimed at many short per-stock outputs instead of one
+# long open-ended one. Far fewer AI round-trips and far fewer tokens spent
+# on repeated prompt/instruction overhead for a portfolio of any size.
+AI_STORY_BULLETS_PER_STOCK = 3
 
-    The free tier has a requests-per-minute cap; if many stocks hit it in
-    the same burst (10 worker threads), a 429 can show up. We retry a
-    couple of times with a short backoff before giving up on this stock.
-    """
-    if Groq is None or groq_client is None:
-        return None
 
-    for attempt in range(max_retries):
-        try:
-            response = groq_client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.7,
-                max_tokens=800,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            is_rate_limit = "429" in str(e) or "rate_limit" in str(e).lower()
-            if is_rate_limit and attempt < max_retries - 1:
-                wait_s = 2 ** (attempt + 1)  # 2s, 4s, 8s
-                log.warning(f"Groq rate limited for {stock_name}, retrying in {wait_s}s...")
-                time.sleep(wait_s)
+def _tavily_search(query, max_results=2):
+    """
+    Runs one query against Tavily's search API directly and returns a list
+    of {"title", "url", "content"} dicts, or [] on any failure / if
+    TAVILY_API_KEY isn't set. Same free tier (1,000 searches/month, no
+    card) swing_trade_advisor.py uses, entirely separate from Groq's and
+    Gemini's own quotas.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": max_results,
+                "include_answer": False,
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for r in data.get("results", []):
+            results.append({
+                "title": r.get("title") or r.get("url", ""),
+                "url": r.get("url", ""),
+                # Trimmed hard -- this only needs to ground the model in a
+                # fact or two per stock, not hand it full articles. Keeping
+                # this short is what keeps the *combined* prompt (every
+                # stock's worth of context at once) inside a sane token
+                # budget.
+                "content": (r.get("content") or "")[:140],
+            })
+        return results
+    except Exception as e:
+        log.warning(f"Tavily search failed for query '{query}': {e}")
+        return []
+
+
+def _gather_ai_stocks_story_context(stock_names, today_str):
+    """
+    Runs one targeted Tavily query per stock (in parallel, reusing the
+    same worker pool style as process_stock) and assembles a compact,
+    per-stock-tagged context block plus a deduplicated source list.
+    Returns ("", []) if Tavily isn't configured or nothing came back.
+    """
+    if not os.getenv("TAVILY_API_KEY"):
+        return "", []
+
+    sources = []
+    blocks_by_stock = {}
+
+    def _fetch_one(name):
+        query = f"{name} share price news {today_str}"
+        return name, _tavily_search(query, max_results=2)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(_fetch_one, name) for name in stock_names]
+        for future in as_completed(futures):
+            try:
+                name, results = future.result()
+            except Exception as e:
+                log.warning(f"Tavily lookup failed for a stock: {e}")
                 continue
-            log.error(f"Groq generation failed for {stock_name}: {e}")
+            for r in results:
+                if not r["url"]:
+                    continue
+                if (r["title"], r["url"]) not in sources:
+                    sources.append((r["title"], r["url"]))
+                blocks_by_stock.setdefault(name, []).append(f"{r['title']}: {r['content']}")
+
+    if not blocks_by_stock:
+        return "", []
+
+    lines = []
+    for name in stock_names:
+        snippets = blocks_by_stock.get(name)
+        if snippets:
+            lines.append(f"[{name}] " + " | ".join(snippets))
+    context_text = (
+        "LIVE NEWS SNIPPETS (real, freshly-fetched -- treat as your factual "
+        "source for each stock; a stock with no snippet below has no fresh "
+        "news, so keep its story brief and generic rather than inventing "
+        "specifics):\n" + "\n".join(lines) + "\n\n"
+    )
+    return context_text, sources
+
+
+def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
+    names_block = "\n".join(f"- {n}" for n in stock_names)
+    return (
+        f"{context_text}"
+        f"Today is {today_str}. For EACH stock listed below, write an \"AI Stock Story\": "
+        f"exactly {AI_STORY_BULLETS_PER_STOCK} short bullet points (max 15 words each, plain "
+        f"text, no sub-bullets, no markdown) covering, in order: "
+        f"1) the single most important recent driver, catalyst, or news item, "
+        f"2) the current momentum/sentiment read, "
+        f"3) the key risk or watch-item. "
+        f"Base each story on the live news snippets above where one exists for that stock; "
+        f"otherwise give a brief, generic-but-accurate read rather than inventing specifics.\n\n"
+        f"Stocks:\n{names_block}\n\n"
+        "OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code "
+        "fences, no commentary before or after):\n"
+        "{\n"
+        '  "stories": {\n'
+        '    "<exact stock name as listed above>": ["bullet 1", "bullet 2", "bullet 3"],\n'
+        "    ...\n"
+        "  }\n"
+        "}\n"
+        "Every stock listed above must appear as a key, using the exact name given."
+    )
+
+
+def _extract_groq_sources(response):
+    """Pulls (title, url) pairs out of groq/compound's executed_tools field
+    so callers can show what was actually searched. Defensive about
+    attribute-vs-dict access since SDK response objects vary."""
+    def _get(obj, key):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    sources = []
+    try:
+        message = response.choices[0].message
+        for tool in (_get(message, "executed_tools") or []):
+            search_results = _get(tool, "search_results")
+            for r in (_get(search_results, "results") or []):
+                url = _get(r, "url")
+                title = _get(r, "title") or url
+                if url and (title, url) not in sources:
+                    sources.append((title, url))
+    except Exception as e:
+        log.warning(f"Could not extract Groq search sources: {e}")
+    return sources
+
+
+def _is_request_too_large(exc):
+    """True for Groq's 413 'Request Entity Too Large' -- a payload-size
+    failure, not a rate limit, so retrying the same request can't help."""
+    msg = str(exc)
+    return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
+
+
+def _is_daily_quota_exceeded(exc):
+    """True for a Groq 429 that's specifically a daily (TPD) limit, as
+    opposed to the much shorter per-minute (TPM) limit -- TPD only resets
+    after potentially over an hour, so retrying it wastes time."""
+    msg = str(exc)
+    return "tokens per day" in msg or "TPD" in msg
+
+
+def _parse_groq_retry_seconds(exc):
+    """Groq's 429 body includes a 'Please try again in 7.342s' hint."""
+    match = re.search(r"try again in ([\d.]+)s", str(exc))
+    if match:
+        try:
+            return float(match.group(1)) + 0.5
+        except ValueError:
             return None
     return None
 
 
-def generate_gemini_reasoning(prompt):
+def _strip_code_fences(text):
+    """Models occasionally wrap the requested JSON in ```json ... ``` even
+    when told not to -- strip that off so it parses cleanly."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    return cleaned
+
+
+def _parse_ai_stocks_story_json(text, stock_names):
     """
-    Generates text using the Gemini 2.5 Flash model via the google-genai Client SDK.
+    Parses the compact per-stock JSON the LLM returns (see
+    _build_ai_stocks_story_prompt's OUTPUT FORMAT). Returns a dict
+    {stock_name: [bullet, ...]} for whichever names it recognizes, matched
+    back to the exact configured stock name case/whitespace-insensitively
+    so lookups in process_stock are a plain dict hit. Returns {} if
+    nothing usable could be parsed.
     """
-    if genai is None or gemini_client is None:
-        return None
+    cleaned = _strip_code_fences(text)
     try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+
+    stories = data.get("stories") if isinstance(data, dict) else None
+    if not isinstance(stories, dict):
+        return {}
+
+    result = {}
+    name_lookup = {n.strip().lower(): n for n in stock_names}
+    for key, bullets in stories.items():
+        if not isinstance(bullets, list):
+            continue
+        clean_bullets = [str(b).strip() for b in bullets if str(b).strip()][:AI_STORY_BULLETS_PER_STOCK]
+        if not clean_bullets:
+            continue
+        matched_name = name_lookup.get(str(key).strip().lower(), key)
+        result[matched_name] = clean_bullets
+    return result
+
+
+def _try_groq_compound_model_for_stories(prompt, model_name, stock_count, max_attempts=2):
+    max_tokens = min(4000, max(700, stock_count * 70))
+    for attempt in range(max_attempts):
+        try:
+            response = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=max_tokens,
+            )
+            text = response.choices[0].message.content.strip()
+            sources = _extract_groq_sources(response)
+            return text, sources, True  # True = had live web search available
+        except Exception as e:
+            log.error(
+                f"Groq ({model_name}) AI Stocks Story generation failed "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if _is_request_too_large(e):
+                log.error(f"Request too large for {model_name} -- skipping further retries.")
+                return None
+            if _is_daily_quota_exceeded(e):
+                log.error(f"Groq daily token quota exhausted for {model_name} -- skipping remaining retries.")
+                return None
+            if attempt < max_attempts - 1:
+                wait_s = _parse_groq_retry_seconds(e) or 10
+                log.info(f"Retrying {model_name} in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+    return None
+
+
+def _try_tavily_plus_groq_for_stories(prompt, stock_count):
+    if not os.getenv("TAVILY_API_KEY") or groq_client is None:
+        return None
+    max_tokens = min(4000, max(700, stock_count * 70))
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content.strip(), True
+    except Exception as e:
+        log.error(f"Groq synthesis over Tavily context failed for AI Stocks Story: {e}")
+        return None
+
+
+def _try_gemini_grounded_for_stories(prompt):
+    """
+    Genuine live-search fallback: Gemini's free tier supports real Google
+    Search grounding (a separate free-tier quota from both Groq and
+    Tavily). Returns (text, sources, True) on success, or None.
+    """
+    global gemini_client
+    if gemini_client is None:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key or genai is None:
+            return None
+        try:
+            gemini_client = genai.Client(api_key=api_key)
+        except Exception as e:
+            log.error(f"Could not lazily initialize Gemini client for AI Stocks Story: {e}")
+            return None
+    try:
+        from google.genai import types
+        grounding_tool = types.Tool(google_search=types.GoogleSearch())
         response = gemini_client.models.generate_content(
-            # "gemini-flash-latest" is Google's auto-updated alias rather
-            # than a pinned dated model -- pinning to gemini-2.5-flash broke
-            # in July 2026 when Google started returning 404s for some
-            # accounts well ahead of its official Oct 16 2026 shutdown date.
-            # The alias gets swapped by Google with >=2 weeks' notice instead.
             model="gemini-flash-latest",
             contents=prompt,
+            config=types.GenerateContentConfig(tools=[grounding_tool]),
         )
-        return response.text.strip()
+        sources = []
+        try:
+            for candidate in response.candidates:
+                gm = getattr(candidate, "grounding_metadata", None)
+                for chunk in (getattr(gm, "grounding_chunks", None) or []):
+                    web = getattr(chunk, "web", None)
+                    if web and web.uri and (web.title, web.uri) not in sources:
+                        sources.append((web.title or web.uri, web.uri))
+        except Exception as e:
+            log.warning(f"Could not extract Gemini grounding sources: {e}")
+        used_live = bool(sources)
+        return response.text.strip(), sources, used_live
     except Exception as e:
-        log.error(f"Gemini generation failed: {e}")
+        log.error(f"Gemini grounded AI Stocks Story generation failed: {e}")
         return None
 
 
-def generate_hf_reasoning(prompt, stock_name=""):
-    """
-    Generates text using the locally run Hugging Face model.
-    Serializes execution using a thread lock to prevent CPU/GPU thrashing.
-    """
+def _generate_local_story(prompt):
+    """Runs the combined-stories prompt through the local Qwen2.5-1.5B
+    pipeline. Returns the generated text, or None if unavailable/failed."""
     if llm_pipeline is None:
         return None
-
     try:
-        # Format the prompt for Qwen2.5 Chat template (uses ChatML template)
         messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = llm_pipeline.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        
-        # Inference must be serialized to prevent resource thrashing
+        formatted_prompt = llm_pipeline.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
         with model_lock:
-            log.info(f"Generating AI trade plan for {stock_name}...")
-            # Allow a longer, more detailed generation for richer trade analysis
-            outputs = llm_pipeline(formatted_prompt, max_new_tokens=400, do_sample=True, temperature=0.7, top_k=50, top_p=0.95)
-            log.info(f"AI trade plan successfully generated for {stock_name}.")
-        
-        generated_text = outputs[0]['generated_text']
-        
-        # Clean up the output to get only the assistant's response (Qwen2.5 style)
-        response = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-        
-        return response
+            outputs = llm_pipeline(
+                formatted_prompt,
+                max_new_tokens=1200,
+                do_sample=True,
+                temperature=0.4,
+                top_k=50,
+                top_p=0.95,
+            )
+        generated_text = outputs[0]["generated_text"]
+        return generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
     except Exception as e:
-        log.error(f"Hugging Face model generation failed for {stock_name}: {e}")
+        log.error(f"Local AI Stocks Story generation failed: {e}")
         return None
+
+
+def generate_ai_stocks_story(stock_names):
+    """
+    Single, combined, live-grounded call that produces a short, bulleted
+    "AI Stock Story" for every stock in `stock_names` at once. Tiering
+    mirrors swing_trade_advisor.py: groq/compound -> groq/compound-mini ->
+    Tavily search + plain Groq -> Gemini + Google Search grounding ->
+    plain (non-live) Groq -> local model.
+
+    Returns (stories, sources, used_live_search):
+      stories: {stock_name: [bullet, bullet, bullet]} -- {} on total failure
+      sources: [(title, url), ...] actually used, for optional display
+      used_live_search: True if the tier that produced the result was
+        genuinely grounded in live search results
+    """
+    if not stock_names:
+        return {}, [], False
+
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
+    stock_count = len(stock_names)
+
+    backend = init_llm_generator()
+    log.info(f"AI Stocks Story using LLM backend: {backend}")
+
+    bare_prompt = _build_ai_stocks_story_prompt(stock_names, "", today_str)
+
+    if backend == "groq":
+        # Tier 1/2: groq/compound (and the lighter compound-mini) can
+        # search the live web on their own -- no separate context needed.
+        result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound", stock_count, max_attempts=2)
+        if result is not None:
+            text, sources, live = result
+            stories = _parse_ai_stocks_story_json(text, stock_names)
+            if stories:
+                return stories, sources, live
+
+        log.info("groq/compound unavailable for AI Stocks Story -- trying groq/compound-mini...")
+        result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound-mini", stock_count, max_attempts=2)
+        if result is not None:
+            text, sources, live = result
+            stories = _parse_ai_stocks_story_json(text, stock_names)
+            if stories:
+                return stories, sources, live
+
+        # Tier 3: fetch live snippets via Tavily directly (own free quota,
+        # one query per stock, run in parallel), then hand them to a
+        # plain, non-orchestrating Groq call.
+        context_text, tavily_sources = _gather_ai_stocks_story_context(stock_names, today_str)
+        if context_text:
+            grounded_prompt = _build_ai_stocks_story_prompt(stock_names, context_text, today_str)
+            result = _try_tavily_plus_groq_for_stories(grounded_prompt, stock_count)
+            if result is not None:
+                text, live = result
+                stories = _parse_ai_stocks_story_json(text, stock_names)
+                if stories:
+                    return stories, tavily_sources, live
+
+        # Tier 4: Gemini + Google Search grounding, a separate free quota.
+        if gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None):
+            grounded = _try_gemini_grounded_for_stories(bare_prompt)
+            if grounded is not None:
+                text, sources, live = grounded
+                stories = _parse_ai_stocks_story_json(text, stock_names)
+                if stories:
+                    return stories, sources, live
+
+        # Tier 5: plain (non-search) Groq -- still one call for every
+        # stock, just without live grounding.
+        try:
+            max_tokens = min(4000, max(700, stock_count * 70))
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": bare_prompt}],
+                temperature=0.4,
+                max_tokens=max_tokens,
+            )
+            text = response.choices[0].message.content.strip()
+            stories = _parse_ai_stocks_story_json(text, stock_names)
+            if stories:
+                return stories, [], False
+        except Exception as e:
+            log.error(f"Groq fallback (no search) AI Stocks Story generation failed: {e}")
+            if _is_daily_quota_exceeded(e):
+                log.error(
+                    "Groq's daily token quota is exhausted for this org. "
+                    "Falling back to the local model instead of retrying Groq."
+                )
+
+    elif backend == "gemini" or gemini_client is not None:
+        grounded = _try_gemini_grounded_for_stories(bare_prompt)
+        if grounded is not None:
+            text, sources, live = grounded
+            stories = _parse_ai_stocks_story_json(text, stock_names)
+            if stories:
+                return stories, sources, live
+        try:
+            response = gemini_client.models.generate_content(
+                model="gemini-flash-latest",
+                contents=bare_prompt,
+            )
+            stories = _parse_ai_stocks_story_json(response.text.strip(), stock_names)
+            if stories:
+                return stories, [], False
+        except Exception as e:
+            log.error(f"Gemini AI Stocks Story generation failed: {e}")
+
+    # Last resort: local model -- still one combined call, not one per stock.
+    local_backend = init_llm_generator(force_local=True)
+    if local_backend == "local" and llm_pipeline is not None:
+        text = _generate_local_story(bare_prompt)
+        if text:
+            stories = _parse_ai_stocks_story_json(text, stock_names)
+            if stories:
+                return stories, [], False
+
+    return {}, [], False
+
+
+def _fallback_stock_story(stock_name, signal, tech_score, fund_score, sentiment_score, sentiment_label, headlines):
+    """
+    Cheap, non-AI 3-bullet fallback used when the batched AI Stocks Story
+    call didn't produce an entry for this stock (e.g. every AI backend
+    failed, or the model skipped a name). Computed instantly from data
+    already on hand for this stock -- no extra AI call.
+    """
+    headline = headlines[0] if headlines else "No recent headlines available."
+    return [
+        f"Signal: {signal}, technical score {tech_score}, fundamentals {fund_score}.",
+        f"Sentiment reads {sentiment_label.lower()} ({round(sentiment_score, 1)}).",
+        f"Latest headline: {headline}",
+    ]
+
+
+def build_ai_story_bullets_html(bullets):
+    """Renders a stock's AI Stock Story bullets as a compact <ul>, HTML-
+    escaping each bullet since the text may come from an LLM."""
+    if not bullets:
+        return ""
+    items = "".join(f"<li style=\"margin:0 0 4px 0;\">{html.escape(b)}</li>" for b in bullets)
+    return f'<ul style="margin:0;padding-left:16px;">{items}</ul>'
+
+
 def fetch_data(symbol):
     df = yf.download(
         symbol,
@@ -942,79 +1352,6 @@ def get_recommended_entry(signal, total_score, latest, market_context, entry_con
     return choose_stock_entry(signal, total_score, latest, market_context, entry_context)
 
 
-def generate_llm_reasoning(stock_name, ticker, latest, tech_score, fund_score, sentiment_score, sentiment_label, tech_signal, signal, headlines, risk_data, entry_context=None):
-    # Fallback summary generation
-    def _get_fallback_reason():
-        headline_summary = headlines[:2]
-        headline_text = "; ".join(headline_summary) if headline_summary else "No recent headlines."
-        return (
-            f"{stock_name} is currently in a {signal.lower()} posture. "
-            f"Technical momentum is {tech_signal.lower()} with a score of {tech_score}, "
-            f"fundamentals are {fund_score}, and sentiment is {sentiment_label.lower()} ({round(sentiment_score, 2)}). "
-            f"Recent headlines: {headline_text}."
-        )
-
-    entry_context = entry_context or {}
-    price_vs_ema20 = entry_context.get("price_vs_ema20_pct", "n/a")
-    price_vs_ema50 = entry_context.get("price_vs_ema50_pct", "n/a")
-    volume_vs_avg = entry_context.get("volume_vs_avg_pct", "n/a")
-    risk_reward = entry_context.get("risk_reward_ratio", "n/a")
-    current_price = entry_context.get("current_price", round(latest['close'], 2))
-
-    # High-quality prompt for a professional swing-trading analysis
-    prompt = (
-        f"Act as a veteran swing trader managing real capital. Deliver a high-conviction trade plan for {stock_name} ({ticker}) focused on the next 1-10 trading sessions. "
-        f"Be direct, professional, and actionable, and treat this as a real decision-making brief rather than a generic summary.\n\n"
-        f"**Trade Context:**\n"
-        f"- Overall Signal: {signal}\n"
-        f"- Current Market Price: {current_price}\n"
-        f"- Technical Score: {tech_score}\n"
-        f"- Key Price Levels: EMA20: {round(latest['ema20'], 2)}, EMA50: {round(latest['ema50'], 2)}, EMA200: {round(latest['ema200'], 2)}\n"
-        f"- Price vs EMA20 / EMA50: {price_vs_ema20} / {price_vs_ema50}\n"
-        f"- Volume vs 20D Avg: {volume_vs_avg}\n"
-        f"- Risk/Reward Ratio: {risk_reward}\n"
-        f"- Momentum: RSI at {round(latest['rsi'], 2)}; ADX at {round(latest['adx'], 2)}\n"
-        f"- Sentiment: {sentiment_label} ({round(sentiment_score, 2)})\n\n"
-        f"**Pre-calculated Risk Levels:**\n"
-        f"- Patient Entry: {risk_data['buy_levels']['patient_entry']} (best for a pullback or discount entry)\n"
-        f"- Optimal Entry: {risk_data['buy_levels']['optimal_entry']} (best for a retest or confirmation entry)\n"
-        f"- Aggressive Entry: {risk_data['buy_levels']['aggressive_entry']} (only for breakout momentum or a strong trend continuation)\n"
-        f"- Stop-Loss: {risk_data['stop_loss']}\n"
-        f"- Profit Target: {risk_data['target']}\n\n"
-        f"**Instructions for a Pro Swing Trader (Detailed Analysis Requested):**\n"
-        f"1. **Trade Thesis:** One clear sentence stating the setup, directional bias, and expected move.\n"
-        f"2. **Entry Plan:** Recommend Patient, Optimal, or Aggressive style and give exact price levels for each, with rationale.\n"
-        f"3. **Positioning & Sizing:** Recommend position sizing guidance (scale-in points, % of portfolio, full size vs partial) and explain rationale.\n"
-        f"4. **Risk Management:** State stop-loss, invalidation point, and calculate risk per share and % risk vs suggested position size.\n"
-        f"5. **Exit Plan & Targets:** Provide at least two profit target levels and what market events or indicator changes would invalidate them.\n"
-        f"6. **Scenario Analysis:** Provide 2-3 short scenarios (Bull case, Base case, Bear case) with approximate probabilities and numeric price ranges.\n"
-        f"7. **Confirmation Signals & Timing:** Name specific near-term triggers (e.g., retest of EMA20, breakout volume) and an expected time horizon (1-3 sessions, 3-10 sessions).\n"
-        f"8. **Supporting Evidence:** Cite 3 concrete data points from the provided inputs (e.g., RSI value, EMA alignment, top headline) that justify the recommendation.\n"
-        f"9. **Format:** Output with clear labeled sections and short bullet points. Use numeric values where possible and avoid generic filler."
-    )
-
-    generator = init_llm_generator()
-    if generator is None:
-        return _get_fallback_reason()
-
-    # Route to whichever backend actually got initialized. (Previously this
-    # always called the local HF path even when Gemini had initialized
-    # successfully, so a configured GOOGLE_API_KEY was silently never used
-    # -- every report was quietly falling back to the generic reason text.)
-    if generator == "groq":
-        text = generate_groq_reasoning(prompt, stock_name=stock_name)
-    elif generator == "gemini":
-        text = generate_gemini_reasoning(prompt)
-    else:
-        text = generate_hf_reasoning(prompt, stock_name=stock_name)
-
-    if text:
-        return text
-
-    # Fallback if the AI model fails for any reason
-    return _get_fallback_reason()
-
-
 def truncate_text(text, limit=350):
     if not text:
         return text
@@ -1101,7 +1438,7 @@ def send_email(report_html, mode, pdf_attachment=None, pdf_filename="stock_repor
         traceback.print_exc()
 
 
-def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
+def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stories=None):
     try:
         # fetch data and compute scores
         df = fetch_data(ticker)
@@ -1181,25 +1518,17 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False):
         # already used for stocks like BEL / ICICI Bank.
         swing_setup = ("Near 20-day breakout" in reasons) and ("ADX strong trend" in reasons)
 
-        llm_reason = generate_llm_reasoning(
-            stock_name,
-            ticker,
-            latest,
-            tech_score,
-            fund_score,
-            sentiment_score,
-            sentiment_label,
-            tech_signal,
-            signal,
-            headlines,
-            risk_data,
-            entry_context,
-        )
-
-        # If user requested concise output, truncate the LLM reasoning server-side
-        llm_display = llm_reason
-        if llm_reason and not detailed_llm:
-            llm_display = truncate_text(llm_reason, limit=350)
+        # AI Stock Story: looked up from the single combined call made once
+        # for every stock in generate_ai_stocks_story() (see main()) rather
+        # than making a fresh AI call per stock here. Falls back to a cheap,
+        # non-AI 3-bullet summary (computed instantly from data already on
+        # hand) if the batch call didn't produce an entry for this stock.
+        story_bullets = (ai_stories or {}).get(stock_name) if use_llm else None
+        if use_llm and not story_bullets:
+            story_bullets = _fallback_stock_story(
+                stock_name, signal, tech_score, fund_score, sentiment_score, sentiment_label, headlines
+            )
+        llm_display = build_ai_story_bullets_html(story_bullets) if story_bullets else ""
 
         if "sell" in signal.lower():
             priority = 3
@@ -1992,8 +2321,19 @@ def main(mode, use_llm, detailed_llm=False):
 
     rows = []
     summary_rows = []
+    ai_stocks_story_map = {}
     if use_llm:
         init_llm_generator()
+        try:
+            ai_stocks_story_map, ai_story_sources, ai_story_live = generate_ai_stocks_story(list(STOCKS.keys()))
+            log.info(
+                f"AI Stocks Story: {len(ai_stocks_story_map)}/{len(STOCKS)} stocks covered by a "
+                f"single combined AI call (live_search={ai_story_live}, sources_used={len(ai_story_sources)})."
+            )
+        except Exception as e:
+            log.error(f"AI Stocks Story batch generation failed, per-stock fallback text will be used instead: {e}")
+            traceback.print_exc()
+            ai_stocks_story_map = {}
 
     run_history = load_run_history()
     prev_stock_history = run_history.get("stocks", {})
@@ -2001,7 +2341,7 @@ def main(mode, use_llm, detailed_llm=False):
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_stock = {
-            executor.submit(process_stock, name, ticker, use_llm, detailed_llm): (name, ticker)
+            executor.submit(process_stock, name, ticker, use_llm, detailed_llm, ai_stocks_story_map): (name, ticker)
             for name, ticker in STOCKS.items()
         }
         for future in as_completed(future_to_stock):
