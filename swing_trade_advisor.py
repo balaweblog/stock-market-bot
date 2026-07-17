@@ -31,6 +31,8 @@ quote/news source yourself -- not investment advice.
 import os
 import re
 import sys
+import json
+import html
 import time
 import traceback
 from datetime import datetime
@@ -67,25 +69,27 @@ Mandatory Analysis Parameters:
 
 Provide the analysis for TWO stocks -- one based on the highest conviction strategy from the list above, and the second from a different strategy if possible.
 
-For EACH stock, give: Name of the Stock; How Much Can Invest (% of total trading capital, e.g. 5-10%); Date of Entry (Targeted); Date of Exit (Expected, 3-5 months from entry); Momentum Name (Strategy Type used); Favourable % (Upside Target for 3-5 months); Risk % (Stop-Loss); Expected Profit % (T1); Expected Profit % (T2, optional); Any Top Buyers (Recent FII/DII, if known); Any Recommendations from Brokers (e.g. 'Buy' with target X from a named brokerage, if known).
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML):
 
-OUTPUT FORMAT -- respond with ONLY the HTML below, fully filled in, and nothing else (no markdown, no code fences, no commentary before or after):
-
-<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
-<tr style="background:#14213D;"><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Parameter</td><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock A</td><td style="padding:9px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock B</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Name of the Stock</td><td style="padding:6px 10px;font-size:13px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:13px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Allocation (% of capital)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Entry Date (Targeted)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Exit Date (Expected)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Strategy Type</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Upside Target %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#2F5233;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#2F5233;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Stop-Loss %</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#8B2E2E;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#8B2E2E;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Target 1 (T1) %</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Target 2 (T2) %</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Recent Top Buyers (FII/DII)</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-<tr><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#4A5063;border-top:1px solid #EDEAE2;">Broker Recommendations</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td><td style="padding:6px 10px;font-size:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#14213D;border-top:1px solid #EDEAE2;">FILL</td></tr>
-</table>
-<div style="margin-top:14px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong> FILL two to three sentences per stock covering the fundamental + technical + sentiment rationale and the key risk to watch.</div>
+{{
+  "stocks": [
+    {{
+      "name": "Stock name",
+      "allocation_pct": "e.g. 5-10%",
+      "entry_date": "Targeted entry date",
+      "exit_date": "Expected exit date, 3-5 months from entry",
+      "strategy_type": "Strategy name used",
+      "upside_target_pct": "Favourable % for 3-5 months",
+      "stop_loss_pct": "Risk % (Stop-Loss)",
+      "target1_pct": "Expected Profit % (T1)",
+      "target2_pct": "Expected Profit % (T2), optional",
+      "top_buyers": "Recent FII/DII activity, if known",
+      "broker_recommendations": "e.g. 'Buy' with target X from a named brokerage, if known",
+      "rationale": "Two to three sentences covering fundamental + technical + sentiment rationale and the key risk to watch"
+    }},
+    {{ ... second stock, same fields ... }}
+  ]
+}}
 """
 
 
@@ -117,7 +121,7 @@ def generate_analysis(prompt):
                     model="groq/compound",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.4,
-                    max_tokens=2200,
+                    max_tokens=1200,
                 )
                 text = response.choices[0].message.content.strip()
                 sources = _extract_groq_sources(response)
@@ -181,7 +185,7 @@ def generate_analysis(prompt):
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
-                max_tokens=3000,
+                max_tokens=1500,
             )
             return response.choices[0].message.content.strip(), [], False
         except Exception as e2:
@@ -376,6 +380,84 @@ def _extract_groq_sources(response):
     return sources
 
 
+def _parse_analysis_json(text):
+    """Parses the compact JSON the LLM now returns (see build_prompt's
+    OUTPUT FORMAT). Models sometimes still wrap it in ```json fences or add
+    stray text around it despite instructions -- handle both. Returns a
+    list of stock dicts, or None if nothing usable could be parsed."""
+    cleaned = _strip_code_fences(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Fallback: grab the first {...} span in case the model added any
+        # commentary before/after the JSON despite instructions not to.
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    stocks = data.get("stocks") if isinstance(data, dict) else None
+    if not stocks or not isinstance(stocks, list):
+        return None
+    return stocks
+
+
+def render_stock_table_html(stocks):
+    """Builds the styled HTML table locally from parsed stock data, instead
+    of asking the LLM to reproduce the ~7KB inline-styled template in every
+    request. This is what previously made the groq/compound prompt large
+    enough to trip Groq's per-request token budget (413 Request Too Large)
+    -- the template itself, not the actual analysis content, was the bulk
+    of the payload."""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    a = stocks[0] if len(stocks) > 0 else {}
+    b = stocks[1] if len(stocks) > 1 else {}
+
+    def esc(v):
+        v = "" if v is None else str(v).strip()
+        return html.escape(v) if v else "—"
+
+    def row(label, key, value_color="#14213D", bold=False):
+        weight = "font-weight:700;" if bold else ""
+        cells = "".join(
+            f'<td style="padding:6px 10px;font-size:12px;{weight}font-family:{sans};'
+            f'color:{value_color};border-top:1px solid #EDEAE2;">{esc(stock.get(key))}</td>'
+            for stock in (a, b)
+        )
+        return (
+            f'<tr><td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#4A5063;border-top:1px solid #EDEAE2;">{label}</td>{cells}</tr>'
+        )
+
+    rows = "".join([
+        row("Name of the Stock", "name", bold=True),
+        row("Allocation (% of capital)", "allocation_pct"),
+        row("Entry Date (Targeted)", "entry_date"),
+        row("Exit Date (Expected)", "exit_date"),
+        row("Strategy Type", "strategy_type"),
+        row("Upside Target %", "upside_target_pct", value_color="#2F5233", bold=True),
+        row("Stop-Loss %", "stop_loss_pct", value_color="#8B2E2E", bold=True),
+        row("Target 1 (T1) %", "target1_pct"),
+        row("Target 2 (T2) %", "target2_pct"),
+        row("Recent Top Buyers (FII/DII)", "top_buyers"),
+        row("Broker Recommendations", "broker_recommendations"),
+    ])
+
+    rationale_items = "".join(
+        f'<div style="margin-top:8px;"><strong style="color:#14213D;">{esc(stock.get("name"))}:</strong> {esc(stock.get("rationale"))}</div>'
+        for stock in (a, b) if stock
+    )
+
+    return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
+<tr style="background:#14213D;"><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Parameter</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock A</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock B</td></tr>
+{rows}
+</table>
+<div style="margin-top:14px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong>{rationale_items}</div>
+"""
+
+
 def _strip_code_fences(text):
     """Models occasionally wrap the requested HTML in ```html ... ``` even
     when told not to -- strip that off so it renders as HTML, not literal text."""
@@ -567,7 +649,22 @@ def run():
         )
         sys.exit(1)
 
-    analysis_html = _strip_code_fences(analysis)
+    stocks = _parse_analysis_json(analysis)
+    if stocks:
+        analysis_html = render_stock_table_html(stocks)
+    else:
+        # Model didn't return parseable JSON despite instructions -- don't
+        # silently drop the content. Show it as plain text so the run still
+        # produces something reviewable instead of a blank/broken email.
+        main.log.error(
+            "Could not parse JSON from LLM output; falling back to raw text display."
+        )
+        sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+        analysis_html = (
+            f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
+            f"Note: the model's response could not be parsed as structured data; showing raw output below.</div>"
+            f'<pre style="white-space:pre-wrap;font-family:{sans};font-size:12px;color:#14213D;">{html.escape(_strip_code_fences(analysis))}</pre>'
+        )
     email_html = build_email_html(analysis_html, today_str, sources, used_live_search)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
