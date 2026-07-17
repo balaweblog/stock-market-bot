@@ -97,6 +97,52 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
 # LLM call (larger token budget than main.py's per-stock reasoning calls,
 # since this is one long-form response rather than a short per-stock blurb)
 # -----------------------------
+def _try_groq_compound_model(prompt, model_name, max_attempts=3):
+    """
+    Runs the prompt against a Groq compound (tool-using, live-search-capable)
+    model and returns (text, sources, True) on success, or None if it
+    fails after retries -- callers should fall through to their next option.
+
+    A 413 ("Request Entity Too Large") or a daily-quota 429 both mean
+    retrying this exact call is pointless, so those stop immediately
+    instead of burning the remaining attempts.
+    """
+    for attempt in range(max_attempts):
+        try:
+            response = main.groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=1200,
+            )
+            text = response.choices[0].message.content.strip()
+            sources = _extract_groq_sources(response)
+            return text, sources, True  # True = had live web search available
+        except Exception as e:
+            main.log.error(
+                f"Groq ({model_name}) swing-trade generation failed "
+                f"(attempt {attempt + 1}/{max_attempts}): {e}"
+            )
+            if _is_request_too_large(e):
+                main.log.error(
+                    f"Request too large for {model_name} -- skipping "
+                    "further retries of this payload."
+                )
+                return None
+            if _is_daily_quota_exceeded(e):
+                main.log.error(
+                    f"Groq daily token quota (TPD) exhausted for "
+                    f"{model_name} -- retrying within seconds cannot help. "
+                    "Skipping remaining retries."
+                )
+                return None
+            if attempt < max_attempts - 1:
+                wait_s = _parse_groq_retry_seconds(e) or 10
+                main.log.info(f"Retrying {model_name} in {wait_s:.1f}s...")
+                time.sleep(wait_s)
+    return None
+
+
 def generate_analysis(prompt):
     backend = main.init_llm_generator()
     main.log.info(f"Swing trade advisor using LLM backend: {backend}")
@@ -115,55 +161,24 @@ def generate_analysis(prompt):
         # usually just that minute's shared quota being briefly exhausted --
         # not a real outage -- so retry a couple of times with the wait time
         # Groq's own error message reports before giving up on it.
-        for attempt in range(3):
-            try:
-                response = main.groq_client.chat.completions.create(
-                    model="groq/compound",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.4,
-                    max_tokens=1200,
-                )
-                text = response.choices[0].message.content.strip()
-                sources = _extract_groq_sources(response)
-                return text, sources, True  # True = had live web search available
-            except Exception as e:
-                main.log.error(
-                    f"Groq (compound) swing-trade generation failed "
-                    f"(attempt {attempt + 1}/3): {e}"
-                )
-                if _is_request_too_large(e):
-                    # A 413 means this exact payload can't fit regardless of
-                    # timing -- retrying it unchanged is guaranteed to fail
-                    # again (as seen: attempt 1 got 413, then wasted 2 more
-                    # attempts and 10+ seconds turning it into 429s instead).
-                    # Stop immediately and let the Gemini fallback below
-                    # handle this run rather than burning more of the shared
-                    # per-minute token budget on retries that can't succeed.
-                    main.log.error(
-                        "Request too large for groq/compound -- skipping "
-                        "further retries of this payload."
-                    )
-                    break
-                if _is_daily_quota_exceeded(e):
-                    # A "tokens per day" (TPD) 429 means the org-wide daily
-                    # budget for this model is exhausted -- typically by
-                    # main.py's own per-stock Groq calls earlier the same
-                    # day, since they share the same GROQ_API_KEY/org. The
-                    # reset is measured in hours, not seconds, so the usual
-                    # short backoff-and-retry can't possibly succeed here.
-                    main.log.error(
-                        "Groq daily token quota (TPD) exhausted for this "
-                        "org -- retrying within seconds cannot help. "
-                        "Skipping remaining retries and moving to the "
-                        "Gemini/local fallback."
-                    )
-                    break
-                if attempt < 2:
-                    wait_s = _parse_groq_retry_seconds(e) or 10
-                    main.log.info(f"Retrying groq/compound in {wait_s:.1f}s...")
-                    time.sleep(wait_s)
+        result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3)
+        if result is not None:
+            return result
 
-        # groq/compound is still rate-limited/unavailable after retries. Try
+        # groq/compound is unavailable/overloaded. Community reports (Groq's
+        # own forum) show the free tier throwing bare "Request too large"
+        # 413s on `compound` even for tiny prompts -- this isn't reliably
+        # about payload size, it's compound's heavier tool-orchestration
+        # overhead hitting the free tier's ceiling. groq/compound-mini uses
+        # a lighter underlying model with less orchestration overhead, so
+        # it's worth one more attempt on the same free-tier key before
+        # spending a separate service's (Gemini's) quota.
+        main.log.info("groq/compound unavailable -- trying groq/compound-mini...")
+        result = _try_groq_compound_model(prompt, "groq/compound-mini", max_attempts=2)
+        if result is not None:
+            return result
+
+        # Both compound variants are still rate-limited/unavailable. Try
         # a real live-search alternative (Gemini + Google Search grounding)
         # before falling back to non-live generation, since that's a
         # genuinely separate free-tier quota from Groq's.
