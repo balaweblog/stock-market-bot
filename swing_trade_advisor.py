@@ -12,20 +12,24 @@ This intentionally reuses main.py's LLM-selection and email-credential
 plumbing instead of duplicating it, so both scripts stay in sync with
 whatever provider is configured.
 
-LIVE DATA: when Groq is the active backend (GROQ_API_KEY set, the default
-first choice), this uses Groq's free "groq/compound" system, which can
-autonomously run live web searches before answering -- so it isn't limited
-to training-data knowledge the way a plain chat completion is. The email
-lists the actual URLs it searched under "Sources checked" so you can spot-
-check its claims.
+LIVE DATA: tries several live-search paths in order before ever falling back
+to a plain (non-live) model:
+  1. groq/compound -- Groq's free tool-using system, autonomous web search.
+  2. groq/compound-mini -- lighter variant, tried if #1 is unavailable.
+  3. Tavily direct search (TAVILY_API_KEY, free tier, 1,000 searches/month,
+     no card) + a plain Groq model for synthesis -- a real live-search path
+     that doesn't share compound's expensive internal orchestration budget.
+  4. Gemini + Google Search grounding (GOOGLE_API_KEY, separate free quota).
+Only if all four fail does it drop to non-live generation (plain Groq, then
+local Qwen2.5-1.5B) -- and even then, REQUIRE_LIVE_DATA=true (the default)
+aborts the run instead of emailing unverified, training-data-only output.
+The email lists whichever sources were actually used under "Sources
+checked" so you can spot-check the claims.
 
 CAVEAT: this is still not a verified real-time trade signal. Web search
-results can be a few hours stale, incomplete, or misread by the model, and
-if GROQ_API_KEY isn't set the run falls back to Gemini or a local model,
-neither of which has any live internet access at all (pure training-data
-reasoning in that case). Either way, treat every price level, %, and
-"recent" news item as a starting hypothesis to verify against a live
-quote/news source yourself -- not investment advice.
+results can be a few hours stale, incomplete, or misread by the model.
+Treat every price level, %, and "recent" news item as a starting hypothesis
+to verify against a live quote/news source yourself -- not investment advice.
 """
 
 import os
@@ -34,6 +38,7 @@ import sys
 import json
 import html
 import time
+import requests
 import traceback
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -97,6 +102,115 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
 # LLM call (larger token budget than main.py's per-stock reasoning calls,
 # since this is one long-form response rather than a short per-stock blurb)
 # -----------------------------
+def _tavily_search(query, max_results=4):
+    """
+    Runs one query against Tavily's search API directly (the same backend
+    groq/compound uses internally) and returns a list of
+    {"title", "url", "content"} dicts, or [] on any failure. Uses Tavily's
+    own free-tier quota (1,000 searches/month, no credit card) -- entirely
+    separate from Groq's and Gemini's budgets, so it isn't affected by
+    either being exhausted.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return []
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": max_results,
+                "include_answer": False,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = []
+        for r in data.get("results", []):
+            results.append({
+                "title": r.get("title") or r.get("url", ""),
+                "url": r.get("url", ""),
+                # Trimmed to keep the combined context compact -- this is
+                # meant to ground the model in real facts/URLs, not to hand
+                # it full articles.
+                "content": (r.get("content") or "")[:280],
+            })
+        return results
+    except Exception as e:
+        main.log.warning(f"Tavily search failed for query '{query}': {e}")
+        return []
+
+
+def _gather_tavily_context(today_str):
+    """
+    Runs a small, fixed set of targeted queries covering the areas the
+    prompt actually needs (momentum/breakout setups, FII/DII activity,
+    broker calls) and assembles the results into a compact context block
+    plus a deduplicated (title, url) source list. Returns (context_text,
+    sources) -- context_text is "" if Tavily isn't configured or every
+    query failed.
+    """
+    queries = [
+        f"NSE BSE India stock momentum breakout {today_str}",
+        f"India stock market FII DII buying activity {today_str}",
+        f"Indian stock brokerage buy rating target price upgrade {today_str}",
+    ]
+    sources = []
+    blocks = []
+    for q in queries:
+        for r in _tavily_search(q):
+            if not r["url"]:
+                continue
+            if (r["title"], r["url"]) not in sources:
+                sources.append((r["title"], r["url"]))
+            blocks.append(f"- {r['title']} ({r['url']}): {r['content']}")
+    if not blocks:
+        return "", []
+    context_text = (
+        "LIVE SEARCH RESULTS (use these real, freshly-fetched facts as your "
+        "data source -- do not treat this as training data):\n"
+        + "\n".join(blocks)
+        + "\n\n"
+    )
+    return context_text, sources
+
+
+def _try_tavily_plus_groq(prompt, today_str):
+    """
+    Fallback tier that decouples search from generation: fetch real search
+    results via Tavily directly (its own separate free quota), prepend them
+    to the prompt as grounding context, then run that through Groq's plain
+    (non-compound) model -- which has no tool-orchestration overhead and so
+    doesn't burn through a shared TPM budget the way groq/compound does.
+    Returns (text, sources, True) on success, or None if Tavily isn't
+    configured / returned nothing, or the Groq call fails.
+    """
+    if not os.getenv("TAVILY_API_KEY"):
+        main.log.info(
+            "Tavily fallback skipped: TAVILY_API_KEY is not configured."
+        )
+        return None
+    context_text, sources = _gather_tavily_context(today_str)
+    if not context_text:
+        main.log.warning("Tavily returned no usable results -- skipping this fallback tier.")
+        return None
+    try:
+        response = main.groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": context_text + prompt}],
+            temperature=0.4,
+            max_tokens=1500,
+        )
+        text = response.choices[0].message.content.strip()
+        return text, sources, True  # True: grounded in real Tavily results
+    except Exception as e:
+        main.log.error(f"Groq synthesis over Tavily context failed: {e}")
+        return None
+
+
 def _try_groq_compound_model(prompt, model_name, max_attempts=3):
     """
     Runs the prompt against a Groq compound (tool-using, live-search-capable)
@@ -178,10 +292,22 @@ def generate_analysis(prompt):
         if result is not None:
             return result
 
-        # Both compound variants are still rate-limited/unavailable. Try
-        # a real live-search alternative (Gemini + Google Search grounding)
-        # before falling back to non-live generation, since that's a
-        # genuinely separate free-tier quota from Groq's.
+        # Both compound variants are still rate-limited/unavailable -- and
+        # per observed logs, that's not a transient blip: groq/compound's
+        # own internal search/planning loop can burn most of its shared
+        # 30,000 TPM budget on a single logical request, so retrying within
+        # the compound family doesn't reliably help. Try Tavily directly
+        # (the same search backend compound uses, but on its own separate
+        # free quota) paired with a plain, non-orchestrating Groq call --
+        # genuine live grounding without compound's overhead.
+        today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
+        result = _try_tavily_plus_groq(prompt, today_str)
+        if result is not None:
+            return result
+
+        # Tavily/plain-Groq wasn't available either. Try Gemini + Google
+        # Search grounding next, since that's a genuinely separate free-tier
+        # quota from both Groq's and Tavily's.
         if main.gemini_client is None and not (os.getenv("GOOGLE_API_KEY") and main.genai is not None):
             main.log.info(
                 "Gemini live-search fallback skipped: GOOGLE_API_KEY is not "
@@ -697,15 +823,27 @@ if __name__ == "__main__":
 # -----------------------------
 # Real-time grounding status
 # -----------------------------
-# Groq path: wired in above via model="groq/compound" (free tier, same API
-# key). It autonomously runs live web searches (Tavily-backed) when the
-# query needs current info, and executed_tools[].search_results gives back
-# the actual URLs used -- surfaced in the email under "Sources checked".
-# This is the primary path since main.init_llm_generator() tries Groq first.
+# groq/compound / groq/compound-mini: autonomous live web search
+# (Tavily-backed under the hood) via the same GROQ_API_KEY as main.py's own
+# calls. executed_tools[].search_results gives back the actual URLs used --
+# surfaced in the email under "Sources checked". This is the first path
+# tried since main.init_llm_generator() picks Groq first when configured.
+# In practice, compound's internal search/planning loop can burn through
+# most of its shared 30,000 TPM budget on a single request on the free
+# tier, so treat both compound variants as opportunistic, not reliable.
 #
-# Gemini / local fallback paths: still plain, non-grounded chat completions
-# with no live internet access. If Groq isn't configured (no GROQ_API_KEY)
-# and the run falls back to Gemini, real-time grounding could be added via
-# Gemini's Google Search grounding tool -- but the exact tool schema differs
-# across google-genai SDK versions, so it's deliberately not wired in here;
-# verify current syntax against Gemini API docs before enabling it.
+# Tavily direct + plain Groq synthesis (_try_tavily_plus_groq): fetches
+# real search results via Tavily's own API directly (TAVILY_API_KEY, free
+# tier, 1,000 searches/month, no card -- entirely separate from Groq's and
+# Gemini's quotas), then hands them to a plain (non-orchestrating) Groq
+# model call. This is genuinely live-grounded but doesn't carry compound's
+# expensive internal tool-orchestration overhead, so it's the more reliable
+# of the two Groq-adjacent paths on the free tier.
+#
+# Gemini grounded (_try_gemini_grounded): Google Search grounding via
+# GOOGLE_API_KEY, a separate free-tier quota from both Groq and Tavily.
+#
+# Plain Groq / local fallback: non-grounded chat completions with no live
+# internet access -- pure training-data reasoning. Only reached if every
+# live-search path above fails, and even then REQUIRE_LIVE_DATA=true (the
+# default) aborts the run rather than emailing that unverified output.
