@@ -75,6 +75,32 @@ def fetch_index_context(index_symbol="^NSEI", period="180d"):
         }
 
 
+def classify_market(ticker):
+    """
+    Classifies a ticker as India or US based on its exchange suffix.
+    Indian tickers pulled via yfinance carry a '.NS' (NSE) or '.BO' (BSE)
+    suffix; US tickers (e.g. AAPL, GOOG, AMZN, QQQ) have no suffix.
+    Mirrors main.py's classify_market so this module stays self-contained.
+    """
+    upper_ticker = str(ticker or "").upper()
+    if upper_ticker.endswith(".NS") or upper_ticker.endswith(".BO"):
+        return "India"
+    return "US"
+
+
+# Benchmark index used for the "market trend" comparison, keyed by market.
+# Previously fetch_index_context() was always called with no argument,
+# which silently defaulted to "^NSEI" (Nifty) for every stock -- including
+# US stocks. Since the Nifty has been broadly trending up, this made the
+# "Trend" field in the email show "bullish" for nearly every stock,
+# regardless of that stock's actual market. Each market now gets its own
+# benchmark index.
+BENCHMARK_INDEX_BY_MARKET = {
+    "India": "^NSEI",   # Nifty 50
+    "US": "^GSPC",       # S&P 500
+}
+
+
 def build_market_context(symbol):
     try:
         session = get_resilient_session()
@@ -88,7 +114,10 @@ def build_market_context(symbol):
         sector = "unknown"
         industry = "unknown"
 
-    context = fetch_index_context()
+    market = classify_market(symbol)
+    benchmark_symbol = BENCHMARK_INDEX_BY_MARKET.get(market, "^NSEI")
+
+    context = fetch_index_context(index_symbol=benchmark_symbol)
     context["sector"] = sector or "unknown"
     context["industry"] = industry or "unknown"
     return context

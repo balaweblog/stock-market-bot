@@ -203,6 +203,11 @@ def init_llm_generator(force_local=False):
 # on repeated prompt/instruction overhead for a portfolio of any size.
 AI_STORY_BULLETS_PER_STOCK = 3
 
+# Number of newspaper-digest-style bullet points the combined AI call writes
+# for the portfolio-wide "AI Portfolio Story" summary (see
+# _build_ai_stocks_story_prompt / build_ai_portfolio_story_html).
+AI_PORTFOLIO_SUMMARY_POINTS = 5
+
 
 def _tavily_search(query, max_results=2):
     """
@@ -308,11 +313,16 @@ def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
         f"3) the key risk or watch-item. "
         f"Base each story on the live news snippets above where one exists for that stock; "
         f"otherwise give a brief, generic-but-accurate read rather than inventing specifics.\n\n"
-        f"Then also write ONE \"Portfolio Summary\": 3-4 sentences, professional/institutional "
-        f"research-note tone (as if opening a daily portfolio briefing for a client), synthesizing "
-        f"the picture ACROSS all the stocks together -- overall tone (risk-on/risk-off/mixed), the "
-        f"one or two most notable opportunities, and the one or two biggest risks or things to "
-        f"watch this week. No bullet points here, flowing prose only, no generic filler.\n\n"
+        f"Then also write ONE \"Portfolio Summary\" laid out like the front-page digest of a "
+        f"financial newspaper (think a Bloomberg/WSJ \"markets at a glance\" box), synthesizing "
+        f"the picture ACROSS all the stocks together:\n"
+        f"1) \"headline\": one punchy news-style headline (max 12 words, title case, no ending "
+        f"period) capturing today's overall portfolio tone (risk-on/risk-off/mixed).\n"
+        f"2) \"points\": exactly {AI_PORTFOLIO_SUMMARY_POINTS} short, scannable news-brief bullet "
+        f"points (max 18 words each, plain text, no sub-bullets, no markdown, each reading like a "
+        f"newspaper digest item), covering across all points: the overall tone, the one or two "
+        f"most notable opportunities, and the one or two biggest risks or things to watch this "
+        f"week. No generic filler, every point must say something specific.\n\n"
         f"Stocks:\n{names_block}\n\n"
         "OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code "
         "fences, no commentary before or after):\n"
@@ -321,7 +331,10 @@ def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
         '    "<exact stock name as listed above>": ["bullet 1", "bullet 2", "bullet 3"],\n'
         "    ...\n"
         "  },\n"
-        '  "portfolio_summary": "3-4 sentence professional prose paragraph here"\n'
+        '  "portfolio_summary": {\n'
+        '    "headline": "punchy news-style headline here",\n'
+        '    "points": ["news-brief point 1", "news-brief point 2", "..."]\n'
+        "  }\n"
         "}\n"
         "Every stock listed above must appear as a key, using the exact name given."
     )
@@ -393,6 +406,42 @@ def _strip_code_fences(text):
     return cleaned
 
 
+def _normalize_portfolio_summary(raw_summary):
+    """
+    Coerces whatever the model returned for "portfolio_summary" into a
+    consistent {"headline": str|None, "points": [str, ...]} dict, or None
+    if there's nothing usable. Accepts:
+      - the intended {"headline": ..., "points": [...]} shape
+      - a bare list of strings (points, no headline)
+      - a legacy plain-string paragraph (older prompt format / stale
+        cache) -- split on sentence boundaries so it still renders as
+        newspaper-style points instead of disappearing.
+    """
+    if isinstance(raw_summary, dict):
+        headline = raw_summary.get("headline")
+        headline = headline.strip() if isinstance(headline, str) and headline.strip() else None
+        points = raw_summary.get("points")
+        if isinstance(points, list):
+            points = [str(p).strip() for p in points if str(p).strip()][:AI_PORTFOLIO_SUMMARY_POINTS]
+        else:
+            points = []
+        if not headline and not points:
+            return None
+        return {"headline": headline, "points": points}
+
+    if isinstance(raw_summary, list):
+        points = [str(p).strip() for p in raw_summary if str(p).strip()][:AI_PORTFOLIO_SUMMARY_POINTS]
+        return {"headline": None, "points": points} if points else None
+
+    if isinstance(raw_summary, str) and raw_summary.strip():
+        # Legacy prose paragraph -- split into sentence-ish points so old
+        # cached/off-spec responses still render in the new points format.
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", raw_summary.strip()) if s.strip()]
+        return {"headline": None, "points": sentences[:AI_PORTFOLIO_SUMMARY_POINTS]}
+
+    return None
+
+
 def _parse_ai_stocks_story_json(text, stock_names):
     """
     Parses the compact per-stock JSON the LLM returns (see
@@ -402,8 +451,11 @@ def _parse_ai_stocks_story_json(text, stock_names):
         recognizes, matched back to the exact configured stock name
         case/whitespace-insensitively so lookups in process_stock are a
         plain dict hit. {} if nothing usable could be parsed.
-      portfolio_summary: the single professional-prose paragraph
-        synthesizing all stocks together, or None if missing/unparseable.
+      portfolio_summary: {"headline": str, "points": [str, ...]} -- the
+        newspaper-digest-style summary synthesizing all stocks together,
+        or None if missing/unparseable. Tolerates an older-style plain
+        string (treated as a single point with no headline) so a stale
+        cached response or an off-spec model reply doesn't just vanish.
     """
     cleaned = _strip_code_fences(text)
     try:
@@ -418,8 +470,8 @@ def _parse_ai_stocks_story_json(text, stock_names):
             return {}, None
 
     stories = data.get("stories") if isinstance(data, dict) else None
-    portfolio_summary = data.get("portfolio_summary") if isinstance(data, dict) else None
-    portfolio_summary = portfolio_summary.strip() if isinstance(portfolio_summary, str) and portfolio_summary.strip() else None
+    raw_summary = data.get("portfolio_summary") if isinstance(data, dict) else None
+    portfolio_summary = _normalize_portfolio_summary(raw_summary)
     if not isinstance(stories, dict):
         return {}, portfolio_summary
 
@@ -566,9 +618,10 @@ def generate_ai_stocks_story(stock_names):
       sources: [(title, url), ...] actually used, for optional display
       used_live_search: True if the tier that produced the result was
         genuinely grounded in live search results
-      portfolio_summary: 3-4 sentence professional-prose paragraph
-        covering all stocks together, or a locally-built generic fallback
-        if every AI tier failed or omitted it
+      portfolio_summary: {"headline": str|None, "points": [str, ...]} --
+        a newspaper-digest-style summary covering all stocks together, or
+        a locally-built generic fallback in the same shape if every AI
+        tier failed or omitted it
     """
     if not stock_names:
         return {}, [], False, None
@@ -693,13 +746,18 @@ def _fallback_portfolio_summary(stock_names):
     Cheap, non-AI fallback used when the AI backend produced per-stock
     stories but the model omitted (or mis-formatted) the portfolio_summary
     field -- keeps the email section populated with an honest, generic
-    line instead of silently disappearing. No extra AI call.
+    line instead of silently disappearing. No extra AI call. Returned in
+    the same {"headline", "points"} shape as the AI-generated summary.
     """
-    return (
-        f"Automated portfolio-wide commentary was not returned this run for the "
-        f"{len(stock_names)} tracked stocks; see the per-stock AI Stock Story notes "
-        f"and signal/score breakdown below for the underlying read on each name."
-    )
+    return {
+        "headline": "Portfolio Commentary Unavailable This Run",
+        "points": [
+            f"Automated portfolio-wide commentary was not returned for the "
+            f"{len(stock_names)} tracked stocks this run.",
+            "See the per-stock AI Stock Story notes and signal/score "
+            "breakdown below for the underlying read on each name.",
+        ],
+    }
 
 
 def build_ai_story_bullets_html(bullets):
@@ -720,25 +778,58 @@ def build_ai_story_bullets_html(bullets):
 def build_ai_portfolio_story_html(portfolio_summary, stock_count, used_live_search):
     """
     Small, email-safe section combining every stock's AI Stock Story into
-    one professional-level paragraph (from generate_ai_stocks_story's
-    portfolio_summary) -- built once from the same single combined AI call,
-    not a separate AI request. Shown near the top of BOTH the email body
-    and the PDF, unlike the full per-stock cards which are PDF-only.
-    Returns "" if there's nothing to show.
+    a newspaper-digest-style briefing (kicker, headline, ruled bullet
+    points) built from generate_ai_stocks_story's portfolio_summary --
+    from the same single combined AI call, not a separate AI request.
+    Shown near the top of BOTH the email body and the PDF, unlike the
+    full per-stock cards which are PDF-only.
+
+    portfolio_summary is {"headline": str|None, "points": [str, ...]}
+    (see _normalize_portfolio_summary). Returns "" if there's nothing to
+    show (no headline and no points).
     """
     if not portfolio_summary:
         return ""
+    headline = portfolio_summary.get("headline") if isinstance(portfolio_summary, dict) else None
+    points = portfolio_summary.get("points") if isinstance(portfolio_summary, dict) else None
+    points = [p for p in (points or []) if p]
+    if not headline and not points:
+        return ""
+
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-    live_tag = " &nbsp;&middot;&nbsp; live-grounded" if used_live_search else ""
+    serif = "Georgia,'Times New Roman',Times,serif"
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y").upper()
+    live_tag = " &nbsp;&middot;&nbsp; LIVE-GROUNDED" if used_live_search else ""
+
+    headline_html = ""
+    if headline:
+        headline_html = (
+            f'<div style="margin:6px 0 8px;font-family:{serif};font-size:18px;'
+            f'font-weight:700;line-height:1.3;color:#1F2430;">{html.escape(headline)}</div>'
+        )
+
+    points_html = ""
+    if points:
+        items = "".join(
+            f'<tr><td style="padding:0 8px 6px 0;font-family:{serif};font-size:14px;'
+            f'line-height:1;color:#B08D57;vertical-align:top;">&#9642;</td>'
+            f'<td style="padding:0 0 6px;font-family:{sans};font-size:13px;line-height:1.55;'
+            f'color:#3C4256;">{html.escape(p)}</td></tr>'
+            for p in points
+        )
+        points_html = f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:4px;">{items}</table>'
+
     return f"""
         <tr>
           <td style="padding:0 28px 18px;" class="email-padding">
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-radius:6px;background:#FAF8F1;border:1px solid #E7DFC9;">
               <tr>
-                <td style="padding:14px 16px;">
-                  <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#B08D57;">🤖 AI Portfolio Story{live_tag}</div>
-                  <p style="margin:8px 0 0;font-family:{sans};font-size:13px;line-height:1.65;color:#3C4256;">{html.escape(portfolio_summary)}</p>
-                  <p style="margin:8px 0 0;font-family:{sans};font-size:10px;color:#8A8F9C;">Synthesized in a single combined AI pass across all {stock_count} tracked stocks &mdash; see each stock's card for its individual AI Stock Story.</p>
+                <td style="padding:14px 16px 16px;">
+                  <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#B08D57;">🤖 AI Portfolio Story &nbsp;&middot;&nbsp; {today_str}{live_tag}</div>
+                  {headline_html}
+                  <div style="border-top:1px solid #E7DFC9;margin:2px 0 8px;"></div>
+                  {points_html}
+                  <p style="margin:10px 0 0;font-family:{sans};font-size:10px;color:#8A8F9C;">Synthesized in a single combined AI pass across all {stock_count} tracked stocks &mdash; see each stock's card for its individual AI Stock Story.</p>
                 </td>
               </tr>
             </table>
@@ -1406,9 +1497,9 @@ def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamental
     total = final_score(technical, combined_fund, sentiment)
 
     trend_text = str(market_context.get("trend", "")).lower()
-    if "up" in trend_text or "positive" in trend_text:
+    if "bullish" in trend_text or "up" in trend_text or "positive" in trend_text:
         total += 2
-    elif "down" in trend_text or "negative" in trend_text:
+    elif "bearish" in trend_text or "down" in trend_text or "negative" in trend_text:
         total -= 2
 
     return round(max(0, min(100, total)), 2)
@@ -1854,11 +1945,17 @@ def _relative_day_label(value):
 def build_quick_summary(rows):
     """
     Builds compact, human-readable summary bullets for the top of the
-    report, grouped by recommendation (Buy / Hold / Sell) so the reader can
-    scan "what should I do" rather than an undifferentiated flat list.
-    Returns a dict: {"Buy": [...], "Hold": [...], "Sell": [...]}.
+    report, grouped first by market (US / India) and then by recommendation
+    (Buy / Hold / Sell) within each market -- mirroring the Portfolio
+    Heatmap's US / India / Commodities grouping so the Executive Summary
+    reads the same way at a glance.
+    Returns a dict: {"US": {"Buy": [...], "Hold": [...], "Sell": [...]},
+                     "India": {"Buy": [...], "Hold": [...], "Sell": [...]}}.
     """
-    groups = {"Buy": [], "Hold": [], "Sell": []}
+    groups = {
+        "US": {"Buy": [], "Hold": [], "Sell": []},
+        "India": {"Buy": [], "Hold": [], "Sell": []},
+    }
     if not rows:
         return groups
 
@@ -1869,6 +1966,11 @@ def build_quick_summary(rows):
         if group_key is None:
             continue  # errors aren't actionable in the quick summary
 
+        market_key = classify_market(row.get("ticker"))
+        if market_key not in groups:
+            market_key = "US"
+        market_bucket = groups[market_key]
+
         stock_name = row.get("stock_name") or ""
         signal = str(row.get("signal") or "").upper()
         current_price = row.get("current_price")
@@ -1877,7 +1979,7 @@ def build_quick_summary(rows):
         upcoming_events = row.get("upcoming_events") or {}
 
         if "BUY" in signal and current_price is not None and recommended_buy_level is not None and current_price < recommended_buy_level:
-            groups[group_key].append(f"✅ {stock_name} below ₹{recommended_buy_level}")
+            market_bucket[group_key].append(f"✅ {stock_name} below ₹{recommended_buy_level}")
             continue
 
         results_date = upcoming_events.get("results_announcement_date")
@@ -1885,22 +1987,22 @@ def build_quick_summary(rows):
             short_date = _format_short_date(results_date)
             relative_label = _relative_day_label(results_date)
             if relative_label == "today":
-                groups[group_key].append(f"📊 {stock_name} results today")
+                market_bucket[group_key].append(f"📊 {stock_name} results today")
             else:
-                groups[group_key].append(f"📊 {stock_name} results on {short_date or results_date}")
+                market_bucket[group_key].append(f"📊 {stock_name} results on {short_date or results_date}")
             continue
 
         dividend_date = upcoming_events.get("dividend_record_date")
         if dividend_date and str(dividend_date).upper() != "NA":
             relative_label = _relative_day_label(dividend_date)
             if relative_label == "today":
-                groups[group_key].append(f"📅 {stock_name} dividend record today")
+                market_bucket[group_key].append(f"📅 {stock_name} dividend record today")
             else:
-                groups[group_key].append(f"📅 {stock_name} dividend record {relative_label or 'soon'}")
+                market_bucket[group_key].append(f"📅 {stock_name} dividend record {relative_label or 'soon'}")
             continue
 
         if current_price is not None and ema20 is not None and current_price < ema20:
-            groups[group_key].append(f"⚠ {stock_name} below EMA20—avoid adding")
+            market_bucket[group_key].append(f"⚠ {stock_name} below EMA20—avoid adding")
 
     return groups
 
@@ -2051,16 +2153,20 @@ def _heatmap_move_html(day_change_pct):
     return f'<span style="color:{color};font-weight:700;">{day_change_pct:+.2f}%</span>'
 
 
-def build_quick_jump_table_html(rows):
+def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals=None):
     """
     Portfolio Heatmap: a single scannable table (Symbol / Signal / Today's
     Move / Trend / Action) covering every ticker across both markets,
     placed above the full stock cards so the report can be read at a
     glance before scrolling through the detailed sections. Grouped into
     explicit US / India sub-sections (rather than just sorted together)
-    so each market's tickers are visually separated.
+    so each market's tickers are visually separated. When commodity_data
+    is supplied, a final "Commodities" group (Gold & Silver) is appended
+    after US/India, mirroring those two groups, so the metals are
+    scannable in the same at-a-glance table -- not just in the detailed
+    cards further down (or, for the email, only in the attached PDF).
     """
-    if not rows:
+    if not rows and not commodity_data:
         return ""
 
     by_market = {"US": [], "India": []}
@@ -2106,6 +2212,54 @@ def build_quick_jump_table_html(rows):
                 f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
                 f'</tr>'
             )
+
+    # Commodities group (Gold & Silver) -- appended last, mirroring the
+    # US/India market groups above. Reuses the same buy-trigger signal
+    # already computed for the Quick Summary bullets (commodity_buy_signals)
+    # so this doesn't re-derive or drift from that logic.
+    if commodity_data:
+        commodity_buy_signals = commodity_buy_signals or {}
+        commodity_entries = []
+        for label, key in [("🥇 Gold (22K)", "gold"), ("🥈 Silver", "silver")]:
+            metal_data = commodity_data.get(key) or {}
+            if not metal_data:
+                continue
+            change = metal_data.get("change", 0) or 0
+            buy_triggered = commodity_buy_signals.get(key, {}).get("last_buy_triggered", False)
+            if buy_triggered:
+                pr, signal = 1, "Buy"
+            elif change <= -1.5:
+                pr, signal = 2, "Watch"
+            elif change >= 1.5:
+                pr, signal = 2, "Momentum"
+            else:
+                pr, signal = 2, "Stable"
+            trend_raw = "up" if change > 0 else ("down" if change < 0 else "")
+            commodity_entries.append((label, pr, signal, change, trend_raw))
+
+        if commodity_entries:
+            body += (
+                f'<tr><td colspan="5" style="padding:7px 10px;background:#F4F2ED;'
+                f'font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
+                f'letter-spacing:0.05em;">🪙 Commodities ({len(commodity_entries)})</td></tr>'
+            )
+            body += col_header
+            for name, pr, signal, change, trend_raw in commodity_entries:
+                dot, color, action = _heatmap_signal_style(pr)
+                move_html = _heatmap_move_html(change)
+                trend_html = _heatmap_trend_label(trend_raw)
+                body += (
+                    f'<tr>'
+                    f'<td style="padding:7px 8px 7px 14px;font-family:{sans};font-size:12px;font-weight:600;color:#14213D;border-bottom:1px solid #EFEDE7;">{name}</td>'
+                    f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}</td>'
+                    f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;border-bottom:1px solid #EFEDE7;text-align:right;">{move_html}</td>'
+                    f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}</td>'
+                    f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
+                    f'</tr>'
+                )
+
+    if not body:
+        return ""
 
     return f"""
         <tr>
@@ -2236,24 +2390,21 @@ def build_pdf_attachment(report_html):
                 page.emulate_media(media="print")
                 page.set_content(report_html, wait_until="networkidle")
 
-                # Render as ONE continuous page rather than paginating across
-                # repeated A4 sheets. Multi-page A4 output was what produced
-                # the broken look in earlier PDFs: cards mid-way down a page
-                # would either get sliced in half across the page boundary,
-                # or (once "avoid break" rules kicked in) get pushed whole
-                # onto the next sheet -- leaving a large blank gap at the
-                # bottom of the previous page and a badge/heading floating
-                # alone at the top of the next one. A single page sized to
-                # the actual content height removes page boundaries entirely,
-                # so nothing can be cut or pushed across one.
-                content_height = page.evaluate(
-                    "Math.ceil(document.documentElement.scrollHeight)"
-                )
-                page_height_px = content_height + (MARGIN_PX * 2)
-
+                # Render as normal paginated A4 sheets rather than one giant
+                # continuous page. A single page sized to the full report
+                # height (previous approach) produced a PDF several thousand
+                # px tall for reports with many stock cards. That renders
+                # fine in a dedicated PDF app (Acrobat, desktop Chrome) but
+                # mobile/webmail inline previewers (iOS Mail QuickLook,
+                # Gmail's built-in PDF viewer, etc.) choke on rasterizing an
+                # extremely tall single page and show a blank/broken/failed
+                # preview -- even though the attachment downloads fine. The
+                # @media print rules above already set page-break-inside:
+                # avoid on every row and page-break-after:avoid on headings,
+                # so standard pagination no longer slices cards across page
+                # boundaries the way it did before those rules existed.
                 pdf_bytes = page.pdf(
-                    width=f"{PAGE_WIDTH_PX}px",
-                    height=f"{page_height_px}px",
+                    format="A4",
                     print_background=True,
                     prefer_css_page_size=False,
                     margin={
@@ -2331,10 +2482,10 @@ def main(mode, use_llm, detailed_llm=False):
     h2 { font-size:15px !important; }
   }
   @media print {
-    /* The PDF is rendered as a single continuous page (see
-       build_pdf_attachment), so there are no page boundaries left to
-       protect cards from -- these rules just keep things tidy rather
-       than working around pagination. */
+    /* The PDF is rendered as standard paginated A4 sheets (see
+       build_pdf_attachment) so it previews correctly in mobile/webmail
+       PDF viewers. These rules stop a card or heading from being sliced
+       across a page boundary. */
     tr { page-break-inside: avoid; break-inside: avoid; }
     h1, h2, h3 { page-break-after: avoid; break-after: avoid-page; }
     body { background:#ffffff !important; }
@@ -2529,10 +2680,12 @@ def main(mode, use_llm, detailed_llm=False):
         log.error(f"Commodity tracker failed during data fetch: {e}")
         traceback.print_exc()
 
-    # Build commodity summary bullets
+    # Build commodity summary bullets, kept separate per metal (gold/silver)
+    # so each can render as its own group in the Executive Summary, mirroring
+    # the Portfolio Heatmap's separate metal rows.
     prev_commodity_history = run_history.get("commodities", {})
     new_commodity_history = {}
-    commodity_bullets = []
+    commodity_bullets_by_metal = {"gold": [], "silver": []}
     if commodity_data:
         for metal, key in [("Gold (22K)", "gold"), ("Silver", "silver")]:
             metal_data = commodity_data[key]
@@ -2570,40 +2723,54 @@ def main(mode, use_llm, detailed_llm=False):
             }
             streak_suffix = f" — {current_streak} runs in a row" if buy_triggered and current_streak > 1 else ""
 
+            metal_key = key  # "gold" or "silver"
             if buy_triggered:
-                commodity_bullets.append(
+                commodity_bullets_by_metal[metal_key].append(
                     f"✅ Buy Signal: {metal} at &#8377;{current:.2f} ({change_sign}{change}%){streak_suffix}"
                 )
             elif change <= -1.5:
-                commodity_bullets.append(
+                commodity_bullets_by_metal[metal_key].append(
                     f"📉 {metal} {direction} {change_sign}{change}% — watching for entry"
                 )
             elif change >= 1.5:
-                commodity_bullets.append(
+                commodity_bullets_by_metal[metal_key].append(
                     f"📈 {metal} {direction} {change_sign}{change}% — momentum up"
                 )
             else:
-                commodity_bullets.append(
+                commodity_bullets_by_metal[metal_key].append(
                     f"⬛ {metal} {direction} {change_sign}{change}% — stable"
                 )
 
-    # Merge stock bullet groups + commodity bullets into one quick summary block
-    has_stock_bullets = any(quick_summary_groups.get(k) for k in ("Buy", "Hold", "Sell"))
+    # Build the Executive Summary grouped by US Stocks / India Stocks / Gold /
+    # Silver -- the same grouping and visual language as the Portfolio
+    # Heatmap above it, so both sections read consistently. Each market's
+    # Buy/Hold/Sell recommendations are nested inside its own group, and each
+    # commodity gets its own group with its signal as the "recommendation".
+    sans_es = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    group_styles = {
+        "Buy":  ("#2F5233", "#E7EEE4"),
+        "Hold": ("#8A6D3B", "#F3ECDD"),
+        "Sell": ("#8B2E2E", "#F3E4E0"),
+    }
 
-    quick_summary_html = ""
-    if has_stock_bullets or commodity_bullets:
-        group_styles = {
-            "Buy":  ("#2F5233", "#E7EEE4"),
-            "Hold": ("#8A6D3B", "#F3ECDD"),
-            "Sell": ("#8B2E2E", "#F3E4E0"),
-        }
-        stock_bullet_html = ""
+    def _es_group_header(label, count):
+        return (
+            f'<div style="margin:14px 0 0;padding:6px 10px;background:#F4F2ED;border-radius:3px;'
+            f'font-family:{sans_es};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
+            f'letter-spacing:0.05em;">{label} ({count})</div>'
+        )
+
+    def _es_market_block(label, market_bucket):
+        total = sum(len(market_bucket.get(k) or []) for k in ("Buy", "Hold", "Sell"))
+        if total == 0:
+            return ""
+        block_html = _es_group_header(label, total)
         for group_key in ("Buy", "Hold", "Sell"):
-            bullets = quick_summary_groups.get(group_key) or []
+            bullets = market_bucket.get(group_key) or []
             if not bullets:
                 continue
             color, bg = group_styles[group_key]
-            stock_bullet_html += (
+            block_html += (
                 '<div style="margin-top:8px;">'
                 f'<span style="display:inline-block;padding:2px 8px;border-radius:999px;'
                 f'background:{bg};color:{color};font-size:11px;font-weight:700;'
@@ -2614,26 +2781,38 @@ def main(mode, use_llm, detailed_llm=False):
                 )
                 + '</div>'
             )
-        commodity_bullet_html = ""
-        if commodity_bullets:
-            commodity_bullet_html = (
-                '<div style="margin-top:8px;padding-top:8px;border-top:1px solid #dbeafe;">'
-                '<div style="font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;'
-                'letter-spacing:0.04em;margin-bottom:4px;">Commodities</div>'
-                + "".join(
-                    f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
-                    for item in commodity_bullets
-                )
-                + '</div>'
-            )
+        return block_html
 
+    def _es_commodity_block(label, bullets):
+        if not bullets:
+            return ""
+        block_html = _es_group_header(label, len(bullets))
+        block_html += (
+            '<div style="margin-top:8px;">'
+            + "".join(
+                f'<div style="margin:4px 0 0;font-size:13px;color:#0f172a;">{item}</div>'
+                for item in bullets
+            )
+            + '</div>'
+        )
+        return block_html
+
+    us_block_html = _es_market_block("🇺🇸 US Stocks", quick_summary_groups.get("US") or {})
+    india_block_html = _es_market_block("🇮🇳 India Stocks", quick_summary_groups.get("India") or {})
+    gold_block_html = _es_commodity_block("🥇 Gold (22K)", commodity_bullets_by_metal.get("gold") or [])
+    silver_block_html = _es_commodity_block("🥈 Silver", commodity_bullets_by_metal.get("silver") or [])
+
+    quick_summary_html = ""
+    if us_block_html or india_block_html or gold_block_html or silver_block_html:
         quick_summary_html = f"""
             <tr>
               <td style="padding:0 28px 14px;" class="email-padding">
                 <div style="border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;background:#FAF9F6;padding:14px 16px;">
-                  <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.08em;">Executive Summary</div>
-                  {stock_bullet_html}
-                  {commodity_bullet_html}
+                  <div style="font-family:{sans_es};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.08em;">Executive Summary</div>
+                  {us_block_html}
+                  {india_block_html}
+                  {gold_block_html}
+                  {silver_block_html}
                 </div>
               </td>
             </tr>
@@ -2728,7 +2907,9 @@ def main(mode, use_llm, detailed_llm=False):
 
     # Build new report-enhancement blocks
     error_summary_html = build_error_summary_html(groups)
-    quick_jump_html = build_quick_jump_table_html(rows)
+    quick_jump_html = build_quick_jump_table_html(
+        rows, commodity_data=commodity_data, commodity_buy_signals=new_commodity_history
+    )
     concentration_alert_html = build_concentration_alert_html(rows)
 
     footer_html = """

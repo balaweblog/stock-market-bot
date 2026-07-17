@@ -80,6 +80,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
   "stocks": [
     {{
       "name": "Stock name",
+      "ticker": "Exact Yahoo Finance ticker symbol for this stock (e.g. 'RELIANCE.NS' for NSE-listed, 'AAPL' for US-listed) -- required, used to fetch a live quote",
       "allocation_pct": "e.g. 5-10%",
       "entry_date": "Targeted entry date",
       "exit_date": "Expected exit date, 3-5 months from entry",
@@ -545,6 +546,48 @@ def _parse_analysis_json(text):
     return stocks
 
 
+def _fetch_current_price(ticker):
+    """
+    Fetches the latest live close price for a ticker via the same
+    yfinance path main.py uses for its own daily report (main.fetch_data),
+    so the Swing Trade Research Note shows a real, current quote rather
+    than a price the LLM may have guessed or pulled from stale training
+    data. Returns (price_float, currency_symbol) or (None, None) on any
+    failure -- callers should treat that as "unavailable", not an error.
+    """
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return None, None
+    try:
+        df = main.fetch_data(ticker)
+        latest_close = main._safe_float(df.iloc[-1].get("close"))
+        if latest_close is None:
+            return None, None
+        market = main.classify_market(ticker)
+        currency_symbol = "₹" if market == "India" else "$"
+        return latest_close, currency_symbol
+    except Exception as e:
+        main.log.warning(f"Could not fetch live price for '{ticker}': {e}")
+        return None, None
+
+
+def _attach_live_prices(stocks):
+    """
+    Mutates each stock dict in place, adding a 'current_price_display'
+    string (e.g. '₹2,845.30' or '$212.40') built from a live yfinance
+    quote keyed off the 'ticker' field the LLM was asked to supply. Falls
+    back to '—' (rendered as such in the table) if the ticker is missing
+    or the live fetch fails, rather than showing an unverified figure.
+    """
+    for stock in stocks:
+        price, currency_symbol = _fetch_current_price(stock.get("ticker"))
+        if price is not None:
+            stock["current_price_display"] = f"{currency_symbol}{price:,.2f}"
+        else:
+            stock["current_price_display"] = None
+    return stocks
+
+
 def render_stock_table_html(stocks):
     """Builds the styled HTML table locally from parsed stock data, instead
     of asking the LLM to reproduce the ~7KB inline-styled template in every
@@ -574,6 +617,7 @@ def render_stock_table_html(stocks):
 
     rows = "".join([
         row("Name of the Stock", "name", bold=True),
+        row("Current Market Price", "current_price_display", value_color="#14213D", bold=True),
         row("Allocation (% of capital)", "allocation_pct"),
         row("Entry Date (Targeted)", "entry_date"),
         row("Exit Date (Expected)", "exit_date"),
@@ -792,6 +836,7 @@ def run():
 
     stocks = _parse_analysis_json(analysis)
     if stocks:
+        stocks = _attach_live_prices(stocks)
         analysis_html = render_stock_table_html(stocks)
     else:
         # Model didn't return parseable JSON despite instructions -- don't
