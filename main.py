@@ -308,6 +308,11 @@ def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
         f"3) the key risk or watch-item. "
         f"Base each story on the live news snippets above where one exists for that stock; "
         f"otherwise give a brief, generic-but-accurate read rather than inventing specifics.\n\n"
+        f"Then also write ONE \"Portfolio Summary\": 3-4 sentences, professional/institutional "
+        f"research-note tone (as if opening a daily portfolio briefing for a client), synthesizing "
+        f"the picture ACROSS all the stocks together -- overall tone (risk-on/risk-off/mixed), the "
+        f"one or two most notable opportunities, and the one or two biggest risks or things to "
+        f"watch this week. No bullet points here, flowing prose only, no generic filler.\n\n"
         f"Stocks:\n{names_block}\n\n"
         "OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code "
         "fences, no commentary before or after):\n"
@@ -315,7 +320,8 @@ def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
         '  "stories": {\n'
         '    "<exact stock name as listed above>": ["bullet 1", "bullet 2", "bullet 3"],\n'
         "    ...\n"
-        "  }\n"
+        "  },\n"
+        '  "portfolio_summary": "3-4 sentence professional prose paragraph here"\n'
         "}\n"
         "Every stock listed above must appear as a key, using the exact name given."
     )
@@ -390,11 +396,14 @@ def _strip_code_fences(text):
 def _parse_ai_stocks_story_json(text, stock_names):
     """
     Parses the compact per-stock JSON the LLM returns (see
-    _build_ai_stocks_story_prompt's OUTPUT FORMAT). Returns a dict
-    {stock_name: [bullet, ...]} for whichever names it recognizes, matched
-    back to the exact configured stock name case/whitespace-insensitively
-    so lookups in process_stock are a plain dict hit. Returns {} if
-    nothing usable could be parsed.
+    _build_ai_stocks_story_prompt's OUTPUT FORMAT). Returns
+    (stories, portfolio_summary):
+      stories: {stock_name: [bullet, ...]} for whichever names it
+        recognizes, matched back to the exact configured stock name
+        case/whitespace-insensitively so lookups in process_stock are a
+        plain dict hit. {} if nothing usable could be parsed.
+      portfolio_summary: the single professional-prose paragraph
+        synthesizing all stocks together, or None if missing/unparseable.
     """
     cleaned = _strip_code_fences(text)
     try:
@@ -402,15 +411,17 @@ def _parse_ai_stocks_story_json(text, stock_names):
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
-            return {}
+            return {}, None
         try:
             data = json.loads(match.group(0))
         except json.JSONDecodeError:
-            return {}
+            return {}, None
 
     stories = data.get("stories") if isinstance(data, dict) else None
+    portfolio_summary = data.get("portfolio_summary") if isinstance(data, dict) else None
+    portfolio_summary = portfolio_summary.strip() if isinstance(portfolio_summary, str) and portfolio_summary.strip() else None
     if not isinstance(stories, dict):
-        return {}
+        return {}, portfolio_summary
 
     result = {}
     name_lookup = {n.strip().lower(): n for n in stock_names}
@@ -422,11 +433,11 @@ def _parse_ai_stocks_story_json(text, stock_names):
             continue
         matched_name = name_lookup.get(str(key).strip().lower(), key)
         result[matched_name] = clean_bullets
-    return result
+    return result, portfolio_summary
 
 
 def _try_groq_compound_model_for_stories(prompt, model_name, stock_count, max_attempts=2):
-    max_tokens = min(4000, max(700, stock_count * 70))
+    max_tokens = min(4200, max(850, stock_count * 70 + 150))
     for attempt in range(max_attempts):
         try:
             response = groq_client.chat.completions.create(
@@ -459,7 +470,7 @@ def _try_groq_compound_model_for_stories(prompt, model_name, stock_count, max_at
 def _try_tavily_plus_groq_for_stories(prompt, stock_count):
     if not os.getenv("TAVILY_API_KEY") or groq_client is None:
         return None
-    max_tokens = min(4000, max(700, stock_count * 70))
+    max_tokens = min(4200, max(850, stock_count * 70 + 150))
     try:
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
@@ -543,19 +554,24 @@ def _generate_local_story(prompt):
 def generate_ai_stocks_story(stock_names):
     """
     Single, combined, live-grounded call that produces a short, bulleted
-    "AI Stock Story" for every stock in `stock_names` at once. Tiering
-    mirrors swing_trade_advisor.py: groq/compound -> groq/compound-mini ->
-    Tavily search + plain Groq -> Gemini + Google Search grounding ->
-    plain (non-live) Groq -> local model.
+    "AI Stock Story" for every stock in `stock_names`, PLUS one
+    professional-prose "Portfolio Summary" synthesizing all of them
+    together -- all from the same one call. Tiering mirrors
+    swing_trade_advisor.py: groq/compound -> groq/compound-mini -> Tavily
+    search + plain Groq -> Gemini + Google Search grounding -> plain
+    (non-live) Groq -> local model.
 
-    Returns (stories, sources, used_live_search):
+    Returns (stories, sources, used_live_search, portfolio_summary):
       stories: {stock_name: [bullet, bullet, bullet]} -- {} on total failure
       sources: [(title, url), ...] actually used, for optional display
       used_live_search: True if the tier that produced the result was
         genuinely grounded in live search results
+      portfolio_summary: 3-4 sentence professional-prose paragraph
+        covering all stocks together, or a locally-built generic fallback
+        if every AI tier failed or omitted it
     """
     if not stock_names:
-        return {}, [], False
+        return {}, [], False, None
 
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     stock_count = len(stock_names)
@@ -571,17 +587,17 @@ def generate_ai_stocks_story(stock_names):
         result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound", stock_count, max_attempts=2)
         if result is not None:
             text, sources, live = result
-            stories = _parse_ai_stocks_story_json(text, stock_names)
+            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
             if stories:
-                return stories, sources, live
+                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
 
         log.info("groq/compound unavailable for AI Stocks Story -- trying groq/compound-mini...")
         result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound-mini", stock_count, max_attempts=2)
         if result is not None:
             text, sources, live = result
-            stories = _parse_ai_stocks_story_json(text, stock_names)
+            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
             if stories:
-                return stories, sources, live
+                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
 
         # Tier 3: fetch live snippets via Tavily directly (own free quota,
         # one query per stock, run in parallel), then hand them to a
@@ -592,23 +608,23 @@ def generate_ai_stocks_story(stock_names):
             result = _try_tavily_plus_groq_for_stories(grounded_prompt, stock_count)
             if result is not None:
                 text, live = result
-                stories = _parse_ai_stocks_story_json(text, stock_names)
+                stories, summary = _parse_ai_stocks_story_json(text, stock_names)
                 if stories:
-                    return stories, tavily_sources, live
+                    return stories, tavily_sources, live, summary or _fallback_portfolio_summary(stock_names)
 
         # Tier 4: Gemini + Google Search grounding, a separate free quota.
         if gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None):
             grounded = _try_gemini_grounded_for_stories(bare_prompt)
             if grounded is not None:
                 text, sources, live = grounded
-                stories = _parse_ai_stocks_story_json(text, stock_names)
+                stories, summary = _parse_ai_stocks_story_json(text, stock_names)
                 if stories:
-                    return stories, sources, live
+                    return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
 
         # Tier 5: plain (non-search) Groq -- still one call for every
         # stock, just without live grounding.
         try:
-            max_tokens = min(4000, max(700, stock_count * 70))
+            max_tokens = min(4200, max(850, stock_count * 70 + 150))
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": bare_prompt}],
@@ -616,9 +632,9 @@ def generate_ai_stocks_story(stock_names):
                 max_tokens=max_tokens,
             )
             text = response.choices[0].message.content.strip()
-            stories = _parse_ai_stocks_story_json(text, stock_names)
+            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
             if stories:
-                return stories, [], False
+                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
         except Exception as e:
             log.error(f"Groq fallback (no search) AI Stocks Story generation failed: {e}")
             if _is_daily_quota_exceeded(e):
@@ -631,17 +647,17 @@ def generate_ai_stocks_story(stock_names):
         grounded = _try_gemini_grounded_for_stories(bare_prompt)
         if grounded is not None:
             text, sources, live = grounded
-            stories = _parse_ai_stocks_story_json(text, stock_names)
+            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
             if stories:
-                return stories, sources, live
+                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
         try:
             response = gemini_client.models.generate_content(
                 model="gemini-flash-latest",
                 contents=bare_prompt,
             )
-            stories = _parse_ai_stocks_story_json(response.text.strip(), stock_names)
+            stories, summary = _parse_ai_stocks_story_json(response.text.strip(), stock_names)
             if stories:
-                return stories, [], False
+                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
         except Exception as e:
             log.error(f"Gemini AI Stocks Story generation failed: {e}")
 
@@ -650,11 +666,11 @@ def generate_ai_stocks_story(stock_names):
     if local_backend == "local" and llm_pipeline is not None:
         text = _generate_local_story(bare_prompt)
         if text:
-            stories = _parse_ai_stocks_story_json(text, stock_names)
+            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
             if stories:
-                return stories, [], False
+                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
 
-    return {}, [], False
+    return {}, [], False, None
 
 
 def _fallback_stock_story(stock_name, signal, tech_score, fund_score, sentiment_score, sentiment_label, headlines):
@@ -672,13 +688,63 @@ def _fallback_stock_story(stock_name, signal, tech_score, fund_score, sentiment_
     ]
 
 
+def _fallback_portfolio_summary(stock_names):
+    """
+    Cheap, non-AI fallback used when the AI backend produced per-stock
+    stories but the model omitted (or mis-formatted) the portfolio_summary
+    field -- keeps the email section populated with an honest, generic
+    line instead of silently disappearing. No extra AI call.
+    """
+    return (
+        f"Automated portfolio-wide commentary was not returned this run for the "
+        f"{len(stock_names)} tracked stocks; see the per-stock AI Stock Story notes "
+        f"and signal/score breakdown below for the underlying read on each name."
+    )
+
+
 def build_ai_story_bullets_html(bullets):
-    """Renders a stock's AI Stock Story bullets as a compact <ul>, HTML-
-    escaping each bullet since the text may come from an LLM."""
+    """Renders a stock's AI Stock Story as a labeled section with a compact
+    <ul> underneath, HTML-escaping each bullet since the text may come from
+    an LLM. Returns "" (nothing rendered) if there are no bullets."""
     if not bullets:
         return ""
     items = "".join(f"<li style=\"margin:0 0 4px 0;\">{html.escape(b)}</li>" for b in bullets)
-    return f'<ul style="margin:0;padding-left:16px;">{items}</ul>'
+    label = (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Helvetica,Arial,'
+        'sans-serif;font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;'
+        'color:#B08D57;margin:0 0 4px;">🤖 AI Stock Story</div>'
+    )
+    return f'{label}<ul style="margin:0;padding-left:16px;">{items}</ul>'
+
+
+def build_ai_portfolio_story_html(portfolio_summary, stock_count, used_live_search):
+    """
+    Small, email-safe section combining every stock's AI Stock Story into
+    one professional-level paragraph (from generate_ai_stocks_story's
+    portfolio_summary) -- built once from the same single combined AI call,
+    not a separate AI request. Shown near the top of BOTH the email body
+    and the PDF, unlike the full per-stock cards which are PDF-only.
+    Returns "" if there's nothing to show.
+    """
+    if not portfolio_summary:
+        return ""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    live_tag = " &nbsp;&middot;&nbsp; live-grounded" if used_live_search else ""
+    return f"""
+        <tr>
+          <td style="padding:0 28px 18px;" class="email-padding">
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-radius:6px;background:#FAF8F1;border:1px solid #E7DFC9;">
+              <tr>
+                <td style="padding:14px 16px;">
+                  <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#B08D57;">🤖 AI Portfolio Story{live_tag}</div>
+                  <p style="margin:8px 0 0;font-family:{sans};font-size:13px;line-height:1.65;color:#3C4256;">{html.escape(portfolio_summary)}</p>
+                  <p style="margin:8px 0 0;font-family:{sans};font-size:10px;color:#8A8F9C;">Synthesized in a single combined AI pass across all {stock_count} tracked stocks &mdash; see each stock's card for its individual AI Stock Story.</p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+    """
 
 
 def fetch_data(symbol):
@@ -2322,14 +2388,17 @@ def main(mode, use_llm, detailed_llm=False):
     rows = []
     summary_rows = []
     ai_stocks_story_map = {}
+    ai_portfolio_story_html = ""
     if use_llm:
         init_llm_generator()
         try:
-            ai_stocks_story_map, ai_story_sources, ai_story_live = generate_ai_stocks_story(list(STOCKS.keys()))
+            ai_stocks_story_map, ai_story_sources, ai_story_live, ai_portfolio_summary = generate_ai_stocks_story(list(STOCKS.keys()))
             log.info(
                 f"AI Stocks Story: {len(ai_stocks_story_map)}/{len(STOCKS)} stocks covered by a "
-                f"single combined AI call (live_search={ai_story_live}, sources_used={len(ai_story_sources)})."
+                f"single combined AI call (live_search={ai_story_live}, sources_used={len(ai_story_sources)}, "
+                f"portfolio_summary={'yes' if ai_portfolio_summary else 'no'})."
             )
+            ai_portfolio_story_html = build_ai_portfolio_story_html(ai_portfolio_summary, len(STOCKS), ai_story_live)
         except Exception as e:
             log.error(f"AI Stocks Story batch generation failed, per-stock fallback text will be used instead: {e}")
             traceback.print_exc()
@@ -2683,6 +2752,7 @@ def main(mode, use_llm, detailed_llm=False):
     report_html += (
         error_summary_html
         + quick_jump_html
+        + ai_portfolio_story_html
         + quick_summary_html
         + summary_html
         + commodity_row_html
@@ -2691,12 +2761,16 @@ def main(mode, use_llm, detailed_llm=False):
     )
     report_html += footer_html
 
-    # Email gets only the Portfolio Heatmap + Quick Summary. The full
-    # per-stock "portfolio" breakdown (summary/commodity cards/concentration
-    # alerts/detailed stock sections) is dropped from the inline message and
-    # lives only in the attached PDF -- keeps the email short and avoids
-    # Gmail's ~102 KB body-clipping entirely rather than just working around it.
-    email_html = report_html_header + quick_jump_html + quick_summary_html + footer_html
+    # Email gets the Portfolio Heatmap + Quick Summary, PLUS the small AI
+    # Portfolio Story paragraph (one professional-level summary combining
+    # every stock's AI Stock Story, from the same single combined AI call
+    # -- no extra AI request). The full per-stock "portfolio" breakdown
+    # (summary/commodity cards/concentration alerts/detailed stock cards
+    # with their individual AI Stock Story bullets) is dropped from the
+    # inline message and lives only in the attached PDF -- keeps the email
+    # short and avoids Gmail's ~102 KB body-clipping entirely rather than
+    # just working around it.
+    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + quick_summary_html + footer_html
 
     # Persist this run's state so the next run can diff signals/prices
     # against it (change badges, breach alerts, commodity streaks).
