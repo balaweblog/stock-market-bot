@@ -83,7 +83,8 @@ def build_prompt():
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     session_label, in_session = _market_session_label()
 
-    return f"""Core Objective: You are an expert at analysing Nifty options-related data. Using the most current, live market data available to you (via web search), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across FOUR time horizons:
+    return f"""Core Objective: You are an expert at analysing Nifty options-related data. Using the most current, 
+    Rebuild Nifty options strategies with live market data. Use current spot, futures, IV, and OI levels.live market data available to you (via web search), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across FOUR time horizons:
 
 1. Nifty Weekly -- Buy, Sell, or a Combination of both (current/nearest weekly expiry)
 2. Nifty Monthly -- Buy, Sell, or a Combination of both (current monthly expiry)
