@@ -17,22 +17,27 @@ is already generic (it just takes a prompt string and returns
 whatever provider/search path is configured. Email credential plumbing is
 reused from main.py the same way swing_trade_advisor.py does it.
 
-LIVE DATA: this script does not call the NSE options-chain API directly --
-there is no clean free/official one, and scraping it reliably is its own
-project. Instead it leans on the LLM's own live-search path (see
-swing_trade_advisor.generate_analysis -- groq/compound's built-in web
-search, then Tavily+Groq, then Gemini+Google Search grounding) to pull
-Nifty spot, India VIX, options-chain levels, FII/DII activity, GIFT Nifty
-pre-market, and global cues at generation time. REQUIRE_LIVE_DATA=true
-(the default) refuses to email a run that never actually reached live
-data, exactly like swing_trade_advisor.py.
+LIVE DATA: this script fetches Nifty spot, India VIX, and a full per-horizon
+options-chain snapshot (PCR by OI, max pain, top-OI strikes on both sides)
+directly from NSE India's public option-chain JSON endpoint and Yahoo
+Finance BEFORE calling the LLM, and embeds those real numbers straight into
+the prompt as ground truth (see fetch_live_market_data() / build_prompt()).
+NSE has no official public API for this and can rate-limit or block
+non-browser traffic -- especially likely from a CI runner's IP (e.g. GitHub
+Actions) -- so the fetch degrades gracefully: on partial/total failure it
+falls through to swing_trade_advisor.generate_analysis()'s own live-search
+path (groq/compound's built-in web search, then Tavily+Groq, then
+Gemini+Google Search grounding) to fill the gaps at generation time.
+REQUIRE_LIVE_DATA=true (the default) refuses to email a run where NEITHER
+the direct fetch NOR the LLM's own search produced anything live, exactly
+like swing_trade_advisor.py.
 
-CAVEAT: this is not a verified real-time trading signal. Web search
-results can be a few hours stale, incomplete, or misread by the model.
-Every strike, level, and Greek-adjacent figure below is a starting
-hypothesis to verify against your broker's live options chain (e.g. Kite
-Connect / Upstox API, or NSE's site directly) before placing any order.
-Not investment advice.
+CAVEAT: this is not a verified real-time trading signal. Both the direct
+feed and web search results can be a few minutes to hours stale, and the
+model can still misread or mis-combine what it's given. Every strike, level,
+and Greek-adjacent figure below is a starting hypothesis to verify against
+your broker's live options chain (e.g. Kite Connect / Upstox API, or NSE's
+site directly) before placing any order. Not investment advice.
 """
 
 import os
@@ -43,6 +48,12 @@ import html
 import traceback
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
+
+import requests
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None  # VIX/spot cross-check degrades gracefully if not installed
 
 import smtplib
 from email.mime.text import MIMEText
@@ -57,6 +68,233 @@ PER_HORIZON_CAP_PCT = float(os.getenv("OPTIONS_PER_HORIZON_CAP_PCT", "5"))
 AGGREGATE_CAP_PCT = float(os.getenv("OPTIONS_AGGREGATE_CAP_PCT", "15"))
 
 HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly", "Annual"]
+
+# -----------------------------
+# Live data fetch (NSE India option-chain API + Yahoo Finance)
+# -----------------------------
+# NSE has no official public API for this, but nseindia.com's own
+# option-chain page calls this exact JSON endpoint client-side, so it's the
+# same "standard website" data a human would read there. It requires a
+# browser-like User-Agent and a warm-up hit to set session cookies -- calling
+# it cold returns 401/403. It also actively rate-limits/blocks non-browser
+# traffic, which is especially likely from a CI runner's IP (e.g. GitHub
+# Actions) -- so every step below degrades gracefully rather than crashing
+# the run. Needs `pip install requests yfinance`.
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/option-chain",
+}
+
+
+def fetch_nse_option_chain(symbol="NIFTY", timeout=12):
+    """Pulls the live, full option chain (all listed expiries, every
+    strike's OI/changeInOI/IV/LTP for CE and PE) straight from NSE's
+    option-chain JSON endpoint. Returns the parsed dict, or None on any
+    failure (network, block, non-200, bad JSON)."""
+    try:
+        session = requests.Session()
+        session.headers.update(_NSE_HEADERS)
+        session.get("https://www.nseindia.com/option-chain", timeout=timeout)  # sets cookies
+        resp = session.get(
+            f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        main.log.warning(f"NSE option-chain fetch failed for {symbol}: {e}")
+        return None
+
+
+def _parse_nse_date(d):
+    return datetime.strptime(d, "%d-%b-%Y")
+
+
+def _pick_horizon_expiries(expiry_dates):
+    """Maps NSE's raw list of listed expiry dates onto the same four
+    horizon definitions used in the prompt (nearest weekly / current
+    monthly / nearest Mar-Jun-Sep-Dec quarterly / farthest available)."""
+    parsed = sorted(((d, _parse_nse_date(d)) for d in expiry_dates), key=lambda t: t[1])
+    if not parsed:
+        return {}
+    weekly, weekly_dt = parsed[0]
+    same_month = [d for d, dt in parsed if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
+    monthly = same_month[-1] if same_month else weekly
+    monthly_dt = _parse_nse_date(monthly)
+    quarter_candidates = [d for d, dt in parsed if dt.month in (3, 6, 9, 12) and dt >= monthly_dt]
+    quarterly = quarter_candidates[0] if quarter_candidates else parsed[-1][0]
+    annual = parsed[-1][0]
+    return {"Weekly": weekly, "Monthly": monthly, "Quarterly": quarterly, "Annual": annual}
+
+
+def _extract_expiry_snapshot(rows, expiry_str):
+    """From NSE's raw per-strike rows, compute the figures the prompt needs
+    for one expiry: PCR by OI, max pain, and the top-5 OI strikes on each
+    side (a direct, computed liquidity signal for constraint #7)."""
+    calls, puts = {}, {}
+    for r in rows:
+        if r.get("expiryDate") != expiry_str:
+            continue
+        strike = r.get("strikePrice")
+        if r.get("CE"):
+            calls[strike] = r["CE"]
+        if r.get("PE"):
+            puts[strike] = r["PE"]
+
+    total_call_oi = sum(c.get("openInterest", 0) for c in calls.values())
+    total_put_oi = sum(p.get("openInterest", 0) for p in puts.values())
+    pcr_oi = round(total_put_oi / total_call_oi, 2) if total_call_oi else None
+
+    top_calls = sorted(calls.items(), key=lambda kv: kv[1].get("openInterest", 0), reverse=True)[:5]
+    top_puts = sorted(puts.items(), key=lambda kv: kv[1].get("openInterest", 0), reverse=True)[:5]
+
+    max_pain = None
+    all_strikes = sorted(set(calls) | set(puts))
+    if all_strikes:
+        pain = {
+            k: (
+                sum(c.get("openInterest", 0) * max(0, k - s) for s, c in calls.items())
+                + sum(p.get("openInterest", 0) * max(0, s - k) for s, p in puts.items())
+            )
+            for k in all_strikes
+        }
+        max_pain = min(pain, key=pain.get)
+
+    return {
+        "expiry": expiry_str,
+        "pcr_oi": pcr_oi,
+        "max_pain": max_pain,
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "top_call_oi": [(s, c.get("openInterest", 0)) for s, c in top_calls],
+        "top_put_oi": [(s, p.get("openInterest", 0)) for s, p in top_puts],
+    }
+
+
+def fetch_live_market_data():
+    """Top-level orchestrator: pulls Nifty spot, India VIX, and a full
+    per-horizon option-chain snapshot (PCR/max-pain/top-OI strikes) BEFORE
+    the LLM is ever called, so the model is reasoning over real fetched
+    numbers instead of whatever it recalls or half-finds via its own
+    search. Returns a dict; always check "status" ("ok"/"partial"/"failed")
+    and read "notes" for what, if anything, could not be fetched."""
+    notes = []
+    data = {
+        "status": "failed",
+        "fetched_at": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST"),
+        "spot": None,
+        "vix": None,
+        "vix_change_pct": None,
+        "horizons": {},
+        "notes": notes,
+    }
+
+    if yf is not None:
+        try:
+            vix_hist = yf.Ticker("^INDIAVIX").history(period="5d")
+            if not vix_hist.empty:
+                data["vix"] = round(float(vix_hist["Close"].iloc[-1]), 2)
+                if len(vix_hist) >= 2:
+                    prev = float(vix_hist["Close"].iloc[-2])
+                    data["vix_change_pct"] = round((data["vix"] - prev) / prev * 100, 2)
+        except Exception as e:
+            notes.append(f"Yahoo Finance VIX fetch failed: {e}")
+        try:
+            spot_hist = yf.Ticker("^NSEI").history(period="1d")
+            if not spot_hist.empty:
+                data["spot"] = round(float(spot_hist["Close"].iloc[-1]), 2)
+        except Exception as e:
+            notes.append(f"Yahoo Finance Nifty spot fetch failed: {e}")
+    else:
+        notes.append("yfinance not installed -- spot/VIX cross-check skipped (pip install yfinance).")
+
+    chain = fetch_nse_option_chain("NIFTY")
+    if chain is None:
+        notes.append(
+            "NSE option-chain fetch failed (blocked, rate-limited, or endpoint "
+            "changed) -- per-horizon OI, PCR, and max-pain will rely entirely "
+            "on the LLM's own live web search this run."
+        )
+        data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
+        return data
+
+    try:
+        records = chain.get("records", {})
+        if data["spot"] is None:
+            data["spot"] = records.get("underlyingValue")
+        horizon_expiries = _pick_horizon_expiries(records.get("expiryDates", []))
+        rows = records.get("data", [])
+        for horizon, expiry in horizon_expiries.items():
+            data["horizons"][horizon] = _extract_expiry_snapshot(rows, expiry)
+        if "Annual" in data["horizons"]:
+            notes.append(
+                "NSE's feed rarely carries a genuinely liquid 12-month-out "
+                "expiry -- the 'Annual' snapshot is just the farthest expiry "
+                "NSE returned; verify its real liquidity (constraint #7) and "
+                "lean on live web search if it's not actually far/liquid enough."
+            )
+        data["status"] = "ok"
+    except Exception as e:
+        notes.append(f"NSE option-chain data was fetched but could not be parsed: {e}")
+        data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
+
+    return data
+
+
+def _fmt_oi_pairs(pairs):
+    if not pairs:
+        return "n/a"
+    return "; ".join(f"{strike}: {oi:,} OI" for strike, oi in pairs)
+
+
+def format_live_data_block(data):
+    """Renders the fetched dict as a plain-text block to embed directly in
+    the LLM prompt, framed explicitly as ground truth rather than something
+    to re-derive from web search."""
+    if not data or data.get("status") == "failed":
+        note_text = "; ".join(data.get("notes", [])) if data else "fetch not attempted"
+        return (
+            "LIVE DATA FEED: unavailable this run (direct NSE/Yahoo fetch failed). "
+            f"Notes: {note_text}. You must rely entirely on your own live web "
+            "search for every figure in the REQUIRED LIVE DATA section below, "
+            "and be honest about this in each horizon's data_status field."
+        )
+
+    lines = [
+        f"LIVE DATA FEED (fetched directly from NSE India's option-chain API and "
+        f"Yahoo Finance at {data['fetched_at']}, status={data['status']}). Treat "
+        f"every figure below as verified ground truth -- do NOT re-derive or "
+        f"second-guess these via web search. Only web-search for whatever is "
+        f"marked unavailable below, plus qualitative context (FII/DII flows, "
+        f"GIFT Nifty pre-market, US/Asian markets overnight, event risk):",
+        f"- Nifty 50 spot: {data.get('spot', 'n/a')}",
+        "- India VIX: "
+        + str(data.get("vix", "n/a"))
+        + (f" ({data['vix_change_pct']:+.2f}% vs prior close)" if data.get("vix_change_pct") is not None else ""),
+    ]
+    for horizon in HORIZON_ORDER:
+        snap = data.get("horizons", {}).get(horizon)
+        if not snap:
+            lines.append(f"- {horizon} expiry: not available from the direct feed -- find via web search.")
+            continue
+        lines.append(
+            f"- {horizon} expiry ({snap['expiry']}): PCR(OI)={snap.get('pcr_oi', 'n/a')}, "
+            f"Max Pain={snap.get('max_pain', 'n/a')}, Total Call OI="
+            f"{snap.get('total_call_oi', 0):,}, Total Put OI={snap.get('total_put_oi', 0):,}"
+        )
+        lines.append(f"    Top Call OI strikes: {_fmt_oi_pairs(snap.get('top_call_oi'))}")
+        lines.append(f"    Top Put OI strikes: {_fmt_oi_pairs(snap.get('top_put_oi'))}")
+
+    if data.get("notes"):
+        lines.append("Fetch notes: " + "; ".join(data["notes"]))
+
+    return "\n".join(lines)
 
 
 def _market_session_label():
@@ -79,19 +317,21 @@ def _market_session_label():
 # -----------------------------
 # Prompt
 # -----------------------------
-def build_prompt():
+def build_prompt(live_data=None):
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     session_label, in_session = _market_session_label()
+    live_data_block = format_live_data_block(live_data)
 
-    return f"""Core Objective: You are an expert at analysing Nifty options-related data. Using the most current, 
-    Rebuild Nifty options strategies with live market data. Use current spot, futures, IV, and OI levels.live market data available to you (via web search), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across FOUR time horizons:
+    return f"""Core Objective: You are an expert at analysing Nifty options-related data. A LIVE DATA FEED has already been fetched for you and is provided below -- use those figures as ground truth for this run rather than searching for or guessing them yourself. Using that feed (plus web search only for what it doesn't cover), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across FOUR time horizons:
+
+{live_data_block}
 
 1. Nifty Weekly -- Buy, Sell, or a Combination of both (current/nearest weekly expiry)
 2. Nifty Monthly -- Buy, Sell, or a Combination of both (current monthly expiry)
 3. Nifty Quarterly -- Buy, Sell, or a Combination of both (nearest quarterly expiry on the Mar/Jun/Sep/Dec cycle)
 4. Nifty Annual -- Buy, Sell, or a Combination of both (farthest available annual/LEAPS-style expiry)
 
-Horizons are independent -- they do not need to agree with each other. For example Weekly can be a bearish credit spread while Monthly is a bullish debit spread, if the data supports it.
+Horizons are independent from Monthly/Quarterly/Annual onward -- they do not need to agree with each other. For example Monthly can be a bullish debit spread while Quarterly is a range-bound Iron Condor, if the data supports it. The Weekly horizon, however, follows the bias-sequencing rule below (constraint #5), which explicitly couples the current week to the next week.
 
 NON-NEGOTIABLE CONSTRAINTS
 
@@ -109,12 +349,21 @@ NON-NEGOTIABLE CONSTRAINTS
 
 4. This is a stateless, any-time request -- today is {today_str}, and this run is being generated during: {session_label}. Produce a full, self-contained recommendation using only live data you can find right now; do not assume access to any prior recommendation.
 
-REQUIRED LIVE DATA TO SEARCH FOR AND USE (do not fabricate any of this -- if you cannot find a real current figure, say so for that field rather than inventing one):
-- Nifty 50 spot price (current)
-- Nifty futures price (weekly/monthly, for basis)
-- Options chain levels for the four relevant expiries: key strikes, OI concentration, IV, PCR by OI
-- India VIX (current level + recent change) -- for expected-move sizing
-- FII/DII cash + index-options net positioning (most recent session)
+5. WEEKLY BIAS SEQUENCING.
+   - Determine the Current Week's bias (Bullish or Bearish) strictly from the live market data you find (spot/futures trend, OI buildup, PCR, FII/DII flow, global cues) -- never assume a default direction.
+   - Apply a mean-reversion assumption for the immediate next weekly expiry: if the Current Week is Bullish, treat the Next Week as Bearish; if the Current Week is Bearish, treat the Next Week as Bullish. Reflect this explicitly in the Weekly horizon's strategy legs and in a dedicated "next_week_bias" field (see schema below) -- e.g. a current-week bull put spread paired with a next-week-aware bear call spread or calendar structure that benefits from the expected reversal.
+   - If live data shows a clear reason to override this assumption (e.g. a major event landing exactly in the next-week window), say so explicitly in bias_reason rather than silently ignoring the rule.
+
+6. MONTHLY/QUARTERLY BIAS TOWARD SIDEWAYS/RANGE-BOUND. Unless live data shows a strong, well-supported directional catalyst inside that horizon's window, default the Monthly and Quarterly recommendations to range-bound/theta-positive structures (Iron Condor, Iron Butterfly, Calendar/Diagonal Spread) rather than pure directional debit/credit spreads -- these horizons are for harvesting range and time decay, not chasing the weekly directional call.
+
+7. NIFTY LIQUIDITY FILTER. Only select strikes with adequate live liquidity for Nifty options -- meaningful open interest, tight bid-ask spread, and strikes close to standard NSE strike intervals. If a theoretically ideal strike is illiquid, state that explicitly and move to the nearest liquid strike instead. Note the liquidity basis (OI/spread) briefly for each leg selected.
+
+8. RISK-CONTROLLED SYNTHESIS. Every horizon's final recommendation must simultaneously satisfy constraints #1-#7 above -- risk-defined, gap-protected, capital-capped, correctly bias-sequenced (Weekly), correctly range-biased (Monthly/Quarterly), and liquidity-filtered. If any of these pull in conflicting directions for a given horizon (e.g. the liquid strike sits inside the expected-move band), state the trade-off explicitly in that horizon's bias_reason and resolve it in favor of the tighter risk-defined structure, never in favor of higher theoretical reward.
+
+ADDITIONAL LIVE DATA TO SEARCH FOR (only for what the LIVE DATA FEED above does not already give you -- do not re-search or contradict anything already provided there; if you cannot find a real current figure, say so for that field rather than inventing one):
+- Nifty futures price (weekly/monthly, for basis) -- the feed above gives spot, not futures
+- Confirmation/context on options-chain levels for any horizon the feed marked unavailable
+- FII/DII cash + index-options net positioning (most recent session) -- not covered by the feed
 - GIFT Nifty pre-market level (if available) and prior-session US market close (S&P 500, Nasdaq), for gap risk
 - Any major near-term event risk (RBI policy, US Fed meeting, major earnings cluster, budget/election dates) that falls within each horizon's window
 
@@ -126,6 +375,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "horizon": "Weekly",
       "expiry_date": "The actual expiry date used, e.g. '24 Jul 2026'",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "ONLY for the Weekly horizon object: 'Bullish' or 'Bearish', the opposite of 'bias' per constraint #5's mean-reversion rule (or a brief override note if constraint #5 was overridden). Omit or leave empty for Monthly/Quarterly/Annual.",
       "bias_reason": "One sentence grounded in the live data you found",
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor'",
       "legs": "Full leg structure, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
@@ -257,7 +507,8 @@ def _horizon_card_html(h, sans, serif):
     rows = "".join([
         row("Strategy", "strategy_name", bold=True),
         row("Legs", "legs"),
-        raw_row("Directional Bias", _bias_badge(h.get("bias"))),
+        raw_row("Directional Bias (Current Week)" if h.get("next_week_bias") else "Directional Bias", _bias_badge(h.get("bias"))),
+        *([raw_row("Directional Bias (Next Week)", _bias_badge(h.get("next_week_bias")))] if h.get("next_week_bias") else []),
         row("Bias Rationale", "bias_reason"),
         row("Max Loss", "max_loss", value_color="#8B2E2E", bold=True),
         row("Max Loss (% of horizon capital)", "max_loss_pct_capital", value_color="#8B2E2E"),
@@ -333,19 +584,55 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
 # -----------------------------
 # Email
 # -----------------------------
-def build_email_html(horizons_html, today_str, sources, used_live_search, session_label):
+def _live_feed_html(data, sans):
+    if not data:
+        return ""
+    status = data.get("status", "failed")
+    style = {
+        "ok": ("#2F5233", "#E7EEE4", "Live feed OK"),
+        "partial": ("#A6812F", "#FDF3D9", "Live feed partial"),
+        "failed": ("#8B2E2E", "#FBEAEA", "Live feed failed"),
+    }.get(status, ("#8A8F9C", "#F4F2ED", status))
+    color, bg, label = style
+
+    bits = [f"Spot: {_esc(data.get('spot'))}", f"VIX: {_esc(data.get('vix'))}"]
+    for horizon in HORIZON_ORDER:
+        snap = data.get("horizons", {}).get(horizon)
+        if snap:
+            bits.append(f"{horizon} ({snap['expiry']}): PCR {snap.get('pcr_oi', 'n/a')}, Max Pain {snap.get('max_pain', 'n/a')}")
+
+    notes_html = ""
+    if data.get("notes"):
+        notes_html = (
+            f'<p style="margin:6px 0 0;font-family:{sans};font-size:11px;color:#9AA0AC;">'
+            f'{_esc("; ".join(data["notes"]))}</p>'
+        )
+
+    return f"""
+<div style="margin-bottom:14px;padding:10px 12px;border:1px solid #E7E4DC;border-radius:4px;background:#FAFAF7;">
+  <span style="display:inline-block;padding:3px 10px;border-radius:3px;font-size:11px;font-weight:700;color:{color};background:{bg};">{label}</span>
+  <span style="font-family:{sans};font-size:10px;color:#8A8F9C;margin-left:8px;">NSE India option-chain API + Yahoo Finance &middot; fetched {_esc(data.get("fetched_at"))}</span>
+  <p style="margin:6px 0 0;font-family:{sans};font-size:11px;line-height:1.6;color:#4A5063;">{_esc(" | ".join(bits))}</p>
+  {notes_html}
+</div>
+"""
+
+
+def build_email_html(horizons_html, today_str, sources, used_live_search, session_label, live_data=None):
     if used_live_search:
         disclaimer = (
-            "Generated using a live-web-search-capable model -- see \"Sources checked\" above for what it "
-            "actually looked at. Options-chain levels, IV, and OI figures can still be a few minutes to "
-            "hours stale, incomplete, or misread by the model. Verify every strike, premium, and Greek "
-            "against your broker's live options chain before placing any order. Not investment advice."
+            "Generated using a live-web-search-capable model plus a direct NSE/Yahoo data fetch -- see "
+            "\"Sources checked\" and the live-feed summary above for what was actually used. Options-chain "
+            "levels, IV, and OI figures can still be a few minutes to hours stale, incomplete, or misread by "
+            "the model. Verify every strike, premium, and Greek against your broker's live options chain "
+            "before placing any order. Not investment advice."
         )
     else:
         disclaimer = (
-            "Generated by an LLM with no live market/internet access for this run -- every price, strike, "
-            "IV, and OI figure above is model output and is NOT verified against a live feed. Do not trade "
-            "off this run; confirm every figure against a real-time options chain first. Not investment advice."
+            "Generated by an LLM with no live web search this run -- see the live-feed summary above for "
+            "what the direct NSE/Yahoo fetch did or didn't supply. Any field not covered by that feed is "
+            "model output and is NOT verified against a live source. Do not trade off this run without "
+            "confirming every figure against a real-time options chain first. Not investment advice."
         )
 
     sources_html = swing._build_sources_html(sources)
@@ -355,6 +642,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
         '<span style="color:#B08D57;">&nbsp;&middot;&nbsp; Live web search used</span>'
         if used_live_search else ""
     )
+    live_feed_html = _live_feed_html(live_data, sans)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -393,6 +681,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
           </tr>
           <tr>
             <td style="padding:14px 28px 18px;" class="email-padding">
+              {live_feed_html}
               {horizons_html}
               {sources_html}
             </td>
@@ -465,7 +754,13 @@ def send_option_strategy_email(html_body):
 def run():
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     session_label, _in_session = _market_session_label()
-    prompt = build_prompt()
+
+    live_data = fetch_live_market_data()
+    main.log.info(
+        f"Live data feed status: {live_data['status']}"
+        + (f" -- {'; '.join(live_data['notes'])}" if live_data["notes"] else "")
+    )
+    prompt = build_prompt(live_data)
 
     # Reuses swing_trade_advisor's Groq(compound/compound-mini) -> Tavily+Groq
     # -> Gemini+Search -> plain Groq -> local model chain unmodified -- this
@@ -479,16 +774,20 @@ def run():
         )
         sys.exit(1)
 
-    if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        # Same rationale as swing_trade_advisor.py: without live search this
-        # is pure training-data reasoning about option strikes/IV/OI, which
-        # is exactly the stale, unverified output this run exists to avoid.
+    live_feed_ok = live_data.get("status") in ("ok", "partial") and (
+        live_data.get("spot") or live_data.get("horizons")
+    )
+    if not used_live_search and not live_feed_ok and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
+        # Neither our own direct NSE/Yahoo fetch nor the LLM's own live search
+        # produced anything -- without one of those this is pure training-data
+        # reasoning about option strikes/IV/OI, which is exactly the stale,
+        # unverified output this run exists to avoid.
         main.log.error(
-            "Live web search was not used for this run, so option-chain levels, "
-            "IV, VIX, and OI figures would only reflect stale training-data -- "
-            "not current strikes. Aborting without sending an email. Set "
-            "REQUIRE_LIVE_DATA=false to override and allow a clearly-labeled "
-            "stale-data email instead."
+            "Neither the direct NSE/Yahoo live data fetch nor the LLM's own live "
+            "web search succeeded this run, so option-chain levels, IV, VIX, and "
+            "OI figures would only reflect stale training-data -- not current "
+            "strikes. Aborting without sending an email. Set REQUIRE_LIVE_DATA="
+            "false to override and allow a clearly-labeled stale-data email instead."
         )
         sys.exit(1)
 
@@ -506,7 +805,7 @@ def run():
             f'<pre style="white-space:pre-wrap;font-family:{sans};font-size:12px;color:#14213D;">{html.escape(swing._strip_code_fences(analysis))}</pre>'
         )
 
-    email_html = build_email_html(horizons_html, today_str, sources, used_live_search, session_label)
+    email_html = build_email_html(horizons_html, today_str, sources, used_live_search, session_label, live_data)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("option_strategy_report.html", "w") as f:
