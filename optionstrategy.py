@@ -398,16 +398,28 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
 def fetch_latest_nse_bhavcopy_fo(max_days_back=6):
     """Walks backward from today (skipping the file NSE hasn't published
     yet for "today" before ~7 PM IST) to find the most recent trading
-    day's F&O Bhavcopy. Returns (rows, trade_date) or (None, None)."""
+    day's F&O Bhavcopy. Returns (rows, trade_date, skipped_weekdays):
+    - rows/trade_date: the parsed CSV rows and date they came from, or
+      (None, None) if nothing was found in max_days_back days.
+    - skipped_weekdays: dates strictly between "today" and trade_date that
+      were Mon-Fri (so a Bhavcopy should plausibly exist) but whose fetch
+      failed anyway -- e.g. not yet published, transient block, or a
+      market holiday. Weekends are never included here since no Bhavcopy
+      is expected for them. Reported in the email so "Bhavcopy dated 16
+      Jul" next to "fetched 19 Jul" reads as an explained gap rather than
+      an unrelated data inconsistency."""
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    skipped_weekdays = []
     for i in range(max_days_back + 1):
         candidate = now_ist - timedelta(days=i)
         if i == 0 and now_ist.time() < dtime(19, 0):
             continue  # today's file isn't published yet -- skip straight to yesterday
         rows = fetch_nse_bhavcopy_fo(candidate)
         if rows:
-            return rows, candidate.date()
-    return None, None
+            return rows, candidate.date(), skipped_weekdays
+        if candidate.weekday() < 5:  # Mon-Fri: a file should plausibly exist
+            skipped_weekdays.append(candidate.date())
+    return None, None, skipped_weekdays
 
 
 def _extract_bhavcopy_snapshot(rows, symbol, expiry_dt):
@@ -485,10 +497,18 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
     """Fallback path used when the live option-chain JSON fetch failed
     entirely: pulls the latest available EOD Bhavcopy and fills data["horizons"]
     from it, clearly tagging every filled horizon as EOD (not live)."""
-    bhav_rows, bhav_date = fetch_latest_nse_bhavcopy_fo()
+    bhav_rows, bhav_date, skipped_weekdays = fetch_latest_nse_bhavcopy_fo()
     if not bhav_rows:
         notes.append("EOD Bhavcopy fallback also failed or is unavailable (no file found in the last 6 days).")
         return False
+
+    staleness_note = ""
+    if skipped_weekdays:
+        skipped_str = ", ".join(d.strftime("%d %b %Y") for d in skipped_weekdays)
+        staleness_note = (
+            f" (more recent weekday Bhavcopy file(s) for {skipped_str} could not be "
+            f"fetched this run -- not yet published, a market holiday, or a transient block)"
+        )
 
     try:
         if data["spot"] is None:
@@ -505,7 +525,10 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
                 data["spot_source"] = f"EOD Bhavcopy near-month futures close proxy ({bhav_date.strftime('%d-%b-%Y')})"
                 notes.append("Spot figure is a Bhavcopy near-month futures CLOSE proxy, not true cash spot.")
 
-        data["option_chain_source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')}) — last trading day's close, not live"
+        data["option_chain_source"] = (
+            f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')}) — last trading day's close, not live"
+            f"{staleness_note}"
+        )
 
         expiry_dts = {
             _parse_bhavcopy_date(r.get("XpryDt", ""))
@@ -534,7 +557,7 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         notes.append(
             f"Live NSE option-chain feed was unavailable this run -- per-horizon OI/PCR/max-pain "
             f"were filled from NSE's official EOD Bhavcopy dated {bhav_date.strftime('%d %b %Y')} "
-            f"instead (last trading day's CLOSE, not live/intraday)."
+            f"instead (last trading day's CLOSE, not live/intraday){staleness_note}."
         )
         return True
     except Exception as e:
@@ -1107,6 +1130,37 @@ def generate_adjustment_trigger(priced_legs, net_premium):
         )
 
 
+_OUTSIDE_BAND_CLAIM_RE = re.compile(
+    r"[.,]?\s*(?:sits?|is|lies?|falls?|positioned|remains?)?\s*"
+    r"outside\s+(?:the\s+)?(?:current\s+)?(?:1[\s-]?sd\s+)?expected[\s-]?move(?:\s+band)?",
+    re.IGNORECASE,
+)
+
+
+def _scrub_false_band_claim(rationale, any_leg_inside_band):
+    """The prompt's own strike_rationale example ('outside the
+    expected-move band and beyond the nearest major OI wall') encourages
+    the model to make a band-position claim, but constraint #7/#8
+    (liquidity filter, trade-offs) can legitimately force a strike that's
+    actually inside the band -- and the model sometimes still writes
+    'outside the expected move' out of habit. That directly contradicts
+    the code-computed '-- inside the 1-SD band (elevated risk)' note that
+    gets appended right after it in the same sentence (issue #2/#3). The
+    band position is deterministic and computed from real fetched
+    premiums, so code wins here. Earlier versions tried to surgically
+    delete just the offending clause, but that leaves a dangling
+    ungrammatical fragment (e.g. 'Chosen for being, near strong
+    resistance') -- arguably as unpolished as the original contradiction.
+    So instead the ENTIRE model sentence is discarded and replaced with a
+    fixed, grammatical fallback; the real OI/liquidity/band facts are
+    still shown in full via the computed addendum appended right after."""
+    if not rationale or not any_leg_inside_band:
+        return rationale
+    if _OUTSIDE_BAND_CLAIM_RE.search(rationale):
+        return "Selected primarily on OI/liquidity positioning -- see the computed band status below"
+    return rationale
+
+
 def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     """Appends real fetched/computed numbers to the model's qualitative
     strike rationale for EVERY short strike actually chosen: its own OI,
@@ -1114,9 +1168,14 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     Black-Scholes delta (from live IV) -- turning a vague 'near top OI'
     into something like 'Short strike 24000 (PE): OI 6,000,000 (+18%); Δ
     -0.32; expected move ±246; outside the 1-SD band' (issue #2/#3).
-    Returns "" if there isn't enough live data to say anything concrete."""
+    Returns (addendum_text, any_leg_inside_band): addendum_text is "" if
+    there isn't enough live data to say anything concrete; any_leg_inside_band
+    is True if at least one short leg actually falls inside the computed
+    1-SD band, so the caller can scrub a contradictory "outside the
+    expected move" claim the model may have written into strike_rationale
+    before concatenating the two."""
     if not horizon_snap:
-        return ""
+        return "", False
 
     parts = []
     top_call_oi = horizon_snap.get("top_call_oi") or []
@@ -1144,15 +1203,24 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
             t_years = None
 
     short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
+    any_leg_inside_band = False
     for leg in short_legs:
         strike, opt_type = leg["strike"], leg["type"]
         oi_val = oi_by_strike[opt_type].get(strike, oi_by_strike[opt_type].get(int(strike) if float(strike).is_integer() else strike))
         chg_map = call_chg if opt_type == "CE" else put_chg
         chg = chg_map.get(strike, chg_map.get(int(strike) if float(strike).is_integer() else strike))
-        oi_note = f"OI {oi_val:,}" if oi_val is not None else "OI n/a"
-        chg_note = f"{chg:+.0f}% chg" if chg is not None else "chg n/a"
+        oi_note = f"OI {oi_val:,}" if oi_val is not None else "OI unavailable"
+        if chg is not None:
+            chg_note = f"{chg:+.0f}% chg"
+        elif is_eod:
+            chg_note = "OI change unavailable from EOD Bhavcopy"
+        else:
+            chg_note = "OI change unavailable this run"
 
-        delta_note = "Δ n/a"
+        delta_note = (
+            "Greeks unavailable (EOD Bhavcopy has no implied volatility)"
+            if is_eod else "Greeks unavailable (live IV missing for this strike)"
+        )
         if t_years is not None and spot is not None:
             iv = _leg_iv(horizon_snap, strike, opt_type)
             g = bs_greeks(spot, strike, t_years, iv, opt_type)
@@ -1162,11 +1230,15 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
         band_note = ""
         if band_lo is not None:
             outside = strike < band_lo or strike > band_hi
-            band_note = " -- outside the 1-SD band" if outside else " -- inside the 1-SD band (elevated risk)"
+            if outside:
+                band_note = " -- outside the 1-SD band"
+            else:
+                band_note = " -- inside the 1-SD band (elevated risk)"
+                any_leg_inside_band = True
 
         parts.append(f"Short strike {strike:g} ({opt_type}): {oi_note} ({chg_note}); {delta_note}{band_note}")
 
-    return " | ".join(parts)
+    return " | ".join(parts), any_leg_inside_band
 
 
 def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
@@ -1195,7 +1267,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["adjustment_trigger"] = "n/a"
         horizon_dict["expected_move"] = "n/a"
         horizon_dict["net_greeks"] = "n/a"
-        horizon_dict["probability_of_profit"] = "n/a"
+        horizon_dict["probability_of_profit"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
@@ -1215,7 +1287,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["adjustment_trigger"] = "n/a"
         horizon_dict["expected_move"] = "n/a"
         horizon_dict["net_greeks"] = "n/a"
-        horizon_dict["probability_of_profit"] = "n/a"
+        horizon_dict["probability_of_profit"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
@@ -1225,12 +1297,14 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
 
     priced_legs = result["priced_legs"]
 
-    rationale_addendum = build_strike_rationale_addendum(priced_legs, horizon_snap, spot)
+    rationale_addendum, any_leg_inside_band = build_strike_rationale_addendum(priced_legs, horizon_snap, spot)
+    existing = _scrub_false_band_claim((horizon_dict.get("strike_rationale") or "").strip(), any_leg_inside_band)
     if rationale_addendum:
-        existing = (horizon_dict.get("strike_rationale") or "").strip()
         horizon_dict["strike_rationale"] = (
             f"{existing} ({rationale_addendum})" if existing else rationale_addendum
         )
+    else:
+        horizon_dict["strike_rationale"] = existing
 
     classified = classify_structure(priced_legs)
     label_note = ""
@@ -1319,8 +1393,11 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         )
         horizon_dict["_net_gamma"] = net_gamma * NIFTY_LOT_SIZE
     else:
-        greeks_reason = "EOD Bhavcopy has no IV column" if is_eod else "live IV unavailable for one or more legs this run"
-        horizon_dict["net_greeks"] = f"n/a ({greeks_reason})"
+        greeks_reason = (
+            "implied volatility is unavailable in the selected data source (EOD Bhavcopy has no IV column)"
+            if is_eod else "implied volatility is unavailable for one or more legs this run"
+        )
+        horizon_dict["net_greeks"] = f"Greeks unavailable -- {greeks_reason}"
         horizon_dict["_net_gamma"] = None
 
     # --- Probability of profit (flat-IV lognormal, ATM IV for this expiry) ---
@@ -1330,7 +1407,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         pop = compute_pop(spot, t_years, atm_iv, result["payoff_fn"], result["breakevens"])
     horizon_dict["probability_of_profit"] = (
         f"~{pop:.0f}% (model: flat ATM IV, lognormal price at expiry -- not a guarantee)"
-        if pop is not None else "n/a (requires live IV, unavailable this run)"
+        if pop is not None else None  # sentinel: render step hides this row rather than printing n/a
     )
 
     # --- Margin (approximate) and Return on Margin ---
@@ -1425,7 +1502,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
       "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
-      "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'outside the expected-move band and beyond the nearest major OI wall'",
+      "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'anchored beyond the nearest major OI wall on this side'. Do NOT state whether the strike is inside or outside the expected-move band -- that is computed exactly from real fetched premiums and appended automatically after your text; a guessed band claim here risks contradicting it.",
       "confidence": "One of: High / Medium / Low",
       "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- be honest here"
     }},
@@ -1565,7 +1642,7 @@ def _horizon_card_html(h, sans, serif):
         row("Max Profit", "max_profit", value_color="#2F5233", bold=True),
         row("Max Profit (% of horizon capital)", "max_profit_pct_capital", value_color="#2F5233"),
         row("Breakeven", "breakeven"),
-        row("Probability of Profit", "probability_of_profit"),
+        *([row("Probability of Profit", "probability_of_profit")] if h.get("probability_of_profit") else []),
         row("Net Greeks (per lot)", "net_greeks"),
         row("Margin Required", "margin_required"),
         row("Return on Margin", "return_on_margin"),
@@ -2029,7 +2106,7 @@ def finalize_horizons(horizons, live_data):
             "strike_rationale": "n/a",
             "expected_move": "n/a",
             "net_greeks": "n/a",
-            "probability_of_profit": "n/a",
+            "probability_of_profit": None,
             "margin_required": "n/a",
             "return_on_margin": "n/a",
             "confidence": "n/a",
