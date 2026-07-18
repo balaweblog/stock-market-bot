@@ -42,11 +42,14 @@ site directly) before placing any order. Not investment advice.
 
 import os
 import re
+import io
+import csv
 import sys
 import json
 import html
+import zipfile
 import traceback
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -116,21 +119,31 @@ def _parse_nse_date(d):
     return datetime.strptime(d, "%d-%b-%Y")
 
 
-def _pick_horizon_expiries(expiry_dates):
-    """Maps NSE's raw list of listed expiry dates onto the same four
-    horizon definitions used in the prompt (nearest weekly / current
-    monthly / nearest Mar-Jun-Sep-Dec quarterly / farthest available)."""
-    parsed = sorted(((d, _parse_nse_date(d)) for d in expiry_dates), key=lambda t: t[1])
-    if not parsed:
+def _pick_horizon_expiry_dates(dt_list):
+    """Shared horizon-selection logic, operating on plain datetime objects
+    so both the live option-chain JSON path (DD-Mon-YYYY strings) and the
+    Bhavcopy fallback path (YYYY-MM-DD strings) pick horizons identically:
+    nearest weekly / current monthly / nearest Mar-Jun-Sep-Dec quarterly /
+    farthest available."""
+    dts = sorted(set(dt_list))
+    if not dts:
         return {}
-    weekly, weekly_dt = parsed[0]
-    same_month = [d for d, dt in parsed if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
-    monthly = same_month[-1] if same_month else weekly
-    monthly_dt = _parse_nse_date(monthly)
-    quarter_candidates = [d for d, dt in parsed if dt.month in (3, 6, 9, 12) and dt >= monthly_dt]
-    quarterly = quarter_candidates[0] if quarter_candidates else parsed[-1][0]
-    annual = parsed[-1][0]
-    return {"Weekly": weekly, "Monthly": monthly, "Quarterly": quarterly, "Annual": annual}
+    weekly_dt = dts[0]
+    same_month = [dt for dt in dts if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
+    monthly_dt = same_month[-1] if same_month else weekly_dt
+    quarter_candidates = [dt for dt in dts if dt.month in (3, 6, 9, 12) and dt >= monthly_dt]
+    quarterly_dt = quarter_candidates[0] if quarter_candidates else dts[-1]
+    annual_dt = dts[-1]
+    return {"Weekly": weekly_dt, "Monthly": monthly_dt, "Quarterly": quarterly_dt, "Annual": annual_dt}
+
+
+def _pick_horizon_expiries(expiry_dates):
+    """Maps NSE's raw list of listed expiry-date STRINGS (live option-chain
+    JSON, DD-Mon-YYYY format) onto the four horizon definitions used in the
+    prompt, via the shared datetime-based picker above."""
+    by_dt = {_parse_nse_date(d): d for d in expiry_dates}
+    picked = _pick_horizon_expiry_dates(by_dt.keys())
+    return {h: by_dt[dt] for h, dt in picked.items()}
 
 
 def _extract_expiry_snapshot(rows, expiry_str):
@@ -177,13 +190,173 @@ def _extract_expiry_snapshot(rows, expiry_str):
     }
 
 
+# -----------------------------
+# EOD fallback: NSE's official Bhavcopy (UDiFF format)
+# -----------------------------
+# When the live option-chain JSON endpoint above is blocked/rate-limited
+# (common from CI/cloud IPs), this pulls NSE's own official end-of-day F&O
+# settlement file instead. It's a static daily ZIP, not a live quote feed,
+# so figures reflect the last trading day's CLOSE -- not intraday moves --
+# but it's still real official exchange data (OI, settlement price, PCR,
+# max pain), which is strictly better than the LLM guessing from memory.
+# Format confirmed via NSE Circular No. 62424 (12 Jun 2024): the old
+# `foDDMONbhav.csv.zip` path was retired 08 Jul 2024 in favour of this
+# UDiFF path. Published only after each trading day's close (typically
+# from ~7-8 PM IST onward).
+_BHAVCOPY_FO_URL = "https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+
+
+def _parse_bhavcopy_date(s):
+    s = (s or "").strip()
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized Bhavcopy date format: {s!r}")
+
+
+def fetch_nse_bhavcopy_fo(trade_date, timeout=15):
+    """Downloads and parses one day's official NSE F&O UDiFF Bhavcopy (a
+    zipped EOD settlement CSV covering every listed F&O instrument) for the
+    given date. Returns a list of CSV row dicts, or None on failure (file
+    not yet published, weekend/holiday, network block, format change)."""
+    url = _BHAVCOPY_FO_URL.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
+    try:
+        session = requests.Session()
+        session.headers.update(_NSE_HEADERS)
+        resp = session.get(url, timeout=timeout)
+        resp.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+            with zf.open(csv_name) as f:
+                return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
+    except Exception as e:
+        main.log.warning(f"NSE Bhavcopy fetch failed for {trade_date.date()}: {e}")
+        return None
+
+
+def fetch_latest_nse_bhavcopy_fo(max_days_back=6):
+    """Walks backward from today (skipping the file NSE hasn't published
+    yet for "today" before ~7 PM IST) to find the most recent trading
+    day's F&O Bhavcopy. Returns (rows, trade_date) or (None, None)."""
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    for i in range(max_days_back + 1):
+        candidate = now_ist - timedelta(days=i)
+        if i == 0 and now_ist.time() < dtime(19, 0):
+            continue  # today's file isn't published yet -- skip straight to yesterday
+        rows = fetch_nse_bhavcopy_fo(candidate)
+        if rows:
+            return rows, candidate.date()
+    return None, None
+
+
+def _extract_bhavcopy_snapshot(rows, symbol, expiry_dt):
+    """Same output shape as _extract_expiry_snapshot (PCR/max-pain/top-OI),
+    computed instead from one day's official EOD Bhavcopy rows for a single
+    NIFTY index-options (FinInstrmTp='IDO') expiry."""
+    calls, puts = {}, {}
+    for r in rows:
+        if r.get("TckrSymb", "").strip() != symbol or r.get("FinInstrmTp", "").strip() != "IDO":
+            continue
+        try:
+            if _parse_bhavcopy_date(r.get("XpryDt", "")) != expiry_dt:
+                continue
+            strike = float(r.get("StrkPric") or 0)
+            strike = int(strike) if strike.is_integer() else strike
+            oi = int(float(r.get("OpnIntrst") or 0))
+        except (ValueError, TypeError):
+            continue
+        opt_type = r.get("OptnTp", "").strip()
+        if opt_type == "CE":
+            calls[strike] = oi
+        elif opt_type == "PE":
+            puts[strike] = oi
+
+    total_call_oi = sum(calls.values())
+    total_put_oi = sum(puts.values())
+    pcr_oi = round(total_put_oi / total_call_oi, 2) if total_call_oi else None
+
+    top_calls = sorted(calls.items(), key=lambda kv: kv[1], reverse=True)[:5]
+    top_puts = sorted(puts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+
+    max_pain = None
+    all_strikes = sorted(set(calls) | set(puts))
+    if all_strikes:
+        pain = {
+            k: (
+                sum(oi * max(0, k - s) for s, oi in calls.items())
+                + sum(oi * max(0, s - k) for s, oi in puts.items())
+            )
+            for k in all_strikes
+        }
+        max_pain = min(pain, key=pain.get)
+
+    return {
+        "expiry": expiry_dt.strftime("%d-%b-%Y"),
+        "pcr_oi": pcr_oi,
+        "max_pain": max_pain,
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "top_call_oi": top_calls,
+        "top_put_oi": top_puts,
+    }
+
+
+def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
+    """Fallback path used when the live option-chain JSON fetch failed
+    entirely: pulls the latest available EOD Bhavcopy and fills data["horizons"]
+    from it, clearly tagging every filled horizon as EOD (not live)."""
+    bhav_rows, bhav_date = fetch_latest_nse_bhavcopy_fo()
+    if not bhav_rows:
+        notes.append("EOD Bhavcopy fallback also failed or is unavailable (no file found in the last 6 days).")
+        return False
+
+    try:
+        expiry_dts = {
+            _parse_bhavcopy_date(r.get("XpryDt", ""))
+            for r in bhav_rows
+            if r.get("TckrSymb", "").strip() == symbol and r.get("FinInstrmTp", "").strip() == "IDO"
+        }
+        horizon_dts = _pick_horizon_expiry_dates(expiry_dts)
+        for horizon, dt in horizon_dts.items():
+            snap = _extract_bhavcopy_snapshot(bhav_rows, symbol, dt)
+            snap["source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')})"
+            data["horizons"][horizon] = snap
+
+        if data["spot"] is None:
+            fut_closes = sorted(
+                (
+                    (_parse_bhavcopy_date(r.get("XpryDt", "")), float(r.get("ClsPric") or r.get("SttlmPric") or 0))
+                    for r in bhav_rows
+                    if r.get("TckrSymb", "").strip() == symbol and r.get("FinInstrmTp", "").strip() == "IDF"
+                ),
+                key=lambda t: t[0],
+            )
+            if fut_closes:
+                data["spot"] = fut_closes[0][1]
+                notes.append("Spot figure is a Bhavcopy near-month futures CLOSE proxy, not true cash spot.")
+
+        notes.append(
+            f"Live NSE option-chain feed was unavailable this run -- per-horizon OI/PCR/max-pain "
+            f"were filled from NSE's official EOD Bhavcopy dated {bhav_date.strftime('%d %b %Y')} "
+            f"instead (last trading day's CLOSE, not live/intraday)."
+        )
+        return True
+    except Exception as e:
+        notes.append(f"Bhavcopy was fetched but could not be parsed: {e}")
+        return False
+
+
 def fetch_live_market_data():
     """Top-level orchestrator: pulls Nifty spot, India VIX, and a full
     per-horizon option-chain snapshot (PCR/max-pain/top-OI strikes) BEFORE
     the LLM is ever called, so the model is reasoning over real fetched
     numbers instead of whatever it recalls or half-finds via its own
-    search. Returns a dict; always check "status" ("ok"/"partial"/"failed")
-    and read "notes" for what, if anything, could not be fetched."""
+    search. Tries the live option-chain JSON first; if that's blocked, falls
+    back to NSE's official EOD Bhavcopy before giving up on direct data
+    entirely. Returns a dict; always check "status" ("ok"/"eod_fallback"/
+    "partial"/"failed") and read "notes" for what, if anything, happened."""
     notes = []
     data = {
         "status": "failed",
@@ -217,11 +390,13 @@ def fetch_live_market_data():
     chain = fetch_nse_option_chain("NIFTY")
     if chain is None:
         notes.append(
-            "NSE option-chain fetch failed (blocked, rate-limited, or endpoint "
-            "changed) -- per-horizon OI, PCR, and max-pain will rely entirely "
-            "on the LLM's own live web search this run."
+            "NSE live option-chain fetch failed (blocked, rate-limited, or "
+            "endpoint changed) -- trying the EOD Bhavcopy fallback instead."
         )
-        data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
+        if _fill_horizons_from_bhavcopy(data, notes):
+            data["status"] = "eod_fallback"
+        else:
+            data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
         return data
 
     try:
@@ -241,8 +416,11 @@ def fetch_live_market_data():
             )
         data["status"] = "ok"
     except Exception as e:
-        notes.append(f"NSE option-chain data was fetched but could not be parsed: {e}")
-        data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
+        notes.append(f"NSE option-chain data was fetched but could not be parsed -- trying the EOD Bhavcopy fallback: {e}")
+        if _fill_horizons_from_bhavcopy(data, notes):
+            data["status"] = "eod_fallback"
+        else:
+            data["status"] = "partial" if (data["spot"] or data["vix"]) else "failed"
 
     return data
 
@@ -260,19 +438,26 @@ def format_live_data_block(data):
     if not data or data.get("status") == "failed":
         note_text = "; ".join(data.get("notes", [])) if data else "fetch not attempted"
         return (
-            "LIVE DATA FEED: unavailable this run (direct NSE/Yahoo fetch failed). "
-            f"Notes: {note_text}. You must rely entirely on your own live web "
-            "search for every figure in the REQUIRED LIVE DATA section below, "
-            "and be honest about this in each horizon's data_status field."
+            "LIVE DATA FEED: unavailable this run (direct NSE/Yahoo fetch, and "
+            f"the EOD Bhavcopy fallback, both failed). Notes: {note_text}. You "
+            "must rely entirely on your own live web search for every figure in "
+            "the ADDITIONAL LIVE DATA section below, and be honest about this "
+            "in each horizon's data_status field."
         )
 
     lines = [
-        f"LIVE DATA FEED (fetched directly from NSE India's option-chain API and "
-        f"Yahoo Finance at {data['fetched_at']}, status={data['status']}). Treat "
-        f"every figure below as verified ground truth -- do NOT re-derive or "
-        f"second-guess these via web search. Only web-search for whatever is "
-        f"marked unavailable below, plus qualitative context (FII/DII flows, "
-        f"GIFT Nifty pre-market, US/Asian markets overnight, event risk):",
+        f"LIVE DATA FEED (fetched directly from NSE India and Yahoo Finance at "
+        f"{data['fetched_at']}, status={data['status']}). Treat every figure "
+        f"below as verified ground truth -- do NOT re-derive or second-guess "
+        f"these via web search. Each horizon is tagged with its data source: "
+        f"'live (NSE option-chain API)' means current intraday data -- use "
+        f"data_status='live' for that horizon if nothing else is stale. "
+        f"'EOD Bhavcopy (<date>)' means NSE's official end-of-day settlement "
+        f"file, i.e. the last trading day's CLOSE, not intraday -- for those "
+        f"horizons use data_status='partial' at best and say so in bias_reason. "
+        f"Only web-search for whatever is marked unavailable below, plus "
+        f"qualitative context (FII/DII flows, GIFT Nifty pre-market, US/Asian "
+        f"markets overnight, event risk):",
         f"- Nifty 50 spot: {data.get('spot', 'n/a')}",
         "- India VIX: "
         + str(data.get("vix", "n/a"))
@@ -283,8 +468,9 @@ def format_live_data_block(data):
         if not snap:
             lines.append(f"- {horizon} expiry: not available from the direct feed -- find via web search.")
             continue
+        source = snap.get("source", "live (NSE option-chain API)")
         lines.append(
-            f"- {horizon} expiry ({snap['expiry']}): PCR(OI)={snap.get('pcr_oi', 'n/a')}, "
+            f"- {horizon} expiry ({snap['expiry']}, source: {source}): PCR(OI)={snap.get('pcr_oi', 'n/a')}, "
             f"Max Pain={snap.get('max_pain', 'n/a')}, Total Call OI="
             f"{snap.get('total_call_oi', 0):,}, Total Put OI={snap.get('total_put_oi', 0):,}"
         )
@@ -590,6 +776,7 @@ def _live_feed_html(data, sans):
     status = data.get("status", "failed")
     style = {
         "ok": ("#2F5233", "#E7EEE4", "Live feed OK"),
+        "eod_fallback": ("#8A6D3B", "#F3ECDD", "Live feed down — EOD Bhavcopy used"),
         "partial": ("#A6812F", "#FDF3D9", "Live feed partial"),
         "failed": ("#8B2E2E", "#FBEAEA", "Live feed failed"),
     }.get(status, ("#8A8F9C", "#F4F2ED", status))
@@ -599,7 +786,8 @@ def _live_feed_html(data, sans):
     for horizon in HORIZON_ORDER:
         snap = data.get("horizons", {}).get(horizon)
         if snap:
-            bits.append(f"{horizon} ({snap['expiry']}): PCR {snap.get('pcr_oi', 'n/a')}, Max Pain {snap.get('max_pain', 'n/a')}")
+            src = " [EOD]" if snap.get("source") else ""
+            bits.append(f"{horizon} ({snap['expiry']}){src}: PCR {snap.get('pcr_oi', 'n/a')}, Max Pain {snap.get('max_pain', 'n/a')}")
 
     notes_html = ""
     if data.get("notes"):
@@ -612,6 +800,7 @@ def _live_feed_html(data, sans):
 <div style="margin-bottom:14px;padding:10px 12px;border:1px solid #E7E4DC;border-radius:4px;background:#FAFAF7;">
   <span style="display:inline-block;padding:3px 10px;border-radius:3px;font-size:11px;font-weight:700;color:{color};background:{bg};">{label}</span>
   <span style="font-family:{sans};font-size:10px;color:#8A8F9C;margin-left:8px;">NSE India option-chain API + Yahoo Finance &middot; fetched {_esc(data.get("fetched_at"))}</span>
+
   <p style="margin:6px 0 0;font-family:{sans};font-size:11px;line-height:1.6;color:#4A5063;">{_esc(" | ".join(bits))}</p>
   {notes_html}
 </div>
@@ -774,7 +963,7 @@ def run():
         )
         sys.exit(1)
 
-    live_feed_ok = live_data.get("status") in ("ok", "partial") and (
+    live_feed_ok = live_data.get("status") in ("ok", "eod_fallback", "partial") and (
         live_data.get("spot") or live_data.get("horizons")
     )
     if not used_live_search and not live_feed_ok and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
