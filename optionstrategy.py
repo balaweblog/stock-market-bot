@@ -104,16 +104,6 @@ _NSE_HEADERS = {
 }
 
 
-# Optional proxy for NSE requests only (Yahoo Finance / everything else is
-# unaffected). Set NSE_PROXY_URL to a residential/non-CI proxy or VPN egress
-# (e.g. "http://user:pass@proxyhost:port") if NSE's WAF is blocking your
-# runner's IP outright -- that's the one thing that can actually restore the
-# live feed, since no amount of header/retry tuning changes which IP NSE sees.
-# Left unset, requests go out directly exactly as before.
-_NSE_PROXY_URL = os.getenv("NSE_PROXY_URL", "").strip()
-_NSE_PROXIES = {"http": _NSE_PROXY_URL, "https": _NSE_PROXY_URL} if _NSE_PROXY_URL else None
-
-
 def _describe_http_error(e):
     """Pulls out the bits that actually explain an NSE fetch failure --
     HTTP status code and a short body snippet for HTTPError, or the
@@ -176,8 +166,6 @@ def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
         try:
             session = requests.Session()
             session.headers.update(_NSE_HEADERS)
-            if _NSE_PROXIES:
-                session.proxies.update(_NSE_PROXIES)
             _nse_warm_session(session, timeout, "/option-chain")
             resp = session.get(
                 f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
@@ -197,7 +185,6 @@ def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
                 main.log.warning(
                     f"NSE option-chain fetch for {symbol}: error looks like a block "
                     f"rather than a transient blip -- skipping remaining retries."
-                    + (" Set NSE_PROXY_URL to route around it." if not _NSE_PROXIES else "")
                 )
                 break
     main.log.warning(
@@ -385,8 +372,6 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
             try:
                 session = requests.Session()
                 session.headers.update(_NSE_HEADERS)
-                if _NSE_PROXIES:
-                    session.proxies.update(_NSE_PROXIES)
                 resp = session.get(url, timeout=timeout)
                 resp.raise_for_status()
                 with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -406,7 +391,6 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
     main.log.warning(
         f"NSE Bhavcopy fetch failed for {trade_date.date()} across all hosts "
         f"({', '.join(_BHAVCOPY_FO_HOSTS)}): {_describe_http_error(last_err)}"
-        + (" Set NSE_PROXY_URL to route around a possible IP block." if not _NSE_PROXIES else "")
     )
     return None
 
