@@ -1241,7 +1241,84 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     return " | ".join(parts), any_leg_inside_band
 
 
-def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
+def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix):
+    """Replaces the model's unexplained High/Medium/Low self-rating with a
+    percentage score built from checks that are actually verifiable from
+    real fetched data -- the same "code wins over the model's own claim"
+    principle used for max_loss/Greeks/POP elsewhere in this file
+    (issue #7). Returns (label, pct, checks) where checks is a list of
+    (passed: bool, reason: str) tuples suitable for a checklist display.
+    Checks included (only when they're actually computable this run):
+      - Short strike aligned with the top open-interest wall on its side
+      - Max Pain sits inside the structure's profit zone (only evaluated
+        for two-breakeven structures like Iron Condor/Butterfly, where
+        "profit zone" is unambiguous)
+      - Live option-chain data was used (vs an EOD Bhavcopy fallback,
+        which carries no IV/live premiums)
+      - VIX regime is calm (<20) at the time of the fetch
+    A missing/unusable input for a check means that check is either
+    counted as failed (VIX unavailable) or omitted from the denominator
+    (Max Pain check on single-breakeven structures, where "profit zone"
+    isn't well-defined) -- never silently assumed favorable."""
+    checks = []
+
+    top_call_oi = horizon_snap.get("top_call_oi") or []
+    top_put_oi = horizon_snap.get("top_put_oi") or []
+    top_by_type = {
+        "CE": top_call_oi[0][0] if top_call_oi else None,
+        "PE": top_put_oi[0][0] if top_put_oi else None,
+    }
+    short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
+    oi_aligned = any(top_by_type.get(l["type"]) == l["strike"] for l in short_legs) if short_legs else False
+    checks.append((
+        oi_aligned,
+        "Short strike aligned with the top open-interest wall" if oi_aligned
+        else "Short strike is not at the top open-interest wall",
+    ))
+
+    max_pain = horizon_snap.get("max_pain")
+    if max_pain is not None and breakevens and len(breakevens) >= 2:
+        lo, hi = min(breakevens), max(breakevens)
+        max_pain_aligned = lo <= max_pain <= hi
+        checks.append((
+            max_pain_aligned,
+            "Max Pain aligned with the structure's profit zone" if max_pain_aligned
+            else "Max Pain sits outside the structure's profit zone",
+        ))
+    # else: not enough info to call this one either way (e.g. a single-
+    # breakeven vertical spread) -- omitted rather than guessed.
+
+    checks.append((
+        not is_eod,
+        "Live option-chain data used" if not is_eod
+        else "Live chain unavailable this run (EOD Bhavcopy fallback used)",
+    ))
+
+    if vix is not None:
+        calm = vix < 20
+        checks.append((
+            calm,
+            f"Calm volatility regime (VIX {vix:g} < 20)" if calm
+            else f"Elevated volatility (VIX {vix:g} \u2265 20) -- wider realistic price swings",
+        ))
+    else:
+        checks.append((False, "VIX unavailable this run"))
+
+    total = len(checks)
+    passed = sum(1 for ok, _ in checks if ok)
+    pct = round(100 * passed / total) if total else None
+    if pct is None:
+        label = "n/a"
+    elif pct >= 75:
+        label = "High"
+    elif pct >= 45:
+        label = "Medium"
+    else:
+        label = "Low"
+    return label, pct, checks
+
+
+def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     """Mutates horizon_dict in place: recomputes max_loss / max_profit /
     max_loss_pct_capital / max_profit_pct_capital / breakeven / gap_risk /
     adjustment_trigger / net Greeks / probability of profit / margin+ROM
@@ -1270,6 +1347,10 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["probability_of_profit"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
+        horizon_dict["capital_efficiency"] = "n/a"
+        horizon_dict["confidence"] = "Low"
+        horizon_dict["confidence_pct"] = 0
+        horizon_dict["confidence_reasons"] = [(False, f"Trade could not be verified: {result['reason']}")]
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
         horizon_dict["_net_gamma"] = None
@@ -1290,6 +1371,10 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["probability_of_profit"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
+        horizon_dict["capital_efficiency"] = "n/a"
+        horizon_dict["confidence"] = "Low"
+        horizon_dict["confidence_pct"] = 0
+        horizon_dict["confidence_reasons"] = [(False, "Rejected: legs do not form a capped-risk structure")]
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
         horizon_dict["_verified_max_loss_inr"] = float("inf")
         horizon_dict["_net_gamma"] = None
@@ -1422,6 +1507,26 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         f"realized returns may differ due to early exit, margin changes, or assignment risk)"
         if rom is not None else "n/a"
     )
+    # Institutional desks watch both sides of margin efficiency, not just the
+    # upside: Profit/Margin (== Return on Margin, best case) and Risk/Margin
+    # (worst case) together show how much of the capital actually locked up
+    # is exposed to loss vs reward -- a structure can have an attractive ROM
+    # while still risking a large share of its own margin (issue #9).
+    risk_margin_pct = round(max_loss / margin * 100, 1) if margin else None
+    if rom is not None and risk_margin_pct is not None:
+        horizon_dict["capital_efficiency"] = (
+            f"Profit/Margin ~{rom:.1f}% · Risk/Margin ~{risk_margin_pct:.1f}% "
+            f"(share of locked-up margin at stake if max loss is hit)"
+        )
+    else:
+        horizon_dict["capital_efficiency"] = "n/a"
+
+    conf_label, conf_pct, conf_checks = compute_confidence(
+        priced_legs, horizon_snap, result["breakevens"], is_eod, vix
+    )
+    horizon_dict["confidence"] = conf_label
+    horizon_dict["confidence_pct"] = conf_pct
+    horizon_dict["confidence_reasons"] = conf_checks
 
     horizon_dict["verification"] = (
         f"✅ Verified from {premium_label}: net {'credit' if net_premium >= 0 else 'debit'} "
@@ -1461,7 +1566,7 @@ NON-NEGOTIABLE CONSTRAINTS
 
 3. CAPITAL PROTECTION RULES.
    - Max capital at risk per horizon must not exceed {PER_HORIZON_CAP_PCT:.0f}% of a hypothetical total options-trading capital pool.
-   - Aggregate capital at risk across all four horizons combined must not exceed {AGGREGATE_CAP_PCT:.0f}%.
+   - Worst-case combined maximum loss across all four horizons (the plain sum of each horizon's own max loss, as if all were hit simultaneously -- a conservative ceiling, not a probabilistic portfolio-risk estimate) must not exceed {AGGREGATE_CAP_PCT:.0f}%.
    - Do NOT write a stop-loss/adjustment trigger yourself -- a standard one (short-strike breach, or loss reaching a set multiple of credit/premium) is generated in code from your chosen strikes after you respond.
    - Do NOT compute the rupee max loss/profit or the % of capital yourself -- those are calculated from real fetched premiums after you respond (see OUTPUT FORMAT). Focus only on choosing strikes/legs that keep risk within the caps once priced.
 
@@ -1490,7 +1595,7 @@ ADDITIONAL LIVE DATA TO SEARCH FOR (only for what the LIVE DATA FEED above does 
 - Any major near-term event risk (RBI policy, US Fed meeting, major earnings cluster, budget/election dates) that falls within each horizon's window
 - Use ONLY primary/official sources: NSE option chain and Bhavcopy, NSE market statistics, India VIX, NSE FII/DII statistics, GIFT Nifty/SGX derivatives data, RBI's policy calendar, company earnings calendars, and official exchange circulars. Never cite social media (Instagram, YouTube, X/Twitter), influencer "prediction" videos, or unsourced broker marketing content as a basis for any figure or bias.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML). NOTE: max_loss, max_profit, the two pct_capital fields, breakeven, gap_risk, net Greeks (delta/theta/vega/gamma), probability of profit, margin required, and return on margin are NOT requested below -- they are all calculated from real fetched premiums/IVs in code after parsing your "legs" field, specifically to avoid the arithmetic errors that come from an LLM inventing option payoff numbers. Your job is only to choose the strikes; be precise and unambiguous in "legs" (format: "Sell 25000 CE, Buy 25200 CE" -- always "Buy"/"Sell", a strike from the live data, and "CE"/"PE"):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML). NOTE: max_loss, max_profit, the two pct_capital fields, breakeven, gap_risk, net Greeks (delta/theta/vega/gamma), probability of profit, margin required, return on margin, capital efficiency, and the confidence score are NOT requested below -- they are all calculated from real fetched premiums/IVs in code after parsing your "legs" field, specifically to avoid the arithmetic errors that come from an LLM inventing option payoff numbers. Your job is only to choose the strikes; be precise and unambiguous in "legs" (format: "Sell 25000 CE, Buy 25200 CE" -- always "Buy"/"Sell", a strike from the live data, and "CE"/"PE"):
 
 {{
   "horizons": [
@@ -1503,14 +1608,14 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
       "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
       "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'anchored beyond the nearest major OI wall on this side'. Do NOT state whether the strike is inside or outside the expected-move band -- that is computed exactly from real fetched premiums and appended automatically after your text; a guessed band claim here risks contradicting it.",
-      "confidence": "One of: High / Medium / Low",
+      "confidence": "One of: High / Medium / Low -- your best qualitative guess, but note this is DISCARDED and replaced with a percentage score computed in code from verifiable signals (OI alignment, Max Pain, live-vs-EOD data, VIX regime), same as max_loss/Greeks/POP above.",
       "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- be honest here"
     }},
     {{ "horizon": "Monthly", ... same fields ... }},
     {{ "horizon": "Quarterly", ... same fields ... }},
     {{ "horizon": "Annual", ... same fields ... }}
   ],
-  "portfolio_view": "One paragraph on whether the combined structure over- or under-hedges overall market gap risk across the four horizons, and how the horizons relate to each other qualitatively (e.g. does Weekly's directional stance conflict with Monthly/Quarterly's range-bound stance). Do NOT state or estimate a net long/short gamma verdict for the combined portfolio -- that figure is computed in code from real per-leg Black-Scholes gamma (live IV) after you respond, and any gamma claim you make here will be discarded. Do NOT state or estimate the aggregate capital-at-risk percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
+  "portfolio_view": "One paragraph on whether the combined structure over- or under-hedges overall market gap risk across the four horizons, and how the horizons relate to each other qualitatively (e.g. does Weekly's directional stance conflict with Monthly/Quarterly's range-bound stance). Do NOT state or estimate a net long/short gamma verdict for the combined portfolio -- that figure is computed in code from real per-leg Black-Scholes gamma (live IV) after you respond, and any gamma claim you make here will be discarded. Do NOT state or estimate the worst-case combined max-loss percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
 }}
 """
 
@@ -1599,6 +1704,27 @@ def _confidence_badge(conf):
     return _badge(conf or "—", color, bg)
 
 
+def _confidence_cell_html(h, sans):
+    """Badge + percentage + a ✓/✗ checklist of the verifiable reasons
+    behind compute_confidence()'s score (issue #7) -- replaces the old
+    bare 'Medium' badge with something a reader can actually audit."""
+    badge = _confidence_badge(h.get("confidence"))
+    pct = h.get("confidence_pct")
+    pct_html = (
+        f' <span style="font-family:{sans};font-size:12px;color:#4A5063;">({pct}%)</span>'
+        if isinstance(pct, (int, float)) else ""
+    )
+    reasons = h.get("confidence_reasons") or []
+    if not reasons:
+        return f"{badge}{pct_html}"
+    items = "".join(
+        f'<div style="font-family:{sans};font-size:11px;color:{"#2F5233" if ok else "#8B2E2E"};margin-top:3px;">'
+        f'{"✓" if ok else "✗"} {html.escape(str(reason))}</div>'
+        for ok, reason in reasons
+    )
+    return f"{badge}{pct_html}{items}"
+
+
 def _data_status_badge(status):
     key = str(status or "").strip().lower()
     color, bg, label = _DATA_STATUS_STYLE.get(key, ("#8A8F9C", "#F4F2ED", status or "—"))
@@ -1646,9 +1772,10 @@ def _horizon_card_html(h, sans, serif):
         row("Net Greeks (per lot)", "net_greeks"),
         row("Margin Required", "margin_required"),
         row("Return on Margin", "return_on_margin"),
+        row("Capital Efficiency", "capital_efficiency"),
         row("Gap Risk", "gap_risk"),
         row("Adjustment / Exit Trigger", "adjustment_trigger"),
-        raw_row("Confidence", _confidence_badge(h.get("confidence"))),
+        raw_row("Confidence", _confidence_cell_html(h, sans)),
         raw_row("Data Freshness", _data_status_badge(h.get("data_status"))),
         row("Payoff Verification", "verification"),
     ])
@@ -1800,7 +1927,10 @@ def render_strategy_summary_table(horizons):
         exp_move = _extract(_EXPECTED_MOVE_RE, h.get("expected_move"))
         pop = _extract(_POP_RE, h.get("probability_of_profit"))
         max_risk = _extract(_MAX_LOSS_RE, h.get("max_loss"))
+        conf_pct = h.get("confidence_pct")
         confidence = _esc(h.get("confidence"))
+        if isinstance(conf_pct, (int, float)) and confidence != "—":
+            confidence = f"{confidence} ({conf_pct}%)"
         cells = "".join([
             _cell(f"<b>{html.escape(label)}</b>"),
             _cell(html.escape(strategy)),
@@ -1863,9 +1993,9 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
     # computed from the same verified figure shown in the badge above it, so
     # it can never contradict what's displayed next to it (issue #1).
     verdict = (
-        f"⚠ EXCEEDS the {AGGREGATE_CAP_PCT:.0f}% aggregate cap -- reduce position size before entering."
+        f"⚠ EXCEEDS the {AGGREGATE_CAP_PCT:.0f}% worst-case combined cap -- reduce position size before entering."
         if over_cap else
-        f"✅ Stays within the {AGGREGATE_CAP_PCT:.0f}% aggregate cap."
+        f"✅ Stays within the {AGGREGATE_CAP_PCT:.0f}% worst-case combined cap."
     )
     # Gamma is a real, code-computed number (from live IV via apply_verified_
     # payoff), so it gets the same treatment as the aggregate-cap verdict
@@ -1878,9 +2008,14 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         f'border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;">'
         f'<div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;'
         f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Portfolio View '
-        f'&nbsp;&middot;&nbsp; Aggregate Capital at Risk: '
+        f'&nbsp;&middot;&nbsp; Worst-Case Combined Max Loss: '
         f'<span style="color:{agg_color};">{agg_display}%</span> '
         f'(cap {AGGREGATE_CAP_PCT:.0f}%)</div>'
+        f'<div style="font-family:{sans};font-size:11px;color:#8A8F9C;font-style:italic;margin-bottom:8px;">'
+        f'This is a conservative ceiling -- the plain sum of each horizon\'s own max loss, as if Weekly, '
+        f'Monthly, Quarterly, and Annual ALL hit max loss simultaneously. It is not a probabilistic '
+        f'estimate of actual combined portfolio risk, which would normally be lower since the horizons '
+        f'won\'t all lose the maximum at the same time.</div>'
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(gamma_summary)}</div>'
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;margin-top:8px;">{_esc(portfolio_text)}</div>'
         f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{agg_color};margin-top:8px;">{verdict}</div>'
@@ -2109,6 +2244,7 @@ def finalize_horizons(horizons, live_data):
             "probability_of_profit": None,
             "margin_required": "n/a",
             "return_on_margin": "n/a",
+            "capital_efficiency": "n/a",
             "confidence": "n/a",
             "data_status": "unavailable",
             "verification": "Omitted: long-dated option chain unavailable or insufficiently liquid.",
@@ -2120,7 +2256,7 @@ def finalize_horizons(horizons, live_data):
         if h.get("_verified_max_loss_inr") is not None:
             continue  # Annual placeholder already finalized above
         snap = (live_data.get("horizons") or {}).get(name, {})
-        apply_verified_payoff(h, snap, live_data.get("spot"))
+        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
 
     for h in by_name.values():
         v = h.get("_verified_max_loss_inr", 0.0)
@@ -2341,7 +2477,7 @@ def run():
         horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data)
         if over_cap:
             main.log.warning(
-                f"Computed aggregate capital at risk ({aggregate_pct}%) exceeds the "
+                f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "
                 f"{AGGREGATE_CAP_PCT:.0f}% cap -- flagging in the report rather than silently sending."
             )
         horizons_html = render_horizons_html(horizons, aggregate_pct, portfolio_view)
