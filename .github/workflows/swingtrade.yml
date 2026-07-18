@@ -37,4 +37,4 @@ jobs:
 
 
       - name: Run Option Trade
-        run: python optionstrategy.py
+        run: python swing_trade_advisor.py
