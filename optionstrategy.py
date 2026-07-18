@@ -48,6 +48,7 @@ import sys
 import json
 import math
 import html
+import time
 import zipfile
 import traceback
 from datetime import datetime, timedelta, time as dtime
@@ -93,27 +94,79 @@ _NSE_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://www.nseindia.com/option-chain",
+    # NSE's edge/WAF checks these Fetch-Metadata headers on top of UA/Referer;
+    # a request missing them looks scripted even with a browser UA set.
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Connection": "keep-alive",
+    "DNT": "1",
 }
 
 
-def fetch_nse_option_chain(symbol="NIFTY", timeout=12):
+def _describe_http_error(e):
+    """Pulls out the bits that actually explain an NSE fetch failure --
+    HTTP status code and a short body snippet for HTTPError, or the
+    exception class name for everything else (timeout, connection reset,
+    DNS failure, etc.) -- so logs say *why* it failed instead of just
+    that it did. A bare `str(e)` on a requests.HTTPError often just says
+    "403 Client Error: Forbidden for url: ..." with no body context."""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        snippet = ""
+        try:
+            snippet = resp.text[:200].replace("\n", " ")
+        except Exception:
+            pass
+        return f"HTTP {resp.status_code} ({type(e).__name__}){' -- ' + snippet if snippet else ''}"
+    return f"{type(e).__name__}: {e}"
+
+
+def _nse_warm_session(session, timeout, referer_path="/option-chain"):
+    """Sets session cookies the way a real browser would: land on the NSE
+    homepage first (this is where the anti-bot cookie is actually issued),
+    then the specific page whose Referer the API call will send. Hitting
+    only the sub-page (as a single warm-up GET) skips the cookie NSE's edge
+    sets on the root domain, which is a common cause of a 401/403 on the
+    very next API call even with a correct-looking Referer header."""
+    session.get("https://www.nseindia.com/", timeout=timeout)
+    time.sleep(0.6)  # brief pause -- an instant homepage->API hit itself looks scripted
+    session.get(f"https://www.nseindia.com{referer_path}", timeout=timeout)
+    time.sleep(0.6)
+
+
+def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
     """Pulls the live, full option chain (all listed expiries, every
     strike's OI/changeInOI/IV/LTP for CE and PE) straight from NSE's
     option-chain JSON endpoint. Returns the parsed dict, or None on any
-    failure (network, block, non-200, bad JSON)."""
-    try:
-        session = requests.Session()
-        session.headers.update(_NSE_HEADERS)
-        session.get("https://www.nseindia.com/option-chain", timeout=timeout)  # sets cookies
-        resp = session.get(
-            f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        main.log.warning(f"NSE option-chain fetch failed for {symbol}: {e}")
-        return None
+    failure (network, block, non-200, bad JSON). Retries a couple of times
+    with a fresh session + backoff, since a single 401/403/timeout from
+    NSE's edge is often transient rather than a permanent block."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            session = requests.Session()
+            session.headers.update(_NSE_HEADERS)
+            _nse_warm_session(session, timeout, "/option-chain")
+            resp = session.get(
+                f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            last_err = e
+            main.log.warning(
+                f"NSE option-chain fetch attempt {attempt}/{max_attempts} failed for "
+                f"{symbol}: {_describe_http_error(e)}"
+            )
+            if attempt < max_attempts:
+                time.sleep(1.5 * attempt)  # linear backoff between attempts
+    main.log.warning(
+        f"NSE option-chain fetch failed for {symbol} after {max_attempts} attempts: "
+        f"{_describe_http_error(last_err)}"
+    )
+    return None
 
 
 def _parse_nse_date(d):
@@ -257,7 +310,15 @@ def _extract_expiry_snapshot(rows, expiry_str):
 # `foDDMONbhav.csv.zip` path was retired 08 Jul 2024 in favour of this
 # UDiFF path. Published only after each trading day's close (typically
 # from ~7-8 PM IST onward).
-_BHAVCOPY_FO_URL = "https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
+#
+# NSE has served this same UDiFF filename from more than one archive
+# subdomain over time (nsearchives.nseindia.com is the one referenced in
+# NSE's own circular/all-reports page; archives.nseindia.com is an older
+# host some third-party downloaders still use successfully for the same
+# path). Trying both -- in this order -- means a block, DNS hiccup, or
+# silent host retirement on one doesn't take down the whole fallback.
+_BHAVCOPY_FO_HOSTS = ["nsearchives.nseindia.com", "archives.nseindia.com"]
+_BHAVCOPY_FO_PATH = "/content/fo/BhavCopy_NSE_FO_0_0_0_{yyyymmdd}_F_0000.csv.zip"
 
 
 def _parse_bhavcopy_date(s):
@@ -270,24 +331,40 @@ def _parse_bhavcopy_date(s):
     raise ValueError(f"Unrecognized Bhavcopy date format: {s!r}")
 
 
-def fetch_nse_bhavcopy_fo(trade_date, timeout=15):
+def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
     """Downloads and parses one day's official NSE F&O UDiFF Bhavcopy (a
     zipped EOD settlement CSV covering every listed F&O instrument) for the
     given date. Returns a list of CSV row dicts, or None on failure (file
-    not yet published, weekend/holiday, network block, format change)."""
-    url = _BHAVCOPY_FO_URL.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
-    try:
-        session = requests.Session()
-        session.headers.update(_NSE_HEADERS)
-        resp = session.get(url, timeout=timeout)
-        resp.raise_for_status()
-        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-            csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
-            with zf.open(csv_name) as f:
-                return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
-    except Exception as e:
-        main.log.warning(f"NSE Bhavcopy fetch failed for {trade_date.date()}: {e}")
-        return None
+    not yet published, weekend/holiday, network block, format change).
+    Tries each candidate archive host in turn, with a short retry on each,
+    before giving up on this date entirely."""
+    date_path = _BHAVCOPY_FO_PATH.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
+    last_err = None
+    for host in _BHAVCOPY_FO_HOSTS:
+        url = f"https://{host}{date_path}"
+        for attempt in range(1, max_attempts_per_host + 1):
+            try:
+                session = requests.Session()
+                session.headers.update(_NSE_HEADERS)
+                resp = session.get(url, timeout=timeout)
+                resp.raise_for_status()
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                    csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+                    with zf.open(csv_name) as f:
+                        return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
+            except Exception as e:
+                last_err = e
+                main.log.warning(
+                    f"NSE Bhavcopy fetch failed for {trade_date.date()} via {host} "
+                    f"(attempt {attempt}/{max_attempts_per_host}): {_describe_http_error(e)}"
+                )
+                if attempt < max_attempts_per_host:
+                    time.sleep(1.0 * attempt)
+    main.log.warning(
+        f"NSE Bhavcopy fetch failed for {trade_date.date()} across all hosts "
+        f"({', '.join(_BHAVCOPY_FO_HOSTS)}): {_describe_http_error(last_err)}"
+    )
+    return None
 
 
 def fetch_latest_nse_bhavcopy_fo(max_days_back=6):
