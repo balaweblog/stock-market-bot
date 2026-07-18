@@ -1,11 +1,6 @@
 name: Swing Trade Advisor Agent
 on:
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Write swing_trade_report.html instead of sending an email"
-        required: false
-        default: "false"
 
 permissions:
   contents: read
@@ -41,12 +36,5 @@ jobs:
 
 
 
-      - name: Run Swing Trade Advisor
-        run: python swing_trade_advisor.py
-
-      - name: Upload dry-run report
-        if: ${{ github.event.inputs.dry_run == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: swing-trade-report
-          path: swing_trade_report.html
+      - name: Run Option Trade
+        run: python optionstrategy.py
