@@ -58,13 +58,29 @@ def fetch_index_context(index_symbol="^NSEI", period="180d"):
 
         df["return_20d"] = df["close"].pct_change(20)
         df["return_50d"] = df["close"].pct_change(50)
-        trend = "bullish" if df["return_20d"].iloc[-1] > 0 and df["return_50d"].iloc[-1] > 0 else "bearish"
+        r20 = df["return_20d"].iloc[-1]
+        r50 = df["return_50d"].iloc[-1]
+
+        # Require a meaningful move (>1%) in both windows before calling it
+        # bullish/bearish -- previously any positive-vs-positive combo (even
+        # +0.01%) counted as "bullish", so nearly every symbol landed there.
+        # NaN returns (not enough history) now report "unknown" instead of
+        # silently falling into "bearish".
+        NEUTRAL_BAND = 0.01
+        if pd.isna(r20) or pd.isna(r50):
+            trend = "unknown"
+        elif r20 > NEUTRAL_BAND and r50 > NEUTRAL_BAND:
+            trend = "bullish"
+        elif r20 < -NEUTRAL_BAND and r50 < -NEUTRAL_BAND:
+            trend = "bearish"
+        else:
+            trend = "neutral"
 
         return {
             "index_symbol": index_symbol,
             "trend": trend,
-            "return_20d": round(float(df["return_20d"].iloc[-1] or 0.0), 4),
-            "return_50d": round(float(df["return_50d"].iloc[-1] or 0.0), 4),
+            "return_20d": round(float(r20), 4) if pd.notna(r20) else 0.0,
+            "return_50d": round(float(r50), 4) if pd.notna(r50) else 0.0,
         }
     except Exception:
         return {
@@ -117,7 +133,20 @@ def build_market_context(symbol):
     market = classify_market(symbol)
     benchmark_symbol = BENCHMARK_INDEX_BY_MARKET.get(market, "^NSEI")
 
-    context = fetch_index_context(index_symbol=benchmark_symbol)
+    # PREVIOUS BUG: this called fetch_index_context(benchmark_symbol) only,
+    # so every stock in a market inherited the *index's* trend (Nifty for
+    # all India stocks, S&P for all US stocks) instead of its own. Since
+    # both indices have been broadly trending up, "Trend" showed "bullish"
+    # for almost every stock regardless of how that stock itself was doing.
+    # Now we compute the trend from the stock's own price history, and keep
+    # the benchmark's trend as separate, clearly-labeled context.
+    context = fetch_index_context(index_symbol=symbol)
+    benchmark_context = fetch_index_context(index_symbol=benchmark_symbol)
+
     context["sector"] = sector or "unknown"
     context["industry"] = industry or "unknown"
+    context["benchmark_index"] = benchmark_symbol
+    context["benchmark_trend"] = benchmark_context.get("trend")
+    context["benchmark_return_20d"] = benchmark_context.get("return_20d")
+    context["benchmark_return_50d"] = benchmark_context.get("return_50d")
     return context

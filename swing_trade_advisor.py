@@ -69,7 +69,7 @@ Mandatory Analysis Parameters:
 - Quarterly Performance: Highly Positive -- Latest Quarterly Net Profit and Revenue growth must exceed the 20% YoY threshold, with positive margin expansion.
 - Technical Setup (3-5M View): Strong & Sustainable -- Price must be trading above its 20-week and 50-week Simple Moving Averages (SMAs). Use RSI on the weekly chart (must be trending up but below 70 for entry) and MACD for a bullish crossover confirmation.
 - Market/News Sentiment: Overwhelmingly Positive -- Search for recent positive news catalysts (analyst upgrades, sector tailwinds, large orders) that support the intermediate-term view. Check institutional activity (FII/DII) for confidence.
-- Risk Management: Pro-Grade Risk/Reward -- The setup must provide a minimum Risk/Reward Ratio of 1:2.5 based on the proposed Stop-Loss (SL) and Target (T1/T2) levels.
+- Risk Management: Pro-Grade Risk/Reward -- The setup must provide a minimum Risk/Reward Ratio of 1:2.5 based on the proposed Stop-Loss (SL) and Target (T1/T2) levels. State this explicitly as risk_reward_ratio.
 - Data Recency: Use stock prices, news, and financial data as of {today_str}.
 
 Provide the analysis for TWO stocks -- one based on the highest conviction strategy from the list above, and the second from a different strategy if possible.
@@ -85,6 +85,10 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "entry_date": "Targeted entry date",
       "exit_date": "Expected exit date, 3-5 months from entry",
       "strategy_type": "Strategy name used",
+      "confidence_score": "Your conviction in this setup, as a number out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
+      "risk_level": "One word: 'Medium' or 'High' -- overall risk of this specific trade",
+      "key_catalysts": "2-4 near-term catalysts driving the thesis, comma-separated, e.g. 'Earnings, AI Chip Launch, Fed Meeting'",
+      "risk_reward_ratio": "e.g. '1 : 2.5', derived from the stop-loss and target levels below",
       "upside_target_pct": "Favourable % for 3-5 months",
       "stop_loss_pct": "Risk % (Stop-Loss)",
       "target1_pct": "Expected Profit % (T1)",
@@ -588,6 +592,36 @@ def _attach_live_prices(stocks):
     return stocks
 
 
+def _confidence_display(score):
+    """Turns a 0-10 confidence_score into '⭐⭐⭐⭐⭐ (8.8/10)' -- 5 stars max,
+    filled proportionally (score/2, rounded), score shown to 1 decimal."""
+    try:
+        s = float(str(score).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+    s = max(0.0, min(10.0, s))
+    filled = max(0, min(5, round(s / 2)))
+    stars = "⭐" * filled + "☆" * (5 - filled)
+    return f"{stars} ({s:.1f}/10)"
+
+
+def _risk_level_badge(level):
+    """Colored pill for 'Medium'/'High' (falls back to a plain dash for
+    anything else so an unexpected LLM value never renders broken HTML)."""
+    text = (level or "").strip()
+    low = text.lower()
+    if "high" in low:
+        color, bg = "#8B2E2E", "#FBEAEA"
+    elif "med" in low:
+        color, bg = "#A6812F", "#FDF3D9"
+    else:
+        return "—"
+    return (
+        f'<span style="display:inline-block;padding:3px 10px;border-radius:3px;'
+        f'font-size:11px;font-weight:700;color:{color};background:{bg};">{html.escape(text)}</span>'
+    )
+
+
 def render_stock_table_html(stocks):
     """Builds the styled HTML table locally from parsed stock data, instead
     of asking the LLM to reproduce the ~7KB inline-styled template in every
@@ -615,9 +649,27 @@ def render_stock_table_html(stocks):
             f'color:#4A5063;border-top:1px solid #EDEAE2;">{label}</td>{cells}</tr>'
         )
 
+    def raw_row(label, cell_html_fn):
+        """Like row(), but cell_html_fn(stock) returns ready-made HTML for
+        each cell instead of plain text -- used for the confidence stars
+        and the risk-level badge, which aren't safe to run through esc()."""
+        cells = "".join(
+            f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html_fn(stock) or "—"}</td>'
+            for stock in (a, b)
+        )
+        return (
+            f'<tr><td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#4A5063;border-top:1px solid #EDEAE2;">{label}</td>{cells}</tr>'
+        )
+
     rows = "".join([
         row("Name of the Stock", "name", bold=True),
         row("Current Market Price", "current_price_display", value_color="#14213D", bold=True),
+        raw_row("Confidence Score", lambda s: _confidence_display(s.get("confidence_score"))),
+        raw_row("Risk Level", lambda s: _risk_level_badge(s.get("risk_level"))),
+        row("Key Catalysts", "key_catalysts"),
+        row("Risk : Reward", "risk_reward_ratio", value_color="#14213D", bold=True),
         row("Allocation (% of capital)", "allocation_pct"),
         row("Entry Date (Targeted)", "entry_date"),
         row("Exit Date (Expected)", "exit_date"),
@@ -635,11 +687,54 @@ def render_stock_table_html(stocks):
         for stock in (a, b) if stock
     )
 
+    execution_plans = "".join(
+        _trade_execution_plan_html(stock, sans) for stock in (a, b) if stock
+    )
+
     return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
 <tr style="background:#14213D;"><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Parameter</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock A</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock B</td></tr>
 {rows}
 </table>
 <div style="margin-top:14px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong>{rationale_items}</div>
+{execution_plans}
+"""
+
+
+def _trade_execution_plan_html(stock, sans):
+    """Per-stock Action/Rule execution playbook. The rules themselves are a
+    fixed, generic scaling plan (not something the LLM is asked to invent),
+    with that stock's own T1/T2 substituted in wherever the rule refers to
+    a specific target."""
+    name = html.escape(str(stock.get("name") or "").strip() or "This stock")
+    t1 = str(stock.get("target1_pct") or "").strip() or "Target 1"
+    t2 = str(stock.get("target2_pct") or "").strip() or "Target 2"
+
+    plan_rows = [
+        ("Initial Buy", "50% at entry"),
+        ("Add Position", "25% on 3–5% pullback"),
+        ("Profit Booking", f"Sell 50% at Target 1 ({html.escape(t1)})"),
+        ("Final Exit", f"Sell remaining at Target 2 ({html.escape(t2)}) or trailing stop"),
+        ("Stop Loss", "Exit immediately if SL is hit"),
+    ]
+    rows_html = "".join(
+        f'<tr><td style="padding:6px 10px;font-size:12px;font-weight:700;font-family:{sans};'
+        f'color:#14213D;border-top:1px solid #EDEAE2;">{action}</td>'
+        f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+        f'color:#4A5063;border-top:1px solid #EDEAE2;">{rule}</td></tr>'
+        for action, rule in plan_rows
+    )
+
+    return f"""
+<div style="margin-top:18px;">
+  <div style="font-family:{sans};font-size:12px;font-weight:700;color:#14213D;margin-bottom:6px;">Trade Execution Plan &mdash; {name}</div>
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
+    <tr style="background:#F4F2ED;">
+      <td style="padding:7px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;">Action</td>
+      <td style="padding:7px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;">Rule</td>
+    </tr>
+    {rows_html}
+  </table>
+</div>
 """
 
 

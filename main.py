@@ -1775,7 +1775,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                     <td style="height:3px;line-height:3px;font-size:0;background:{'#8B2E2E' if 'sell' in signal.lower() else '#A6812F' if 'hold' in signal.lower() else '#2F5233'};border-radius:6px 6px 0 0;">&nbsp;</td>
                 </tr>
                 <tr>
-                    <td style="padding:16px;">
+                    <td style="padding:16px 16px 0;">
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
                                 <td style="vertical-align:top;">
@@ -1790,6 +1790,10 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                 </td>
                             </tr>
                         </table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding:0 16px;">
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#4A5063;">
                             <tr>
                                 <td style="padding:6px 0;width:50%;"><strong>Current Price</strong><div style="color:#0f172a;margin-top:4px;">{round(latest['close'],2)}</div></td>
@@ -1818,8 +1822,14 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                             {build_fundamentals_html(fund_raw, fund_score)}
                             {build_52_week_range_html(range_52w)}
                             {build_risk_meter_html(risk_meter)}
+                        </table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding:0 16px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                <td style="padding-top:10px;border-top:1px solid #eef2f7;">
                                     <div style="font-size:13px;color:#475569;"><strong>Buy Levels:</strong></div>
                                     <div style="font-size:12px;color:#0f172a;margin-top:4px;">
                                         <span style="color:#047857;font-weight:700;">Recommended {risk_data['recommended_entry_label']}: <strong>{risk_data['recommended_buy_level']}</strong></span>
@@ -1831,8 +1841,14 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                     </div>
                                 </td>
                             </tr>
+                        </table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding:0 16px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                <td style="padding-top:10px;border-top:1px solid #eef2f7;">
                             <div style="font-size:13px;color:#475569;">
                             <strong>Upcoming Events</strong>
                         </div>
@@ -1841,8 +1857,14 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                    
                                 </td>
                             </tr>
+                        </table>
+                    </td>
+                </tr>
+                <tr>
+                    <td style="padding:0 16px 16px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
+                                <td style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
                             </tr>
                         </table>
                     </td>
@@ -2005,6 +2027,210 @@ def build_quick_summary(rows):
             market_bucket[group_key].append(f"⚠ {stock_name} below EMA20—avoid adding")
 
     return groups
+
+
+# Thresholds for the Action Plan table's buy-zone classification. Tunable
+# via env vars without touching code. ADD_ALLOCATION_PCT is the generic
+# allocation size suggested when a stock is in its buy zone -- main.py
+# doesn't currently size positions per-stock (see position_sizing.py for
+# the risk-based stop/target sizing, which is separate from allocation %).
+ADD_ALLOCATION_PCT = int(os.getenv("ADD_ALLOCATION_PCT", "25"))
+SLIGHTLY_ABOVE_BUY_ZONE_PCT = float(os.getenv("SLIGHTLY_ABOVE_BUY_ZONE_PCT", "6"))
+IN_BUY_ZONE_TOLERANCE_PCT = float(os.getenv("IN_BUY_ZONE_TOLERANCE_PCT", "1.5"))
+
+_ACTION_PLAN_STATUS_DISPLAY = {
+    "in_zone":        ("In buy zone",            "#2F5233", "#E7EEE4"),
+    "slightly_above": ("Slightly above buy zone", "#A6812F", "#FDF3D9"),
+    "overextended":   ("Overextended",            "#8B2E2E", "#FBEAEA"),
+    "sell_signal":    ("Sell signal active",      "#8B2E2E", "#FBEAEA"),
+    "unknown":        ("—",                       "#8A8F9C", "#F4F2ED"),
+}
+
+_ACTION_PLAN_NEXT_ACTION = {
+    "in_zone":        f"Add {ADD_ALLOCATION_PCT}% allocation",
+    "slightly_above": "Wait for dip",
+    "overextended":   "Don't add",
+    "sell_signal":    "Exit / Reduce",
+    "unknown":        "—",
+}
+
+
+def _classify_buy_zone(current_price, buy_level, signal=""):
+    """
+    Classifies where the current price sits relative to the recommended
+    buy level, for the Action Plan table. Returns one of:
+    "in_zone" / "slightly_above" / "overextended" / "sell_signal" / "unknown".
+
+    - A SELL signal always takes priority over the price/buy-level math.
+    - "in_zone": at or within IN_BUY_ZONE_TOLERANCE_PCT of the buy level
+      (covers prices at or slightly below it too).
+    - "slightly_above": up to SLIGHTLY_ABOVE_BUY_ZONE_PCT above the buy
+      level -- still a fair entry, but no longer the ideal one.
+    - "overextended": further above than that -- chasing the price here
+      has a worse risk/reward than waiting for a pullback.
+    """
+    if "sell" in str(signal or "").lower():
+        return "sell_signal"
+    if current_price is None or buy_level is None or buy_level == 0:
+        return "unknown"
+    pct_above = (current_price - buy_level) / buy_level * 100
+    if pct_above <= IN_BUY_ZONE_TOLERANCE_PCT:
+        return "in_zone"
+    elif pct_above <= SLIGHTLY_ABOVE_BUY_ZONE_PCT:
+        return "slightly_above"
+    return "overextended"
+
+
+def _action_plan_profit_booking(status_key, buy_level, target):
+    """
+    "Partial at +X%" when the stock is in the 'slightly_above' zone and a
+    target is known (X = the planned gain from buy level to target) --
+    this is the state where someone who already holds a position from
+    around the buy level is sitting on a gain worth considering booking,
+    even though it's not a great level to add fresh money at. Every other
+    state (still accumulating, overextended, or unknown) just says "Hold":
+    either it's too early to think about booking, or there's nothing new
+    to act on here.
+    """
+    if status_key == "sell_signal":
+        return "Book profit"
+    if status_key == "slightly_above" and buy_level and target and target > buy_level:
+        gain_pct = round((target - buy_level) / buy_level * 100)
+        return f"Partial at +{gain_pct}%"
+    return "Hold"
+
+
+def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None):
+    sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
+    next_action = _ACTION_PLAN_NEXT_ACTION[status_key]
+    profit_booking = _action_plan_profit_booking(status_key, buy_level, target)
+    add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
+    name_display = f"{name} <span style=\"color:#8A8F9C;font-size:11px;\">{ticker_label}</span>" if ticker_label else name
+    return f"""
+        <tr>
+            <td style="padding:7px 10px;font-size:12px;font-weight:700;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{name_display}</td>
+            <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{add_below}</td>
+            <td style="padding:7px 10px;font-size:12px;font-family:{sans};border-top:1px solid #EDEAE2;">
+                <span style="display:inline-block;padding:2px 8px;border-radius:999px;background:{bg};color:{color};font-size:11px;font-weight:700;">{label}</span>
+            </td>
+            <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{next_action}</td>
+            <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{profit_booking}</td>
+        </tr>
+    """
+
+
+def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=None, silver_levels=None, gold_plan=None, silver_plan=None):
+    """
+    Builds the "Action Plan" table shown right after the Executive Summary:
+    one row per stock/commodity with Add Below / Current Status / Next
+    Action / Profit Booking, grouped into US Stocks, India Stocks, Gold,
+    and Silver -- the same four groups used elsewhere in the report.
+
+    Only covers stocks with a usable current price and recommended buy
+    level (skips Errors, where neither is available). Gold/Silver rows
+    are best-effort: this reads a few plausible key names off whatever
+    CommodityTracker.derive_buy_levels()/build_trade_plan() return, and
+    falls back to "—" for any field it can't find rather than crashing --
+    that module wasn't available when this was written, so if the metals
+    rows come back mostly blank, the key names below need adjusting to
+    match your actual commodity_tracker.py.
+    """
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+    def group_header_row(label):
+        return (
+            f'<tr><td colspan="5" style="padding:10px 10px 6px;font-family:{sans};'
+            f'font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
+            f'letter-spacing:0.05em;background:#F4F2ED;">{label}</td></tr>'
+        )
+
+    stock_rows_by_market = {"US": [], "India": []}
+    for entry in (summary_rows or []):
+        signal = entry.get("signal") or ""
+        if str(signal).upper() == "ERROR":
+            continue
+        current_price = entry.get("current_price")
+        buy_level = entry.get("recommended_buy_level")
+        target = entry.get("target")
+        status_key = _classify_buy_zone(current_price, buy_level, signal)
+        if status_key == "unknown":
+            continue
+        currency_symbol = "₹" if classify_market(entry.get("ticker")) == "India" else "$"
+        row_html_str = _action_plan_row_html(
+            entry.get("stock_name") or entry.get("ticker") or "—",
+            currency_symbol, buy_level, target, status_key,
+            ticker_label=entry.get("ticker"), sans=sans,
+        )
+        market_key = classify_market(entry.get("ticker"))
+        stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
+
+    def sorted_rows(market_key):
+        return [r for _, r in sorted(stock_rows_by_market.get(market_key, []), key=lambda x: x[0], reverse=True)]
+
+    us_rows = sorted_rows("US")
+    india_rows = sorted_rows("India")
+
+    def commodity_row(name, data, levels, plan):
+        if not data:
+            return ""
+        current_price = data.get("current")
+        # Best-effort lookup across a few plausible key names -- see the
+        # docstring above about commodity_tracker.py not being available.
+        buy_level = None
+        for src in (levels or {}, plan or {}):
+            for key in ("recommended_buy_level", "optimal_entry", "buy_level", "entry"):
+                if isinstance(src, dict) and src.get(key) is not None:
+                    buy_level = src.get(key)
+                    break
+            if buy_level is not None:
+                break
+        target = None
+        for src in (plan or {}, levels or {}):
+            for key in ("target", "target1", "recommended_target"):
+                if isinstance(src, dict) and src.get(key) is not None:
+                    target = src.get(key)
+                    break
+            if target is not None:
+                break
+        status_key = _classify_buy_zone(current_price, buy_level)
+        if status_key == "unknown":
+            return ""
+        return _action_plan_row_html(name, "₹", buy_level, target, status_key, sans=sans)
+
+    gold_row = commodity_row("Gold (22K)", (commodity_data or {}).get("gold"), gold_levels, gold_plan)
+    silver_row = commodity_row("Silver", (commodity_data or {}).get("silver"), silver_levels, silver_plan)
+
+    body = ""
+    if us_rows:
+        body += group_header_row("🇺🇸 US Stocks") + "".join(us_rows)
+    if india_rows:
+        body += group_header_row("🇮🇳 India Stocks") + "".join(india_rows)
+    if gold_row:
+        body += group_header_row("🥇 Gold") + gold_row
+    if silver_row:
+        body += group_header_row("🥈 Silver") + silver_row
+
+    if not body:
+        return ""
+
+    return f"""
+        <tr>
+          <td style="padding:0 28px 18px;" class="email-padding">
+            <h2 style="margin:0 0 8px;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:16px;color:#14213D;">Action Plan</h2>
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
+              <tr style="background:#14213D;">
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Stock</td>
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Add Below</td>
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Current Status</td>
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Next Action</td>
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Profit Booking</td>
+              </tr>
+              {body}
+            </table>
+          </td>
+        </tr>
+    """
 
 
 def classify_market(ticker):
@@ -2488,6 +2714,10 @@ def main(mode, use_llm, detailed_llm=False):
        across a page boundary. */
     tr { page-break-inside: avoid; break-inside: avoid; }
     h1, h2, h3 { page-break-after: avoid; break-after: avoid-page; }
+    /* If a very long AI thesis still can't fit inside one avoided <tr>
+       and the browser is forced to split it, don't strand a single
+       line at the top/bottom of a page. */
+    p, div { orphans: 3; widows: 3; }
     body { background:#ffffff !important; }
     .email-container {
       max-width:820px !important;
@@ -2830,6 +3060,7 @@ def main(mode, use_llm, detailed_llm=False):
     # Commodity section (Gold & Silver) — built BEFORE stock sections so it appears
     # near the top of the email and is never clipped by Gmail's 102 KB limit.
     commodity_row_html = ""
+    gold_levels = silver_levels = gold_plan = silver_plan = None
     if commodity_data is not None:
         try:
             gold_levels   = tracker.derive_buy_levels(commodity_data["gold"]["current"],   commodity_data["gold"]["history"])
@@ -2905,6 +3136,16 @@ def main(mode, use_llm, detailed_llm=False):
     # reuse it without the full per-stock "portfolio" sections that follow.
     report_html_header = report_html
 
+    # Action Plan table -- Stock/commodity | Add Below | Current Status |
+    # Next Action | Profit Booking, grouped like everything else (US /
+    # India / Gold / Silver). Placed right after the Executive Summary in
+    # both the PDF and the email body.
+    action_plan_html = build_action_plan_table_html(
+        summary_rows, commodity_data=commodity_data,
+        gold_levels=gold_levels, silver_levels=silver_levels,
+        gold_plan=gold_plan, silver_plan=silver_plan,
+    )
+
     # Build new report-enhancement blocks
     error_summary_html = build_error_summary_html(groups)
     quick_jump_html = build_quick_jump_table_html(
@@ -2935,6 +3176,7 @@ def main(mode, use_llm, detailed_llm=False):
         + quick_jump_html
         + ai_portfolio_story_html
         + quick_summary_html
+        + action_plan_html
         + summary_html
         + commodity_row_html
         + concentration_alert_html
@@ -2951,7 +3193,7 @@ def main(mode, use_llm, detailed_llm=False):
     # inline message and lives only in the attached PDF -- keeps the email
     # short and avoids Gmail's ~102 KB body-clipping entirely rather than
     # just working around it.
-    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + quick_summary_html + footer_html
+    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + quick_summary_html + action_plan_html + footer_html
 
     # Persist this run's state so the next run can diff signals/prices
     # against it (change badges, breach alerts, commodity streaks).
