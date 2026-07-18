@@ -221,6 +221,11 @@ def _extract_expiry_snapshot(rows, expiry_str):
     # LLM. Only present on the live JSON path; EOD Bhavcopy has no IV field.
     call_iv = {s: c.get("impliedVolatility") for s, c in calls.items() if c.get("impliedVolatility")}
     put_iv = {s: p.get("impliedVolatility") for s, p in puts.items() if p.get("impliedVolatility")}
+    # % change in OI per strike (NSE's own field), used to give the strike
+    # rationale a real figure like "PE OI +18%" instead of a vague "near top
+    # OI" (issue #3).
+    call_oi_chg_pct = {s: c.get("pchangeinOpenInterest") for s, c in calls.items() if c.get("pchangeinOpenInterest") is not None}
+    put_oi_chg_pct = {s: p.get("pchangeinOpenInterest") for s, p in puts.items() if p.get("pchangeinOpenInterest") is not None}
 
     return {
         "expiry": expiry_str,
@@ -234,6 +239,8 @@ def _extract_expiry_snapshot(rows, expiry_str):
         "put_ltp": put_ltp,
         "call_iv": call_iv,
         "put_iv": put_iv,
+        "call_oi_chg_pct": call_oi_chg_pct,
+        "put_oi_chg_pct": put_oi_chg_pct,
     }
 
 
@@ -984,6 +991,48 @@ def generate_adjustment_trigger(priced_legs, net_premium):
         )
 
 
+def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
+    """Appends real fetched numbers to the model's qualitative strike
+    rationale: the actual highest-OI CE/PE strikes and their OI, the OI %
+    change at whichever short strike(s) were actually chosen, and whether
+    each short strike sits outside the expected-move (1-SD-ish) band --
+    turning a vague 'near top OI' into something like 'Short strike 24000
+    chosen because PE OI +18%; expected move ±246, strike lies outside the
+    1-SD band' (issue #3). Returns "" if there isn't enough live data to
+    say anything concrete."""
+    if not horizon_snap:
+        return ""
+
+    parts = []
+    top_call_oi = horizon_snap.get("top_call_oi") or []
+    top_put_oi = horizon_snap.get("top_put_oi") or []
+    if top_call_oi:
+        parts.append(f"Highest CE OI: {top_call_oi[0][0]:g} ({top_call_oi[0][1]:,} OI)")
+    if top_put_oi:
+        parts.append(f"Highest PE OI: {top_put_oi[0][0]:g} ({top_put_oi[0][1]:,} OI)")
+
+    call_chg = horizon_snap.get("call_oi_chg_pct") or {}
+    put_chg = horizon_snap.get("put_oi_chg_pct") or {}
+    exp_move = horizon_snap.get("expected_move")
+    band_lo = band_hi = None
+    if exp_move and spot is not None:
+        band_lo, band_hi = spot - exp_move["expected_move_pts"], spot + exp_move["expected_move_pts"]
+
+    short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
+    for leg in short_legs:
+        strike, opt_type = leg["strike"], leg["type"]
+        chg_map = call_chg if opt_type == "CE" else put_chg
+        chg = chg_map.get(strike, chg_map.get(int(strike) if float(strike).is_integer() else strike))
+        chg_note = f"{opt_type} OI {chg:+.0f}%" if chg is not None else f"{opt_type} OI change n/a"
+        band_note = ""
+        if band_lo is not None:
+            outside = strike < band_lo or strike > band_hi
+            band_note = " -- outside the 1-SD expected-move band" if outside else " -- inside the 1-SD expected-move band (elevated risk)"
+        parts.append(f"Short strike {strike:g} chosen: {chg_note}{band_note}")
+
+    return " | ".join(parts)
+
+
 def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
     """Mutates horizon_dict in place: recomputes max_loss / max_profit /
     max_loss_pct_capital / max_profit_pct_capital / breakeven / gap_risk /
@@ -1015,6 +1064,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
+        horizon_dict["_net_gamma"] = None
         return horizon_dict
 
     if result["unbounded_risk"]:
@@ -1034,9 +1084,18 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
         horizon_dict["_verified_max_loss_inr"] = float("inf")
+        horizon_dict["_net_gamma"] = None
         return horizon_dict
 
     priced_legs = result["priced_legs"]
+
+    rationale_addendum = build_strike_rationale_addendum(priced_legs, horizon_snap, spot)
+    if rationale_addendum:
+        existing = (horizon_dict.get("strike_rationale") or "").strip()
+        horizon_dict["strike_rationale"] = (
+            f"{existing} ({rationale_addendum})" if existing else rationale_addendum
+        )
+
     classified = classify_structure(priced_legs)
     label_note = ""
     if _label_conflicts(horizon_dict.get("strategy_name"), classified):
@@ -1082,9 +1141,13 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
     # --- Expected move (pass-through from the live-data snapshot) ---
     exp_move = (horizon_snap or {}).get("expected_move")
     if exp_move:
+        band = ""
+        if spot is not None:
+            lo, hi = spot - exp_move["expected_move_pts"], spot + exp_move["expected_move_pts"]
+            band = f" -- 68% probability band: {lo:,.0f}–{hi:,.0f}"
         horizon_dict["expected_move"] = (
             f"±{exp_move['expected_move_pts']:g} pts (~{exp_move.get('expected_move_pct', 'n/a')}% of spot) "
-            f"by expiry, from the {exp_move['atm_strike']:g} ATM straddle"
+            f"by expiry, from the {exp_move['atm_strike']:g} ATM straddle{band}"
         )
     else:
         horizon_dict["expected_move"] = "n/a (no ATM straddle premium available this run)"
@@ -1118,9 +1181,11 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
             f"Θ ₹{net_theta * NIFTY_LOT_SIZE:+,.0f}/day · Vega ₹{net_vega * NIFTY_LOT_SIZE:+,.0f}/vol pt "
             f"(per lot, from live IV; positive Θ = time decay working in your favor)"
         )
+        horizon_dict["_net_gamma"] = net_gamma * NIFTY_LOT_SIZE
     else:
         greeks_reason = "EOD Bhavcopy has no IV column" if is_eod else "live IV unavailable for one or more legs this run"
         horizon_dict["net_greeks"] = f"n/a ({greeks_reason})"
+        horizon_dict["_net_gamma"] = None
 
     # --- Probability of profit (flat-IV lognormal, ATM IV for this expiry) ---
     pop = None
@@ -1134,8 +1199,16 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
 
     # --- Margin (approximate) and Return on Margin ---
     margin, rom = estimate_margin_and_rom(max_loss, max_profit, priced_legs, NIFTY_LOT_SIZE)
-    horizon_dict["margin_required"] = f"~₹{margin:,.0f} per lot (approx. -- confirm exact figure in your broker's margin calculator)"
-    horizon_dict["return_on_margin"] = f"~{rom:.1f}%" if rom is not None else "n/a"
+    horizon_dict["margin_required"] = (
+        f"~₹{margin:,.0f} per lot -- estimated broker margin (SPAN + exposure margin proxy; "
+        f"Zerodha, Groww, ICICI Direct, etc. compute this differently, so confirm the exact "
+        f"figure in your own broker's margin calculator before sizing)"
+    )
+    horizon_dict["return_on_margin"] = (
+        f"~{rom:.1f}% (assumes the structure is held to expiry and achieves max profit; actual "
+        f"realized returns may differ due to early exit, margin changes, or assignment risk)"
+        if rom is not None else "n/a"
+    )
 
     horizon_dict["verification"] = (
         f"✅ Verified from {premium_label}: net {'credit' if net_premium >= 0 else 'debit'} "
@@ -1185,8 +1258,7 @@ NON-NEGOTIABLE CONSTRAINTS
    - Determine the Current Week's bias (Bullish or Bearish) strictly from the live market data you find (spot/futures trend, OI buildup, PCR, FII/DII flow, global cues) -- never assume a default direction.
    - CORRECT PCR READING: PCR(OI) > 1 means more puts are written than calls, which is generally read as bullish-to-neutral (put writers expect the market to stay above their strike, building support below spot) -- NOT bearish. PCR < 1 leans bearish-to-neutral. Do not state a bias that contradicts the PCR figure you were given without explaining, in bias_reason, exactly why other data overrides it.
    - CORRECT VIX READING: India VIX measures the MAGNITUDE of expected volatility, not direction. A high VIX means bigger expected moves either way (and richer option premiums, favorable for premium-selling structures) -- it does NOT by itself mean bearish. A low VIX (e.g. under ~15) signals calm, range-bound conditions, not bullishness or bearishness. Never write "high/low VIX indicates bullish/bearish trend" -- derive direction only from price/OI/PCR/flow data, and use VIX only for expected-move sizing and premium-selling suitability.
-   - Apply a mean-reversion ASSUMPTION (not a factual prediction) for the immediate next weekly expiry: if the Current Week is Bullish, treat the Next Week as Bearish; if the Current Week is Bearish, treat the Next Week as Bullish. Reflect this explicitly in the Weekly horizon's strategy legs and in a dedicated "next_week_bias" field (see schema below) -- e.g. a current-week bull put spread paired with a next-week-aware bear call spread or calendar structure that benefits from the expected reversal. Say plainly in bias_reason that this reversal is a modeling assumption, not a confirmed forecast.
-   - If live data shows a clear reason to override this assumption (e.g. a major event landing exactly in the next-week window), say so explicitly in bias_reason rather than silently ignoring the rule.
+   - DO NOT assume mean reversion for the immediate next weekly expiry. A single week's move is not a quantitative basis for predicting the following week's direction, and the "next_week_bias" field (see schema below) is discarded and overridden in code regardless of what you write here -- do not build the Weekly horizon's legs around a next-week reversal thesis. Size and structure the Weekly horizon for the Current Week only, from the live data you found for it.
 
 6. MONTHLY/QUARTERLY BIAS TOWARD SIDEWAYS/RANGE-BOUND. Unless live data shows a strong, well-supported directional catalyst inside that horizon's window, default the Monthly and Quarterly recommendations to range-bound/theta-positive structures (Iron Condor, Iron Butterfly, Calendar/Diagonal Spread) rather than pure directional debit/credit spreads -- these horizons are for harvesting range and time decay, not chasing the weekly directional call.
    - IRON BUTTERFLY DEFINITION: an Iron Butterfly sells a call AND a put at the SAME at-the-money strike (e.g. Sell 24500 CE + Sell 24500 PE), then buys further OTM wings on each side for protection. If the short call and short put strikes differ, that is an Iron Condor, not an Iron Butterfly -- do not mislabel one as the other.
@@ -1213,7 +1285,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "horizon": "Weekly",
       "expiry_date": "The actual expiry date used, e.g. '24 Jul 2026'",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "ONLY for the Weekly horizon object: 'Bullish' or 'Bearish', the opposite of 'bias' per constraint #5's mean-reversion rule (or a brief override note if constraint #5 was overridden). Omit or leave empty for Monthly/Quarterly/Annual.",
+      "next_week_bias": "ONLY for the Weekly horizon object: this field is ignored and overridden in code per constraint #5 -- leave it empty or write 'n/a'. Omit entirely for Monthly/Quarterly/Annual.",
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
       "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
@@ -1225,7 +1297,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
     {{ "horizon": "Quarterly", ... same fields ... }},
     {{ "horizon": "Annual", ... same fields ... }}
   ],
-  "portfolio_view": "One paragraph: are you net long or net short gamma across all four horizons combined, and does the combined structure over- or under-hedge overall market gap risk. Do NOT state or estimate the aggregate capital-at-risk percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
+  "portfolio_view": "One paragraph on whether the combined structure over- or under-hedges overall market gap risk across the four horizons, and how the horizons relate to each other qualitatively (e.g. does Weekly's directional stance conflict with Monthly/Quarterly's range-bound stance). Do NOT state or estimate a net long/short gamma verdict for the combined portfolio -- that figure is computed in code from real per-leg Black-Scholes gamma (live IV) after you respond, and any gamma claim you make here will be discarded. Do NOT state or estimate the aggregate capital-at-risk percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
 }}
 """
 
@@ -1295,7 +1367,16 @@ def _badge(text, color, bg):
 
 def _bias_badge(bias):
     key = str(bias or "").strip().lower()
-    color, bg = _BIAS_STYLE.get(key, ("#8A8F9C", "#F4F2ED"))
+    style = _BIAS_STYLE.get(key)
+    if style is None:
+        # Match on prefix too, e.g. "neutral (insufficient evidence)" should
+        # still get the plain "neutral" styling rather than falling through
+        # to the generic gray default.
+        for k, v in _BIAS_STYLE.items():
+            if key.startswith(k):
+                style = v
+                break
+    color, bg = style or ("#8A8F9C", "#F4F2ED")
     return _badge(bias or "—", color, bg)
 
 
@@ -1389,6 +1470,73 @@ def _strip_cap_claims(text):
     return " ".join(kept).strip()
 
 
+_GAMMA_WORD_RE = re.compile(r"\bgamma\b", re.IGNORECASE)
+
+
+def _strip_gamma_claims(text):
+    """Removes any sentence where the model asserted a net long/short gamma
+    verdict -- the model only sees its own free-text strategy description,
+    not the real per-leg IV/Greeks computed in code, so a blanket claim like
+    'net short gamma across all horizons' can be wrong (e.g. a debit
+    vertical spread is generally long gamma even though condors/butterflies
+    elsewhere in the portfolio are short gamma). The real, code-computed
+    verdict is prepended separately by compute_portfolio_gamma_summary()."""
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept = [s for s in sentences if not _GAMMA_WORD_RE.search(s)]
+    return " ".join(kept).strip()
+
+
+def compute_portfolio_gamma_summary(horizons):
+    """Builds the single authoritative statement of the portfolio's combined
+    gamma exposure from the real per-horizon net gamma figures computed in
+    apply_verified_payoff (Black-Scholes, from live IV) -- never from the
+    model's own portfolio-level claim, which has no way to know that e.g. a
+    debit Bull Call Spread is generally long gamma even while Iron Condor/
+    Butterfly legs elsewhere are short gamma (issue #2). Returns a plain-
+    English sentence, or an honest 'insufficient data' note if fewer than
+    two horizons have a usable gamma figure."""
+    parts, usable = [], []
+    for h in horizons:
+        name = str(h.get("horizon") or "").strip()
+        gamma = h.get("_net_gamma")
+        if gamma is None or not name:
+            continue
+        usable.append((name, h.get("strategy_name") or "n/a", gamma))
+
+    if not usable:
+        return (
+            "Combined portfolio gamma: not computable this run (live IV was unavailable "
+            "for one or more legs across all horizons)."
+        )
+
+    for name, strategy, gamma in usable:
+        direction = "long gamma" if gamma > 0 else ("short gamma" if gamma < 0 else "gamma-neutral")
+        parts.append(f"{name} ({strategy}): Γ {gamma:+.3f} — {direction}")
+
+    net_total = sum(g for _, _, g in usable)
+    if net_total > 0:
+        overall = "net LONG gamma overall"
+    elif net_total < 0:
+        overall = "net SHORT gamma overall"
+    else:
+        overall = "net gamma-neutral overall"
+
+    coverage_note = (
+        "" if len(usable) == len([h for h in horizons if str(h.get("horizon") or "").strip()])
+        else " (some horizons omitted -- live IV unavailable for those legs)"
+    )
+
+    return (
+        f"Per-horizon net gamma (per lot, from live IV): {'; '.join(parts)}. "
+        f"Summed across the horizons with a computable figure, the combined structure is "
+        f"{overall}{coverage_note} -- not uniformly short gamma across every horizon, since "
+        f"long-gamma debit spreads and short-gamma premium-selling structures can coexist and "
+        f"partly offset."
+    )
+
+
 def render_horizons_html(horizons, aggregate_pct, portfolio_view):
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     serif = "Georgia,'Times New Roman',serif"
@@ -1431,7 +1579,12 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         if over_cap else
         f"✅ Stays within the {AGGREGATE_CAP_PCT:.0f}% aggregate cap."
     )
-    portfolio_text = _strip_cap_claims(portfolio_view)
+    # Gamma is a real, code-computed number (from live IV via apply_verified_
+    # payoff), so it gets the same treatment as the aggregate-cap verdict
+    # above: the model's own gamma claim is stripped out and replaced with
+    # the authoritative figure (issue #2).
+    gamma_summary = compute_portfolio_gamma_summary(horizons)
+    portfolio_text = _strip_gamma_claims(_strip_cap_claims(portfolio_view))
     portfolio_html = (
         f'<div style="margin-top:16px;padding:12px 14px;background:#FAF9F6;'
         f'border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;">'
@@ -1440,7 +1593,8 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         f'&nbsp;&middot;&nbsp; Aggregate Capital at Risk: '
         f'<span style="color:{agg_color};">{agg_display}%</span> '
         f'(cap {AGGREGATE_CAP_PCT:.0f}%)</div>'
-        f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(portfolio_text)}</div>'
+        f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(gamma_summary)}</div>'
+        f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;margin-top:8px;">{_esc(portfolio_text)}</div>'
         f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{agg_color};margin-top:8px;">{verdict}</div>'
         f'</div>'
     )
@@ -1635,6 +1789,16 @@ def finalize_horizons(horizons, live_data):
     mismatch traces back to). Returns (horizons, aggregate_pct, over_cap)."""
     by_name = {str(h.get("horizon") or "").strip(): h for h in horizons}
 
+    # A single week's move is not a quantitative basis for predicting the
+    # following week's direction (issue #1) -- regardless of what the model
+    # wrote for next_week_bias, or whether it complied with constraint #5's
+    # instruction to leave it blank, force it to an honest, non-predictive
+    # placeholder here so it can never contradict itself in the rendered
+    # report the way "Current Week Bullish / Next Week Bearish (mean
+    # reversion)" did.
+    if "Weekly" in by_name:
+        by_name["Weekly"]["next_week_bias"] = "Neutral (insufficient evidence)"
+
     if live_data.get("annual_usable") is False and "Annual" in by_name:
         by_name["Annual"] = {
             "horizon": "Annual",
@@ -1698,10 +1862,17 @@ _BLOCKED_SOURCE_HINTS = ("instagram.com", "youtube.com", "youtu.be", "twitter.co
 def _filter_sources(sources):
     """Defensive filter over whatever shape swing.generate_analysis()
     returns for 'sources' (list of dicts with a url/link key, or plain
-    strings) -- drops social-media and unsourced-video links outright, and
-    otherwise passes through anything not explicitly on the block list
-    (better to under-filter than to silently hide a legitimate source the
-    allowlist above doesn't happen to name)."""
+    strings). swing.generate_analysis() is shared with swing_trade_advisor.py
+    (a stock-picking report), so its own live-search path can just as easily
+    surface breakout-stock roundups, broker marketing blogs, or generic
+    "swing trading" content -- none of which should back a derivatives
+    report (issue #6). This is now a strict ALLOWLIST: a source survives
+    only if its URL matches one of the recognized official/primary NSE-
+    adjacent or major-financial-press domains in _OFFICIAL_SOURCE_DOMAINS,
+    on top of the existing social-media/video blocklist. Anything else --
+    including a legitimate-looking source the allowlist doesn't happen to
+    name -- is dropped rather than risk showing an unvetted stock-picking
+    link next to option strikes."""
     if not sources:
         return sources
     out = []
@@ -1711,7 +1882,10 @@ def _filter_sources(sources):
             url = str(s.get("url") or s.get("link") or "")
         else:
             url = str(s)
-        if any(bad in url.lower() for bad in _BLOCKED_SOURCE_HINTS):
+        low_url = url.lower()
+        if any(bad in low_url for bad in _BLOCKED_SOURCE_HINTS):
+            continue
+        if not any(dom in low_url for dom in _OFFICIAL_SOURCE_DOMAINS):
             continue
         out.append(s)
     return out
