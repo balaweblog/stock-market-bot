@@ -1,4 +1,4 @@
-name: Swing Trade Advisor Agent
+name: Option Trading Agent
 on:
   workflow_dispatch:
 
