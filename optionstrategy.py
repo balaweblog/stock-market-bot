@@ -46,6 +46,7 @@ import io
 import csv
 import sys
 import json
+import math
 import html
 import zipfile
 import traceback
@@ -215,6 +216,11 @@ def _extract_expiry_snapshot(rows, expiry_str):
     # invent those numbers -- see compute_spread_payoff() below.
     call_ltp = {s: c.get("lastPrice") for s, c in calls.items() if c.get("lastPrice") is not None}
     put_ltp = {s: p.get("lastPrice") for s, p in puts.items() if p.get("lastPrice") is not None}
+    # Per-strike IV, straight from NSE's own chain -- this is what makes
+    # Greeks/POP/expected-move computable in code instead of asked of the
+    # LLM. Only present on the live JSON path; EOD Bhavcopy has no IV field.
+    call_iv = {s: c.get("impliedVolatility") for s, c in calls.items() if c.get("impliedVolatility")}
+    put_iv = {s: p.get("impliedVolatility") for s, p in puts.items() if p.get("impliedVolatility")}
 
     return {
         "expiry": expiry_str,
@@ -226,6 +232,8 @@ def _extract_expiry_snapshot(rows, expiry_str):
         "top_put_oi": [(s, p.get("openInterest", 0)) for s, p in top_puts],
         "call_ltp": call_ltp,
         "put_ltp": put_ltp,
+        "call_iv": call_iv,
+        "put_iv": put_iv,
     }
 
 
@@ -353,6 +361,11 @@ def _extract_bhavcopy_snapshot(rows, symbol, expiry_dt):
         # data_status='partial' at best (mirrors the OI figures' own caveat).
         "call_ltp": call_ltp,
         "put_ltp": put_ltp,
+        # NSE's Bhavcopy has no implied-vol column -- Greeks/POP/expected-move
+        # are simply unavailable ("n/a") for any horizon filled from this
+        # fallback path, and are labeled as such rather than estimated.
+        "call_iv": {},
+        "put_iv": {},
     }
 
 
@@ -366,6 +379,19 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         return False
 
     try:
+        if data["spot"] is None:
+            fut_closes = sorted(
+                (
+                    (_parse_bhavcopy_date(r.get("XpryDt", "")), float(r.get("ClsPric") or r.get("SttlmPric") or 0))
+                    for r in bhav_rows
+                    if r.get("TckrSymb", "").strip() == symbol and r.get("FinInstrmTp", "").strip() == "IDF"
+                ),
+                key=lambda t: t[0],
+            )
+            if fut_closes:
+                data["spot"] = fut_closes[0][1]
+                notes.append("Spot figure is a Bhavcopy near-month futures CLOSE proxy, not true cash spot.")
+
         expiry_dts = {
             _parse_bhavcopy_date(r.get("XpryDt", ""))
             for r in bhav_rows
@@ -375,6 +401,7 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         for horizon, dt in horizon_dts.items():
             snap = _extract_bhavcopy_snapshot(bhav_rows, symbol, dt)
             snap["source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')})"
+            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
             data["horizons"][horizon] = snap
 
         annual_snap = data["horizons"].get("Annual")
@@ -388,19 +415,6 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         data["annual_usable"], data["annual_reason"] = usable, reason
         if not usable:
             notes.append(f"Annual horizon not usable: {reason}")
-
-        if data["spot"] is None:
-            fut_closes = sorted(
-                (
-                    (_parse_bhavcopy_date(r.get("XpryDt", "")), float(r.get("ClsPric") or r.get("SttlmPric") or 0))
-                    for r in bhav_rows
-                    if r.get("TckrSymb", "").strip() == symbol and r.get("FinInstrmTp", "").strip() == "IDF"
-                ),
-                key=lambda t: t[0],
-            )
-            if fut_closes:
-                data["spot"] = fut_closes[0][1]
-                notes.append("Spot figure is a Bhavcopy near-month futures CLOSE proxy, not true cash spot.")
 
         notes.append(
             f"Live NSE option-chain feed was unavailable this run -- per-horizon OI/PCR/max-pain "
@@ -473,7 +487,9 @@ def fetch_live_market_data():
         horizon_expiries = _pick_horizon_expiries(records.get("expiryDates", []))
         rows = records.get("data", [])
         for horizon, expiry in horizon_expiries.items():
-            data["horizons"][horizon] = _extract_expiry_snapshot(rows, expiry)
+            snap = _extract_expiry_snapshot(rows, expiry)
+            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
+            data["horizons"][horizon] = snap
 
         by_dt = {_parse_nse_date(d): d for d in records.get("expiryDates", [])}
         horizon_dts = _pick_horizon_expiry_dates(by_dt.keys())
@@ -550,7 +566,15 @@ def format_live_data_block(data):
         )
         lines.append(f"    Top Call OI strikes: {_fmt_oi_pairs(snap.get('top_call_oi'))}")
         lines.append(f"    Top Put OI strikes: {_fmt_oi_pairs(snap.get('top_put_oi'))}")
+        exp_move = snap.get("expected_move")
+        if exp_move:
+            lines.append(
+                f"    Expected move (ATM straddle at {exp_move['atm_strike']:g}): "
+                f"±{exp_move['expected_move_pts']:g} pts (~{exp_move.get('expected_move_pct', 'n/a')}% of spot) "
+                f"by expiry -- use this as the 1-SD band constraint #2 asks you to keep short strikes outside of."
+            )
         call_ltp, put_ltp = snap.get("call_ltp") or {}, snap.get("put_ltp") or {}
+        call_iv, put_iv = snap.get("call_iv") or {}, snap.get("put_iv") or {}
         if call_ltp or put_ltp:
             top_call_strikes = [s for s, _ in snap.get("top_call_oi", [])]
             top_put_strikes = [s for s, _ in snap.get("top_put_oi", [])]
@@ -558,11 +582,20 @@ def format_live_data_block(data):
             pe_px = "; ".join(f"{s}: ₹{put_ltp[s]:.2f}" for s in top_put_strikes if s in put_ltp) or "n/a"
             lines.append(f"    Live CE premiums (LTP) at top-OI strikes: {ce_px}")
             lines.append(f"    Live PE premiums (LTP) at top-OI strikes: {pe_px}")
+            if call_iv or put_iv:
+                ce_iv = "; ".join(f"{s}: {call_iv[s]:.1f}%" for s in top_call_strikes if s in call_iv) or "n/a"
+                pe_iv = "; ".join(f"{s}: {put_iv[s]:.1f}%" for s in top_put_strikes if s in put_iv) or "n/a"
+                lines.append(f"    Live IV at top-OI strikes -- CE: {ce_iv} | PE: {pe_iv}")
             lines.append(
                 "    NOTE: only pick strikes for this horizon's legs from strikes that appear "
                 "above (they have both real OI and a real fetched premium) -- max profit/loss/"
-                "breakeven will be CALCULATED FROM THESE REAL PREMIUMS by code after you respond, "
-                "not from any number you write, so do not bother computing them precisely yourself."
+                "breakeven, Greeks (delta/theta/vega/gamma), probability of profit, and margin/ROM "
+                "will all be CALCULATED FROM THESE REAL PREMIUMS/IVs by code after you respond, not "
+                "from any number you write, so do not bother computing them precisely yourself. In "
+                "'strike_rationale' (schema below), just describe qualitatively why you picked each "
+                "short strike (e.g. 'outside the expected-move band above' or 'near the far edge of "
+                "top OI concentration') -- do not state a delta value or POP number, since those are "
+                "verified figures the code will compute and display separately."
             )
 
     if data.get("annual_usable") is False:
@@ -615,6 +648,156 @@ NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 # into "% of capital" -- override to match your actual account size.
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 
+# -----------------------------
+# Quant add-ons: expected move, Greeks, POP, margin/ROM (all computed in
+# code from real fetched IV/premiums -- never asked of or trusted from the
+# LLM, for the same reason max_loss/max_profit above aren't).
+# -----------------------------
+# 10Y G-Sec-ish proxy for the risk-free rate used in Black-Scholes. Nifty
+# index options are European-style and cash-settled, so plain BS (no
+# early-exercise adjustment) is the standard practitioner approximation.
+RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
+
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf(x):
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _iv_to_frac(iv):
+    """NSE reports IV as a percentage (e.g. 14.5 meaning 14.5%); this
+    normalizes either a percent or already-fractional input to a fraction."""
+    if iv is None:
+        return None
+    iv = float(iv)
+    return iv / 100.0 if iv > 3 else iv
+
+
+def time_to_expiry_years(expiry_dt, now=None):
+    """Years-to-expiry using calendar days/365 to the 15:30 IST close on
+    expiry day -- the standard simplification for a desk-level Greeks
+    estimate (not a trading-day/252 model). Floored just above zero so
+    same-day expiry doesn't blow up the Black-Scholes formulas below."""
+    now = now or datetime.now(ZoneInfo("Asia/Kolkata"))
+    expiry_close = datetime.combine(expiry_dt.date(), dtime(15, 30), tzinfo=ZoneInfo("Asia/Kolkata"))
+    return max((expiry_close - now).total_seconds() / (365.0 * 86400), 1e-6)
+
+
+def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE):
+    """Black-Scholes delta/gamma/theta/vega for one leg, from a real fetched
+    per-strike IV -- used only to characterize the STRUCTURE's risk (net
+    delta/theta/vega/gamma), never to re-derive a premium the live feed
+    already gave us. Returns None if inputs are unusable (missing/zero IV,
+    zero time, etc.) rather than a fabricated number.
+    theta is per calendar day; vega is per 1 implied-vol point (e.g. IV
+    14.5 -> 15.5)."""
+    try:
+        sigma = _iv_to_frac(iv)
+        if spot is None or strike is None or sigma is None or t_years is None:
+            return None
+        if t_years <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+            return None
+        sqrt_t = math.sqrt(t_years)
+        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+        pdf_d1 = _norm_pdf(d1)
+        if opt_type == "CE":
+            delta = _norm_cdf(d1)
+            theta = (
+                -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
+                - r * strike * math.exp(-r * t_years) * _norm_cdf(d2)
+            ) / 365.0
+        else:
+            delta = _norm_cdf(d1) - 1.0
+            theta = (
+                -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
+                + r * strike * math.exp(-r * t_years) * _norm_cdf(-d2)
+            ) / 365.0
+        gamma = pdf_d1 / (spot * sigma * sqrt_t)
+        vega = spot * pdf_d1 * sqrt_t / 100.0
+        return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
+def compute_expected_move(call_ltp, put_ltp, spot):
+    """Expected move to expiry from the ATM straddle -- the standard
+    options-desk shorthand: ATM call premium + ATM put premium approximates
+    the market-implied ~1-standard-deviation move by expiry. Returns the
+    raw straddle-derived figure (no extra multiplier applied) plus the ATM
+    strike used, or None if there's no strike with both a live CE and PE
+    premium to build a straddle from."""
+    strikes = sorted(set(call_ltp or {}) & set(put_ltp or {}))
+    if not strikes or spot is None:
+        return None
+    atm = min(strikes, key=lambda s: abs(s - spot))
+    straddle = call_ltp.get(atm, 0) + put_ltp.get(atm, 0)
+    return {
+        "atm_strike": atm,
+        "straddle_premium": round(straddle, 2),
+        "expected_move_pts": round(straddle, 2),
+        "expected_move_pct": round(straddle / spot * 100, 2) if spot else None,
+    }
+
+
+def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
+    """Approximate risk-neutral probability of profit at expiry: integrates
+    a flat-IV lognormal distribution (the ATM implied vol for this expiry --
+    not a full strike-by-strike vol surface) over whichever price regions
+    the structure's own piecewise-linear payoff is actually positive in.
+    This is a standard desk-level approximation, not a guaranteed outcome --
+    realized price paths are not exactly lognormal and IV itself will drift
+    before expiry. Returns a percentage, or None if inputs are unusable."""
+    sigma = _iv_to_frac(iv)
+    if spot is None or sigma is None or t_years is None or t_years <= 0 or sigma <= 0:
+        return None
+
+    def cdf_le(K):
+        if K <= 0:
+            return 0.0
+        sqrt_t = math.sqrt(t_years)
+        d1 = (math.log(spot / K) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+        d2 = d1 - sigma * sqrt_t
+        return 1.0 - _norm_cdf(d2)  # P(S_T <= K) under the risk-neutral lognormal
+
+    lo_bound, hi_bound = 0.01, spot * 5.0
+    bounds = sorted(set([lo_bound] + [round(b, 2) for b in breakevens if b > 0] + [hi_bound]))
+    prob_profit = 0.0
+    try:
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            mid = (lo + hi) / 2.0
+            if payoff_fn(mid) > 0:
+                prob_profit += cdf_le(hi) - cdf_le(lo)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return round(max(0.0, min(1.0, prob_profit)) * 100, 1)
+
+
+def estimate_margin_and_rom(max_loss_inr, max_profit_inr, priced_legs, lot_size):
+    """Approximates margin required for a risk-defined spread and the
+    resulting Return on Margin.
+
+    IMPORTANT CAVEAT: this is NOT a real SPAN+exposure margin figure -- NSE
+    does not expose a public margin-calculator API, so the true number
+    depends on same-day volatility scans only your broker's margin
+    calculator has. What IS reliably true for a genuinely risk-defined
+    spread is that no broker should require MARGIN GREATER than the
+    position's own worst-case loss (that's the entire point of a defined-
+    risk structure), so max_loss is used as the floor/ceiling proxy here,
+    with a small exposure-style buffer on the short legs so the estimate
+    isn't naively low for a spread with a very cheap max_loss. Always
+    confirm the exact figure in your broker's margin calculator before
+    sizing a position."""
+    short_legs = [l for l in priced_legs if l["action"] == "Sell"]
+    exposure_buffer = 0.03 * sum(l["strike"] for l in short_legs) * lot_size if short_legs else 0.0
+    margin = max(max_loss_inr, exposure_buffer, 1.0)
+    rom_pct = round(max_profit_inr / margin * 100, 2) if margin else None
+    return round(margin, 0), rom_pct
+
+
 _LEG_RE = re.compile(r"\b(Buy|Sell)\s+(\d+(?:\.\d+)?)\s*(CE|PE)\b", re.IGNORECASE)
 
 
@@ -632,6 +815,13 @@ def parse_legs(legs_text):
 def _leg_premium(horizon_snap, strike, opt_type):
     table = (horizon_snap or {}).get("call_ltp" if opt_type == "CE" else "put_ltp", {})
     # Strikes may be int or float depending on source; try both.
+    return table.get(strike, table.get(int(strike) if float(strike).is_integer() else strike))
+
+
+def _leg_iv(horizon_snap, strike, opt_type):
+    """Same int/float-key lookup as _leg_premium, but against the per-strike
+    IV maps -- empty for the EOD Bhavcopy path, since it carries no IV."""
+    table = (horizon_snap or {}).get("call_iv" if opt_type == "CE" else "put_iv", {})
     return table.get(strike, table.get(int(strike) if float(strike).is_integer() else strike))
 
 
@@ -707,18 +897,108 @@ def compute_strategy_payoff(legs_text, horizon_snap, lot_size=NIFTY_LOT_SIZE):
         "net_premium": round(net_premium, 2),
         "unbounded_risk": unbounded_risk,
         "priced_legs": priced,
+        "payoff_fn": payoff_points,
+        "strikes": strikes,
     }
 
 
-def apply_verified_payoff(horizon_dict, horizon_snap):
+def classify_structure(priced_legs):
+    """Determines the ACTUAL structure from the priced legs' strikes --
+    independent of whatever name the model gave it. This is what catches a
+    same-strike short call + short put being mislabeled as an 'Iron Condor'
+    (that's an Iron Butterfly, or a wide-winged variant of one) instead of
+    just trusting the model's strategy_name."""
+    calls = [l for l in priced_legs if l["type"] == "CE"]
+    puts = [l for l in priced_legs if l["type"] == "PE"]
+    short_calls = [l for l in calls if l["action"] == "Sell"]
+    long_calls = [l for l in calls if l["action"] == "Buy"]
+    short_puts = [l for l in puts if l["action"] == "Sell"]
+    long_puts = [l for l in puts if l["action"] == "Buy"]
+
+    if len(priced_legs) == 4 and len(short_calls) == 1 and len(long_calls) == 1 and len(short_puts) == 1 and len(long_puts) == 1:
+        sc, lc, sp, lp = short_calls[0], long_calls[0], short_puts[0], long_puts[0]
+        if sc["strike"] == sp["strike"]:
+            return "Iron Butterfly"
+        elif sc["strike"] > sp["strike"]:
+            return "Iron Condor"
+        else:
+            return "Non-standard 4-leg structure (short call strike below short put strike -- verify manually)"
+
+    if len(priced_legs) == 2 and len(calls) == 2 and not puts:
+        sc, lc = (short_calls[0], long_calls[0]) if short_calls and long_calls else (None, None)
+        if sc and lc:
+            return "Bear Call Spread (credit)" if sc["strike"] < lc["strike"] else "Bull Call Spread (debit)"
+
+    if len(priced_legs) == 2 and len(puts) == 2 and not calls:
+        sp, lp = (short_puts[0], long_puts[0]) if short_puts and long_puts else (None, None)
+        if sp and lp:
+            return "Bull Put Spread (credit)" if sp["strike"] > lp["strike"] else "Bear Put Spread (debit)"
+
+    return f"Custom {len(priced_legs)}-leg risk-defined structure"
+
+
+_STRUCTURE_KEYWORDS = ("iron condor", "iron butterfly", "bull call", "bear call", "bull put", "bear put")
+
+
+def _label_conflicts(model_name, classified_name):
+    """Loose check for whether the model's own strategy_name contradicts
+    what the strikes actually form (e.g. model said 'Iron Condor' but the
+    strikes form an Iron Butterfly)."""
+    m = (model_name or "").lower()
+    found_in_model = [kw for kw in _STRUCTURE_KEYWORDS if kw in m]
+    if not found_in_model:
+        return False
+    return not any(kw in classified_name.lower() for kw in found_in_model)
+
+
+def generate_adjustment_trigger(priced_legs, net_premium):
+    """Replaces the model's own adjustment-trigger text with a
+    deterministic, standard rule derived from the actual short strikes and
+    net premium -- the model's free-text version produced both a
+    non-standard metric ('spread width exceeds 10% of credit', which isn't
+    a recognized rule) and, separately, a directionally illogical trigger
+    (a level already breached by the current spot for a bullish spread).
+    Grounding this in the real strikes avoids both failure modes."""
+    short_call_strikes = sorted(l["strike"] for l in priced_legs if l["type"] == "CE" and l["action"] == "Sell")
+    short_put_strikes = sorted(l["strike"] for l in priced_legs if l["type"] == "PE" and l["action"] == "Sell")
+
+    breach_parts = []
+    if short_put_strikes:
+        breach_parts.append(f"closes below {min(short_put_strikes):g} (short put strike)")
+    if short_call_strikes:
+        breach_parts.append(f"closes above {max(short_call_strikes):g} (short call strike)")
+    breach_clause = " or ".join(breach_parts) if breach_parts else "either short strike is breached"
+
+    if net_premium >= 0:
+        loss_trigger_pts = round(1.5 * abs(net_premium), 1)
+        return (
+            f"Exit/adjust if Nifty {breach_clause}, or if running loss reaches roughly 1.5x the net "
+            f"credit collected (~{loss_trigger_pts:g} pts), whichever comes first -- standard "
+            f"rules-of-thumb for a credit structure, not an arbitrary threshold."
+        )
+    else:
+        return (
+            f"Exit if running loss reaches roughly 50% of the net premium paid (~{abs(net_premium) * 0.5:.1f} pts), "
+            f"or if the original directional thesis hasn't played out by the final fifth of the time "
+            f"remaining to expiry -- standard rules for a debit structure."
+        )
+
+
+def apply_verified_payoff(horizon_dict, horizon_snap, spot=None):
     """Mutates horizon_dict in place: recomputes max_loss / max_profit /
-    max_loss_pct_capital / max_profit_pct_capital / breakeven / gap_risk from
-    real premiums, discarding whatever free-text figures the model wrote for
-    those fields. Always adds a 'verification' field describing what
-    happened, so the email never silently presents an unverifiable number as
-    if it were checked."""
+    max_loss_pct_capital / max_profit_pct_capital / breakeven / gap_risk /
+    adjustment_trigger / net Greeks / probability of profit / margin+ROM
+    from real premiums, real IVs, and actual strike structure, discarding
+    whatever free-text figures the model wrote for those fields. Always
+    adds a 'verification' field describing what happened, so the email
+    never silently presents an unverifiable number as if it were checked --
+    and never claims 'live' premiums (or live Greeks/POP) when the
+    underlying data was actually an EOD Bhavcopy close."""
+    horizon_dict["bias_reason"] = _strip_cap_claims(horizon_dict.get("bias_reason"))
     legs_text = horizon_dict.get("legs", "")
     result = compute_strategy_payoff(legs_text, horizon_snap)
+    is_eod = bool((horizon_snap or {}).get("source"))  # only set on the Bhavcopy fallback path
+    premium_label = "EOD Bhavcopy closing prices (not live)" if is_eod else "live NSE premiums"
 
     if not result["ok"]:
         horizon_dict["max_loss"] = "Unverified -- do not trade"
@@ -727,6 +1007,12 @@ def apply_verified_payoff(horizon_dict, horizon_snap):
         horizon_dict["max_profit_pct_capital"] = "n/a"
         horizon_dict["breakeven"] = "n/a"
         horizon_dict["gap_risk"] = "n/a"
+        horizon_dict["adjustment_trigger"] = "n/a"
+        horizon_dict["expected_move"] = "n/a"
+        horizon_dict["net_greeks"] = "n/a"
+        horizon_dict["probability_of_profit"] = "n/a"
+        horizon_dict["margin_required"] = "n/a"
+        horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
         return horizon_dict
@@ -740,13 +1026,43 @@ def apply_verified_payoff(horizon_dict, horizon_snap):
         horizon_dict["max_profit_pct_capital"] = "n/a"
         horizon_dict["breakeven"] = "n/a"
         horizon_dict["gap_risk"] = "Loss is theoretically unbounded -- this violates the risk-defined-only rule."
+        horizon_dict["adjustment_trigger"] = "n/a"
+        horizon_dict["expected_move"] = "n/a"
+        horizon_dict["net_greeks"] = "n/a"
+        horizon_dict["probability_of_profit"] = "n/a"
+        horizon_dict["margin_required"] = "n/a"
+        horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
         horizon_dict["_verified_max_loss_inr"] = float("inf")
         return horizon_dict
 
+    priced_legs = result["priced_legs"]
+    classified = classify_structure(priced_legs)
+    label_note = ""
+    if _label_conflicts(horizon_dict.get("strategy_name"), classified):
+        label_note = f" Re-labeled from model's '{horizon_dict.get('strategy_name')}' to match the actual strikes."
+        horizon_dict["strategy_name"] = classified
+    elif not (horizon_dict.get("strategy_name") or "").strip():
+        horizon_dict["strategy_name"] = classified
+
     max_loss = result["max_loss"]
     max_profit = result["max_profit"]
+    net_premium = result["net_premium"]
     be = ", ".join(f"{b:,.2f}" for b in result["breakevens"]) if result["breakevens"] else "n/a"
+
+    # Sanity check: a credit that consumes most of the spread's width isn't
+    # impossible (it happens for ATM short straddle-style structures), but
+    # it's unusual enough to warrant flagging for a manual premium check
+    # rather than presenting it silently as fully verified.
+    strikes = sorted(set(l["strike"] for l in priced_legs))
+    width = strikes[-1] - strikes[0] if len(strikes) > 1 else 0
+    rich_credit_flag = ""
+    if width > 0 and net_premium > 0 and (net_premium / width) > 0.5:
+        pct_of_width = net_premium / width * 100
+        rich_credit_flag = (
+            f" ⚠ Net credit is {pct_of_width:.0f}% of the {width:g}-point spread width -- unusually rich; "
+            f"double-check these premiums against a live broker terminal before trusting this figure."
+        )
 
     horizon_dict["max_loss"] = f"₹{max_loss:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
     horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
@@ -761,9 +1077,69 @@ def apply_verified_payoff(horizon_dict, horizon_snap):
         f"Capped at max loss (₹{max_loss:,.0f}) even on a gap beyond the strikes -- "
         f"this is a defined-risk structure, so gap risk cannot exceed max loss."
     )
+    horizon_dict["adjustment_trigger"] = generate_adjustment_trigger(priced_legs, net_premium)
+
+    # --- Expected move (pass-through from the live-data snapshot) ---
+    exp_move = (horizon_snap or {}).get("expected_move")
+    if exp_move:
+        horizon_dict["expected_move"] = (
+            f"±{exp_move['expected_move_pts']:g} pts (~{exp_move.get('expected_move_pct', 'n/a')}% of spot) "
+            f"by expiry, from the {exp_move['atm_strike']:g} ATM straddle"
+        )
+    else:
+        horizon_dict["expected_move"] = "n/a (no ATM straddle premium available this run)"
+
+    # --- Net Greeks (Black-Scholes, from real fetched per-strike IV) ---
+    expiry_dt = None
+    try:
+        expiry_dt = _parse_nse_date((horizon_snap or {}).get("expiry", ""))
+    except (ValueError, TypeError):
+        expiry_dt = None
+    t_years = time_to_expiry_years(expiry_dt) if expiry_dt else None
+
+    greeks_ok = spot is not None and t_years is not None and not is_eod  # Bhavcopy carries no IV
+    net_delta = net_gamma = net_theta = net_vega = 0.0
+    if greeks_ok:
+        for leg in priced_legs:
+            iv = _leg_iv(horizon_snap, leg["strike"], leg["type"])
+            g = bs_greeks(spot, leg["strike"], t_years, iv, leg["type"])
+            if g is None:
+                greeks_ok = False
+                break
+            sign = 1 if leg["action"] == "Buy" else -1
+            net_delta += sign * g["delta"]
+            net_gamma += sign * g["gamma"]
+            net_theta += sign * g["theta"]
+            net_vega += sign * g["vega"]
+
+    if greeks_ok:
+        horizon_dict["net_greeks"] = (
+            f"Δ {net_delta * NIFTY_LOT_SIZE:+.1f} · Γ {net_gamma * NIFTY_LOT_SIZE:+.3f} · "
+            f"Θ ₹{net_theta * NIFTY_LOT_SIZE:+,.0f}/day · Vega ₹{net_vega * NIFTY_LOT_SIZE:+,.0f}/vol pt "
+            f"(per lot, from live IV; positive Θ = time decay working in your favor)"
+        )
+    else:
+        greeks_reason = "EOD Bhavcopy has no IV column" if is_eod else "live IV unavailable for one or more legs this run"
+        horizon_dict["net_greeks"] = f"n/a ({greeks_reason})"
+
+    # --- Probability of profit (flat-IV lognormal, ATM IV for this expiry) ---
+    pop = None
+    if not is_eod and spot is not None and t_years is not None and exp_move:
+        atm_iv = _leg_iv(horizon_snap, exp_move["atm_strike"], "CE") or _leg_iv(horizon_snap, exp_move["atm_strike"], "PE")
+        pop = compute_pop(spot, t_years, atm_iv, result["payoff_fn"], result["breakevens"])
+    horizon_dict["probability_of_profit"] = (
+        f"~{pop:.0f}% (model: flat ATM IV, lognormal price at expiry -- not a guarantee)"
+        if pop is not None else "n/a (requires live IV, unavailable this run)"
+    )
+
+    # --- Margin (approximate) and Return on Margin ---
+    margin, rom = estimate_margin_and_rom(max_loss, max_profit, priced_legs, NIFTY_LOT_SIZE)
+    horizon_dict["margin_required"] = f"~₹{margin:,.0f} per lot (approx. -- confirm exact figure in your broker's margin calculator)"
+    horizon_dict["return_on_margin"] = f"~{rom:.1f}%" if rom is not None else "n/a"
+
     horizon_dict["verification"] = (
-        f"✅ Verified from live premiums: net {'credit' if result['net_premium'] >= 0 else 'debit'} "
-        f"of {abs(result['net_premium']):.2f} pts/leg-set."
+        f"✅ Verified from {premium_label}: net {'credit' if net_premium >= 0 else 'debit'} "
+        f"of {abs(net_premium):.2f} pts/leg-set.{label_note}{rich_credit_flag}"
     )
     horizon_dict["_verified_max_loss_inr"] = max_loss
     return horizon_dict
@@ -800,7 +1176,7 @@ NON-NEGOTIABLE CONSTRAINTS
 3. CAPITAL PROTECTION RULES.
    - Max capital at risk per horizon must not exceed {PER_HORIZON_CAP_PCT:.0f}% of a hypothetical total options-trading capital pool.
    - Aggregate capital at risk across all four horizons combined must not exceed {AGGREGATE_CAP_PCT:.0f}%.
-   - State the stop-loss / adjustment trigger for each recommendation (e.g. "exit if Nifty closes beyond X level" or "adjust if short strike is breached").
+   - Do NOT write a stop-loss/adjustment trigger yourself -- a standard one (short-strike breach, or loss reaching a set multiple of credit/premium) is generated in code from your chosen strikes after you respond.
    - Do NOT compute the rupee max loss/profit or the % of capital yourself -- those are calculated from real fetched premiums after you respond (see OUTPUT FORMAT). Focus only on choosing strikes/legs that keep risk within the caps once priced.
 
 4. This is a stateless, any-time request -- today is {today_str}, and this run is being generated during: {session_label}. Produce a full, self-contained recommendation using only live data you can find right now; do not assume access to any prior recommendation.
@@ -829,7 +1205,7 @@ ADDITIONAL LIVE DATA TO SEARCH FOR (only for what the LIVE DATA FEED above does 
 - Any major near-term event risk (RBI policy, US Fed meeting, major earnings cluster, budget/election dates) that falls within each horizon's window
 - Use ONLY primary/official sources: NSE option chain and Bhavcopy, NSE market statistics, India VIX, NSE FII/DII statistics, GIFT Nifty/SGX derivatives data, RBI's policy calendar, company earnings calendars, and official exchange circulars. Never cite social media (Instagram, YouTube, X/Twitter), influencer "prediction" videos, or unsourced broker marketing content as a basis for any figure or bias.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML). NOTE: max_loss, max_profit, the two pct_capital fields, breakeven, and gap_risk are NOT requested below -- they are calculated from real fetched premiums in code after parsing your "legs" field, specifically to avoid the arithmetic errors that come from an LLM inventing option payoff numbers. Your job is only to choose the strikes; be precise and unambiguous in "legs" (format: "Sell 25000 CE, Buy 25200 CE" -- always "Buy"/"Sell", a strike from the live data, and "CE"/"PE"):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML). NOTE: max_loss, max_profit, the two pct_capital fields, breakeven, gap_risk, net Greeks (delta/theta/vega/gamma), probability of profit, margin required, and return on margin are NOT requested below -- they are all calculated from real fetched premiums/IVs in code after parsing your "legs" field, specifically to avoid the arithmetic errors that come from an LLM inventing option payoff numbers. Your job is only to choose the strikes; be precise and unambiguous in "legs" (format: "Sell 25000 CE, Buy 25200 CE" -- always "Buy"/"Sell", a strike from the live data, and "CE"/"PE"):
 
 {{
   "horizons": [
@@ -841,7 +1217,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
       "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
-      "adjustment_trigger": "The specific exit/adjust rule, per constraint #3",
+      "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'outside the expected-move band and beyond the nearest major OI wall'",
       "confidence": "One of: High / Medium / Low",
       "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- be honest here"
     }},
@@ -849,7 +1225,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
     {{ "horizon": "Quarterly", ... same fields ... }},
     {{ "horizon": "Annual", ... same fields ... }}
   ],
-  "portfolio_view": "One paragraph: are you net long or net short gamma across all four horizons combined, and does the combined structure over- or under-hedge overall market gap risk (aggregate capital at risk will be summed and checked against the {AGGREGATE_CAP_PCT:.0f}% cap in code, not from a figure you provide)"
+  "portfolio_view": "One paragraph: are you net long or net short gamma across all four horizons combined, and does the combined structure over- or under-hedge overall market gap risk. Do NOT state or estimate the aggregate capital-at-risk percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
 }}
 """
 
@@ -965,11 +1341,17 @@ def _horizon_card_html(h, sans, serif):
         raw_row("Directional Bias (Current Week)" if h.get("next_week_bias") else "Directional Bias", _bias_badge(h.get("bias"))),
         *([raw_row("Directional Bias (Next Week)", _bias_badge(h.get("next_week_bias")))] if h.get("next_week_bias") else []),
         row("Bias Rationale", "bias_reason"),
+        row("Strike Selection Rationale", "strike_rationale"),
+        row("Expected Move (ATM Straddle)", "expected_move"),
         row("Max Loss", "max_loss", value_color="#8B2E2E", bold=True),
         row("Max Loss (% of horizon capital)", "max_loss_pct_capital", value_color="#8B2E2E"),
         row("Max Profit", "max_profit", value_color="#2F5233", bold=True),
         row("Max Profit (% of horizon capital)", "max_profit_pct_capital", value_color="#2F5233"),
         row("Breakeven", "breakeven"),
+        row("Probability of Profit", "probability_of_profit"),
+        row("Net Greeks (per lot)", "net_greeks"),
+        row("Margin Required", "margin_required"),
+        row("Return on Margin", "return_on_margin"),
         row("Gap Risk", "gap_risk"),
         row("Adjustment / Exit Trigger", "adjustment_trigger"),
         raw_row("Confidence", _confidence_badge(h.get("confidence"))),
@@ -988,6 +1370,23 @@ def _horizon_card_html(h, sans, serif):
   </table>
 </div>
 """
+
+
+def _strip_cap_claims(text):
+    """Removes any sentence where the model asserted or implied cap
+    compliance (e.g. 'stays within the 15% aggregate limit') -- the model
+    is never in a position to know this correctly since the real aggregate
+    is only summed from verified per-horizon numbers AFTER it responds, and
+    letting its guess stand next to the real figure is exactly what
+    produced the self-contradiction (issue #1)."""
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    kept = [
+        s for s in sentences
+        if not (re.search(r"%", s) and re.search(r"\b(cap|limit)\b", s, re.IGNORECASE))
+    ]
+    return " ".join(kept).strip()
 
 
 def render_horizons_html(horizons, aggregate_pct, portfolio_view):
@@ -1016,12 +1415,23 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
 
     agg_display = _esc(aggregate_pct)
     agg_color = "#14213D"
+    over_cap = False
     try:
-        if float(str(aggregate_pct).replace("%", "").strip()) > AGGREGATE_CAP_PCT:
-            agg_color = "#8B2E2E"  # flag if the model's own math breached the cap
+        over_cap = float(str(aggregate_pct).replace("%", "").strip()) > AGGREGATE_CAP_PCT
+        if over_cap:
+            agg_color = "#8B2E2E"
     except (TypeError, ValueError):
         pass
 
+    # This is the single authoritative statement of cap compliance -- always
+    # computed from the same verified figure shown in the badge above it, so
+    # it can never contradict what's displayed next to it (issue #1).
+    verdict = (
+        f"⚠ EXCEEDS the {AGGREGATE_CAP_PCT:.0f}% aggregate cap -- reduce position size before entering."
+        if over_cap else
+        f"✅ Stays within the {AGGREGATE_CAP_PCT:.0f}% aggregate cap."
+    )
+    portfolio_text = _strip_cap_claims(portfolio_view)
     portfolio_html = (
         f'<div style="margin-top:16px;padding:12px 14px;background:#FAF9F6;'
         f'border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;">'
@@ -1030,7 +1440,8 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         f'&nbsp;&middot;&nbsp; Aggregate Capital at Risk: '
         f'<span style="color:{agg_color};">{agg_display}%</span> '
         f'(cap {AGGREGATE_CAP_PCT:.0f}%)</div>'
-        f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(portfolio_view)}</div>'
+        f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(portfolio_text)}</div>'
+        f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{agg_color};margin-top:8px;">{verdict}</div>'
         f'</div>'
     )
 
@@ -1239,6 +1650,12 @@ def finalize_horizons(horizons, live_data):
             "breakeven": "n/a",
             "gap_risk": "n/a",
             "adjustment_trigger": "n/a",
+            "strike_rationale": "n/a",
+            "expected_move": "n/a",
+            "net_greeks": "n/a",
+            "probability_of_profit": "n/a",
+            "margin_required": "n/a",
+            "return_on_margin": "n/a",
             "confidence": "n/a",
             "data_status": "unavailable",
             "verification": "Omitted: long-dated option chain unavailable or insufficiently liquid.",
@@ -1250,7 +1667,7 @@ def finalize_horizons(horizons, live_data):
         if h.get("_verified_max_loss_inr") is not None:
             continue  # Annual placeholder already finalized above
         snap = (live_data.get("horizons") or {}).get(name, {})
-        apply_verified_payoff(h, snap)
+        apply_verified_payoff(h, snap, live_data.get("spot"))
 
     for h in by_name.values():
         v = h.get("_verified_max_loss_inr", 0.0)
