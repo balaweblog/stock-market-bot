@@ -104,6 +104,16 @@ _NSE_HEADERS = {
 }
 
 
+# Optional proxy for NSE requests only (Yahoo Finance / everything else is
+# unaffected). Set NSE_PROXY_URL to a residential/non-CI proxy or VPN egress
+# (e.g. "http://user:pass@proxyhost:port") if NSE's WAF is blocking your
+# runner's IP outright -- that's the one thing that can actually restore the
+# live feed, since no amount of header/retry tuning changes which IP NSE sees.
+# Left unset, requests go out directly exactly as before.
+_NSE_PROXY_URL = os.getenv("NSE_PROXY_URL", "").strip()
+_NSE_PROXIES = {"http": _NSE_PROXY_URL, "https": _NSE_PROXY_URL} if _NSE_PROXY_URL else None
+
+
 def _describe_http_error(e):
     """Pulls out the bits that actually explain an NSE fetch failure --
     HTTP status code and a short body snippet for HTTPError, or the
@@ -120,6 +130,23 @@ def _describe_http_error(e):
             pass
         return f"HTTP {resp.status_code} ({type(e).__name__}){' -- ' + snippet if snippet else ''}"
     return f"{type(e).__name__}: {e}"
+
+
+def _is_retryable_nse_error(e):
+    """Distinguishes a plausibly-transient failure (worth a quick retry)
+    from one that means "this IP/session is blocked" (retrying is wasted
+    time, since it'll fail the same way every time). requests.Timeout
+    (ReadTimeout/ConnectTimeout) is the signature of a WAF silently
+    stalling a flagged connection rather than answering -- retrying that
+    from the same IP just repeats the same stall. A 5xx HTTPError or a
+    raw ConnectionError (reset, refused) is more consistent with a
+    genuine transient blip and is worth one retry."""
+    if isinstance(e, requests.exceptions.Timeout):
+        return False
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        return 500 <= resp.status_code < 600
+    return isinstance(e, requests.exceptions.ConnectionError)
 
 
 def _nse_warm_session(session, timeout, referer_path="/option-chain"):
@@ -139,14 +166,18 @@ def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
     """Pulls the live, full option chain (all listed expiries, every
     strike's OI/changeInOI/IV/LTP for CE and PE) straight from NSE's
     option-chain JSON endpoint. Returns the parsed dict, or None on any
-    failure (network, block, non-200, bad JSON). Retries a couple of times
-    with a fresh session + backoff, since a single 401/403/timeout from
-    NSE's edge is often transient rather than a permanent block."""
+    failure (network, block, non-200, bad JSON). Retries plausibly-transient
+    failures (5xx, connection reset) with backoff, but fails fast on a
+    Timeout -- that's the signature of a blocked IP being silently
+    stalled by NSE's WAF, and repeating it just burns the run's time
+    budget for no chance of a different outcome."""
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
             session = requests.Session()
             session.headers.update(_NSE_HEADERS)
+            if _NSE_PROXIES:
+                session.proxies.update(_NSE_PROXIES)
             _nse_warm_session(session, timeout, "/option-chain")
             resp = session.get(
                 f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}",
@@ -160,11 +191,17 @@ def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
                 f"NSE option-chain fetch attempt {attempt}/{max_attempts} failed for "
                 f"{symbol}: {_describe_http_error(e)}"
             )
-            if attempt < max_attempts:
+            if attempt < max_attempts and _is_retryable_nse_error(e):
                 time.sleep(1.5 * attempt)  # linear backoff between attempts
+            elif attempt < max_attempts:
+                main.log.warning(
+                    f"NSE option-chain fetch for {symbol}: error looks like a block "
+                    f"rather than a transient blip -- skipping remaining retries."
+                    + (" Set NSE_PROXY_URL to route around it." if not _NSE_PROXIES else "")
+                )
+                break
     main.log.warning(
-        f"NSE option-chain fetch failed for {symbol} after {max_attempts} attempts: "
-        f"{_describe_http_error(last_err)}"
+        f"NSE option-chain fetch failed for {symbol}: {_describe_http_error(last_err)}"
     )
     return None
 
@@ -336,8 +373,10 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
     zipped EOD settlement CSV covering every listed F&O instrument) for the
     given date. Returns a list of CSV row dicts, or None on failure (file
     not yet published, weekend/holiday, network block, format change).
-    Tries each candidate archive host in turn, with a short retry on each,
-    before giving up on this date entirely."""
+    Tries each candidate archive host in turn. Only retries a host when the
+    failure looks transient (5xx, connection reset); a Timeout moves
+    straight to the next host instead of repeating the same stall, since
+    that's what a WAF silently blocking this IP looks like."""
     date_path = _BHAVCOPY_FO_PATH.format(yyyymmdd=trade_date.strftime("%Y%m%d"))
     last_err = None
     for host in _BHAVCOPY_FO_HOSTS:
@@ -346,6 +385,8 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
             try:
                 session = requests.Session()
                 session.headers.update(_NSE_HEADERS)
+                if _NSE_PROXIES:
+                    session.proxies.update(_NSE_PROXIES)
                 resp = session.get(url, timeout=timeout)
                 resp.raise_for_status()
                 with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -358,11 +399,14 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
                     f"NSE Bhavcopy fetch failed for {trade_date.date()} via {host} "
                     f"(attempt {attempt}/{max_attempts_per_host}): {_describe_http_error(e)}"
                 )
-                if attempt < max_attempts_per_host:
+                if attempt < max_attempts_per_host and _is_retryable_nse_error(e):
                     time.sleep(1.0 * attempt)
+                else:
+                    break  # move on to the next host rather than repeating a non-transient failure
     main.log.warning(
         f"NSE Bhavcopy fetch failed for {trade_date.date()} across all hosts "
         f"({', '.join(_BHAVCOPY_FO_HOSTS)}): {_describe_http_error(last_err)}"
+        + (" Set NSE_PROXY_URL to route around a possible IP block." if not _NSE_PROXIES else "")
     )
     return None
 
