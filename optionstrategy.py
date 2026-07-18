@@ -397,7 +397,10 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
             )
             if fut_closes:
                 data["spot"] = fut_closes[0][1]
+                data["spot_source"] = f"EOD Bhavcopy near-month futures close proxy ({bhav_date.strftime('%d-%b-%Y')})"
                 notes.append("Spot figure is a Bhavcopy near-month futures CLOSE proxy, not true cash spot.")
+
+        data["option_chain_source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')}) — last trading day's close, not live"
 
         expiry_dts = {
             _parse_bhavcopy_date(r.get("XpryDt", ""))
@@ -448,8 +451,11 @@ def fetch_live_market_data():
         "status": "failed",
         "fetched_at": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %b %Y, %I:%M %p IST"),
         "spot": None,
+        "spot_source": None,
         "vix": None,
         "vix_change_pct": None,
+        "vix_source": None,
+        "option_chain_source": None,
         "horizons": {},
         "notes": notes,
         "annual_usable": None,   # None = not yet evaluated (e.g. total fetch failure)
@@ -461,6 +467,7 @@ def fetch_live_market_data():
             vix_hist = yf.Ticker("^INDIAVIX").history(period="5d")
             if not vix_hist.empty:
                 data["vix"] = round(float(vix_hist["Close"].iloc[-1]), 2)
+                data["vix_source"] = "Yahoo Finance (^INDIAVIX)"
                 if len(vix_hist) >= 2:
                     prev = float(vix_hist["Close"].iloc[-2])
                     data["vix_change_pct"] = round((data["vix"] - prev) / prev * 100, 2)
@@ -470,6 +477,7 @@ def fetch_live_market_data():
             spot_hist = yf.Ticker("^NSEI").history(period="1d")
             if not spot_hist.empty:
                 data["spot"] = round(float(spot_hist["Close"].iloc[-1]), 2)
+                data["spot_source"] = "Yahoo Finance (^NSEI)"
         except Exception as e:
             notes.append(f"Yahoo Finance Nifty spot fetch failed: {e}")
     else:
@@ -491,6 +499,9 @@ def fetch_live_market_data():
         records = chain.get("records", {})
         if data["spot"] is None:
             data["spot"] = records.get("underlyingValue")
+            if data["spot"] is not None:
+                data["spot_source"] = "NSE option-chain API (underlyingValue)"
+        data["option_chain_source"] = f"Live NSE option-chain API (fetched {data['fetched_at']})"
         horizon_expiries = _pick_horizon_expiries(records.get("expiryDates", []))
         rows = records.get("data", [])
         for horizon, expiry in horizon_expiries.items():
@@ -992,14 +1003,13 @@ def generate_adjustment_trigger(priced_legs, net_premium):
 
 
 def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
-    """Appends real fetched numbers to the model's qualitative strike
-    rationale: the actual highest-OI CE/PE strikes and their OI, the OI %
-    change at whichever short strike(s) were actually chosen, and whether
-    each short strike sits outside the expected-move (1-SD-ish) band --
-    turning a vague 'near top OI' into something like 'Short strike 24000
-    chosen because PE OI +18%; expected move ±246, strike lies outside the
-    1-SD band' (issue #3). Returns "" if there isn't enough live data to
-    say anything concrete."""
+    """Appends real fetched/computed numbers to the model's qualitative
+    strike rationale for EVERY short strike actually chosen: its own OI,
+    the OI % change, the expiry's expected move, and the strike's
+    Black-Scholes delta (from live IV) -- turning a vague 'near top OI'
+    into something like 'Short strike 24000 (PE): OI 6,000,000 (+18%); Δ
+    -0.32; expected move ±246; outside the 1-SD band' (issue #2/#3).
+    Returns "" if there isn't enough live data to say anything concrete."""
     if not horizon_snap:
         return ""
 
@@ -1011,24 +1021,45 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     if top_put_oi:
         parts.append(f"Highest PE OI: {top_put_oi[0][0]:g} ({top_put_oi[0][1]:,} OI)")
 
+    oi_by_strike = {"CE": dict(top_call_oi), "PE": dict(top_put_oi)}
     call_chg = horizon_snap.get("call_oi_chg_pct") or {}
     put_chg = horizon_snap.get("put_oi_chg_pct") or {}
     exp_move = horizon_snap.get("expected_move")
     band_lo = band_hi = None
     if exp_move and spot is not None:
         band_lo, band_hi = spot - exp_move["expected_move_pts"], spot + exp_move["expected_move_pts"]
+        parts.append(f"Expected move: ±{exp_move['expected_move_pts']:g}")
+
+    is_eod = bool(horizon_snap.get("source"))  # Bhavcopy has no IV -- delta unavailable
+    t_years = None
+    if not is_eod:
+        try:
+            t_years = time_to_expiry_years(_parse_nse_date(horizon_snap.get("expiry", "")))
+        except (ValueError, TypeError):
+            t_years = None
 
     short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
     for leg in short_legs:
         strike, opt_type = leg["strike"], leg["type"]
+        oi_val = oi_by_strike[opt_type].get(strike, oi_by_strike[opt_type].get(int(strike) if float(strike).is_integer() else strike))
         chg_map = call_chg if opt_type == "CE" else put_chg
         chg = chg_map.get(strike, chg_map.get(int(strike) if float(strike).is_integer() else strike))
-        chg_note = f"{opt_type} OI {chg:+.0f}%" if chg is not None else f"{opt_type} OI change n/a"
+        oi_note = f"OI {oi_val:,}" if oi_val is not None else "OI n/a"
+        chg_note = f"{chg:+.0f}% chg" if chg is not None else "chg n/a"
+
+        delta_note = "Δ n/a"
+        if t_years is not None and spot is not None:
+            iv = _leg_iv(horizon_snap, strike, opt_type)
+            g = bs_greeks(spot, strike, t_years, iv, opt_type)
+            if g is not None:
+                delta_note = f"Δ {g['delta']:+.2f}"
+
         band_note = ""
         if band_lo is not None:
             outside = strike < band_lo or strike > band_hi
-            band_note = " -- outside the 1-SD expected-move band" if outside else " -- inside the 1-SD expected-move band (elevated risk)"
-        parts.append(f"Short strike {strike:g} chosen: {chg_note}{band_note}")
+            band_note = " -- outside the 1-SD band" if outside else " -- inside the 1-SD band (elevated risk)"
+
+        parts.append(f"Short strike {strike:g} ({opt_type}): {oi_note} ({chg_note}); {delta_note}{band_note}")
 
     return " | ".join(parts)
 
@@ -1537,6 +1568,81 @@ def compute_portfolio_gamma_summary(horizons):
     )
 
 
+_EXPECTED_MOVE_RE = re.compile(r"±[\d,]+(?:\.\d+)?")
+_POP_RE = re.compile(r"~[\d.]+%")
+_MAX_LOSS_RE = re.compile(r"₹[\d,]+")
+
+
+def render_strategy_summary_table(horizons):
+    """One-line-per-horizon overview table (Horizon / Strategy / Bias /
+    Expected Move / POP / Max Risk / Confidence) shown before the detailed
+    per-horizon cards, so the reader gets the shape of the whole
+    recommendation at a glance. Every cell is extracted from the same
+    authoritative, already-computed strings shown in the detailed cards
+    below (never recomputed or re-derived here) -- so the summary can never
+    drift from or contradict the detail it's summarizing."""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+    by_name = {}
+    for h in horizons:
+        key = str(h.get("horizon") or "").strip()
+        if key:
+            by_name[key] = h
+
+    def _extract(pattern, text, default="n/a"):
+        m = pattern.search(text or "")
+        return m.group(0) if m else default
+
+    def _cell(text, header=False, color="#14213D"):
+        weight = "font-weight:700;" if header else ""
+        bg = "background:#14213D;color:#ffffff;" if header else f"color:{color};"
+        border = "" if header else "border-top:1px solid #EDEAE2;"
+        return (
+            f'<td style="padding:7px 10px;font-size:11px;{weight}font-family:{sans};'
+            f'{bg}{border}text-align:left;">{text}</td>'
+        )
+
+    header_cells = "".join(
+        _cell(h, header=True) for h in
+        ("Horizon", "Strategy", "Bias", "Expected Move", "POP", "Max Risk", "Confidence")
+    )
+    header_row = f'<tr>{header_cells}</tr>'
+
+    body_rows = []
+    for label in HORIZON_ORDER:
+        h = by_name.get(label)
+        if not h:
+            continue
+        strategy = _esc(h.get("strategy_name"))
+        bias = _esc(h.get("bias"))
+        exp_move = _extract(_EXPECTED_MOVE_RE, h.get("expected_move"))
+        pop = _extract(_POP_RE, h.get("probability_of_profit"))
+        max_risk = _extract(_MAX_LOSS_RE, h.get("max_loss"))
+        confidence = _esc(h.get("confidence"))
+        cells = "".join([
+            _cell(f"<b>{html.escape(label)}</b>"),
+            _cell(html.escape(strategy)),
+            _cell(html.escape(bias)),
+            _cell(html.escape(exp_move)),
+            _cell(html.escape(pop)),
+            _cell(html.escape(max_risk), color="#8B2E2E"),
+            _cell(html.escape(confidence)),
+        ])
+        body_rows.append(f'<tr>{cells}</tr>')
+
+    if not body_rows:
+        return ""
+
+    return f"""
+<div style="margin-bottom:16px;overflow-x:auto;">
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
+    {header_row}
+    {''.join(body_rows)}
+  </table>
+</div>
+"""
+
+
 def render_horizons_html(horizons, aggregate_pct, portfolio_view):
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     serif = "Georgia,'Times New Roman',serif"
@@ -1599,7 +1705,8 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         f'</div>'
     )
 
-    return cards + portfolio_html
+    summary_table_html = render_strategy_summary_table(horizons)
+    return summary_table_html + cards + portfolio_html
 
 
 # -----------------------------
@@ -1646,7 +1753,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
     if used_live_search:
         disclaimer = (
             "Generated using a live-web-search-capable model plus a direct NSE/Yahoo data fetch -- see "
-            "\"Sources checked\" and the live-feed summary above for what was actually used. Options-chain "
+            "\"Market Data Inputs\" and the live-feed summary above for what was actually used. Options-chain "
             "levels, IV, and OI figures can still be a few minutes to hours stale, incomplete, or misread by "
             "the model. Verify every strike, premium, and Greek against your broker's live options chain "
             "before placing any order. Not investment advice."
@@ -1659,9 +1766,9 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
             "confirming every figure against a real-time options chain first. Not investment advice."
         )
 
-    sources_html = swing._build_sources_html(sources)
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     serif = "Georgia,'Times New Roman',serif"
+    sources_html = render_market_data_inputs_html(live_data, sources, sans)
     live_tag = (
         '<span style="color:#B08D57;">&nbsp;&middot;&nbsp; Live web search used</span>'
         if used_live_search else ""
@@ -1889,6 +1996,118 @@ def _filter_sources(sources):
             continue
         out.append(s)
     return out
+
+
+# -----------------------------
+# Market Data Inputs (replaces the generic "Sources Consulted" link-dump)
+# -----------------------------
+_CATEGORY_KEYWORDS = {
+    "Nifty Futures": ("nifty futures", "futures price", "futures basis"),
+    "FII/DII Activity": (
+        "fii", "dii", "foreign institutional", "foreign portfolio investor",
+        "domestic institutional", "fii/dii", "fpi",
+    ),
+    "GIFT Nifty / Pre-Market": ("gift nifty", "sgx nifty", "gift city", "pre-market", "premarket"),
+    "Event Calendar": (
+        "rbi", "fomc", "federal reserve", "fed meeting", "monetary policy",
+        "earnings calendar", "union budget", "budget session", "election",
+    ),
+}
+
+
+def _categorize_source(s):
+    """Buckets an already domain-allowlisted source (see _filter_sources)
+    into one of the Market Data Inputs categories below by keyword match on
+    its title/URL. Returns None if it doesn't match a recognized category --
+    callers drop those rather than showing them under a generic catch-all
+    bucket, so a stray "top breakout stocks this week" link that happened
+    to sit on an allowlisted domain still can't surface here."""
+    if isinstance(s, dict):
+        url = str(s.get("url") or s.get("link") or "")
+        title = str(s.get("title") or s.get("name") or "")
+    else:
+        url, title = str(s), ""
+    text = f"{url} {title}".lower()
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            return cat
+    return None
+
+
+def render_market_data_inputs_html(live_data, sources, sans):
+    """Structured manifest of the actual data used this run -- Spot,
+    Futures, Option Chain/Bhavcopy, India VIX, FII/DII Activity, GIFT
+    Nifty, and Event Calendar -- each attributed to where it really came
+    from, replacing the old generic "Sources Consulted" link-dump. Spot,
+    VIX, and Option Chain/Bhavcopy are deterministic (always known one way
+    or another, from the direct NSE/Yahoo fetch); the other four are
+    search-only categories and show only sources that were actually found
+    and matched to that category -- anything uncategorized (including
+    unrelated stock-recommendation links surfaced by the shared search
+    pipeline) is dropped rather than shown under a catch-all."""
+    live_data = live_data or {}
+
+    def _row(label, value_html):
+        return (
+            f'<tr><td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#4A5063;border-top:1px solid #EDEAE2;width:34%;">{label}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#14213D;border-top:1px solid #EDEAE2;">{value_html}</td></tr>'
+        )
+
+    spot_val = _esc(live_data.get("spot"))
+    spot_src = _esc(live_data.get("spot_source") or "unavailable this run")
+    vix_val = _esc(live_data.get("vix"))
+    vix_src = _esc(live_data.get("vix_source") or "unavailable this run")
+    oc_src = _esc(
+        live_data.get("option_chain_source")
+        or "unavailable this run (direct fetch and EOD Bhavcopy fallback both failed)"
+    )
+
+    rows = [
+        _row("Spot", f'{spot_val} &nbsp;&middot;&nbsp; <span style="color:#8A8F9C;">{spot_src}</span>'),
+        _row("Option Chain / Bhavcopy", f'<span style="color:#8A8F9C;">{oc_src}</span>'),
+        _row("India VIX", f'{vix_val} &nbsp;&middot;&nbsp; <span style="color:#8A8F9C;">{vix_src}</span>'),
+    ]
+
+    by_cat = {}
+    for s in (sources or []):
+        cat = _categorize_source(s)
+        if cat:
+            by_cat.setdefault(cat, []).append(s)
+
+    def _links_cell(cat_sources):
+        links = []
+        for s in cat_sources[:3]:
+            if isinstance(s, dict):
+                url = s.get("url") or s.get("link") or ""
+                title = s.get("title") or s.get("name") or url
+            else:
+                url, title = str(s), str(s)
+            if url:
+                links.append(f'<a href="{html.escape(str(url))}" style="color:#8A6D3B;">{html.escape(str(title))}</a>')
+            elif title:
+                links.append(html.escape(str(title)))
+        if links:
+            return "<br>".join(links)
+        return '<span style="color:#8A8F9C;">not found in this run&#8217;s search</span>'
+
+    for label, cat_key in (
+        ("Nifty Futures", "Nifty Futures"),
+        ("FII/DII Activity", "FII/DII Activity"),
+        ("GIFT Nifty", "GIFT Nifty / Pre-Market"),
+        ("Event Calendar", "Event Calendar"),
+    ):
+        rows.append(_row(label, _links_cell(by_cat.get(cat_key, []))))
+
+    return f"""
+<div style="margin-top:16px;">
+  <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Market Data Inputs</div>
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #EDEAE2;border-radius:4px;overflow:hidden;">
+    {''.join(rows)}
+  </table>
+</div>
+"""
 
 
 def run():
