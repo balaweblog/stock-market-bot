@@ -881,7 +881,14 @@ def format_live_data_block(data):
         f"horizons use data_status='partial' at best and say so in bias_reason. "
         f"Only web-search for whatever is marked unavailable below, plus "
         f"qualitative context (FII/DII flows, GIFT Nifty pre-market, US/Asian "
-        f"markets overnight, event risk):",
+        f"markets overnight, event risk). Wherever premiums/IVs are listed below, "
+        f"pick legs ONLY from those strikes (real OI + real fetched premium) -- "
+        f"max profit/loss/breakeven, Greeks, POP, and margin/ROM are all CALCULATED "
+        f"FROM THOSE REAL PREMIUMS by code after you respond, not from any number "
+        f"you write, so don't compute them yourself. In 'strike_rationale', "
+        f"describe qualitatively why you picked each short strike (e.g. 'outside "
+        f"the expected-move band' or 'near the top OI concentration') -- no delta "
+        f"or POP numbers, since those are verified separately.",
         f"- Nifty 50 spot: {data.get('spot', 'n/a')}",
         "- India VIX: "
         + str(data.get("vix", "n/a"))
@@ -929,17 +936,6 @@ def format_live_data_block(data):
                 ce_iv = "; ".join(f"{s}: {call_iv[s]:.1f}%" for s in top_call_strikes if s in call_iv) or "n/a"
                 pe_iv = "; ".join(f"{s}: {put_iv[s]:.1f}%" for s in top_put_strikes if s in put_iv) or "n/a"
                 lines.append(f"    Live IV at top-OI strikes -- CE: {ce_iv} | PE: {pe_iv}")
-            lines.append(
-                "    NOTE: only pick strikes for this horizon's legs from strikes that appear "
-                "above (they have both real OI and a real fetched premium) -- max profit/loss/"
-                "breakeven, Greeks (delta/theta/vega/gamma), probability of profit, and margin/ROM "
-                "will all be CALCULATED FROM THESE REAL PREMIUMS/IVs by code after you respond, not "
-                "from any number you write, so do not bother computing them precisely yourself. In "
-                "'strike_rationale' (schema below), just describe qualitatively why you picked each "
-                "short strike (e.g. 'outside the expected-move band above' or 'near the far edge of "
-                "top OI concentration') -- do not state a delta value or POP number, since those are "
-                "verified figures the code will compute and display separately."
-            )
 
     if data.get("notes"):
         lines.append("Fetch notes: " + "; ".join(data["notes"]))
@@ -2526,7 +2522,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
   "horizons": [
     {{
       "horizon": "Weekly",
-      "expiry_date": "The actual expiry date used, e.g. '24 Jul 2026'",
+      "expiry_date": "The actual expiry date for this horizon, copied EXACTLY as shown in the LIVE DATA FEED above (e.g. '24 Jul 2026') -- do not calculate or guess your own expiry cycle date; use the real one already provided.",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "ONLY for the Weekly horizon object: this field is ignored and overridden in code per constraint #5 -- leave it empty or write 'n/a'. Omit entirely for Monthly/Quarterly.",
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",

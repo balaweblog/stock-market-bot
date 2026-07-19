@@ -53,42 +53,38 @@ import main  # reuses LLM init, email config/credentials, and helpers
 # -----------------------------
 def build_prompt():
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
-    return f"""Core Objective: Analyze like PRO and use latest data, Identify a high-conviction swing trade opportunity suitable for a 3 to 5-month holding period, based on a robust blend of professional-grade fundamental, technical, and sentiment analysis, utilizing the most current market data. Give only confident stocks only and make sure you consider global data, Indian market news any risks associated with etc
+    return f"""Core Objective: Using the most current market data as of {today_str}, identify a high-conviction swing trade suitable for a 3-5 month hold, based on a rigorous blend of fundamental, technical, and sentiment analysis. Only recommend a stock you have genuine conviction in; weigh relevant global cues, Indian market news, and risks. Do not fabricate a price, financial figure, or news item -- if you cannot find or verify a real current number for a required field, say so explicitly in "rationale" rather than inventing one.
 
-Stock Selection Strategy (Choose One):
+Stock Selection Strategy (choose one per stock):
+- Momentum Breakout: a large-cap or quality mid-cap breaking out of a multi-month consolidation (Cup and Handle, Multi-Year Base, Symmetrical Triangle on a weekly chart) on significantly above-average volume, signaling a new sustained intermediate-term uptrend.
+- Event-Driven: positioned to gain from a major near-term catalyst (regulatory approval, large contract win, demerger/spinoff, M&A arbitrage) with a clearly quantifiable price impact inside the 3-5 month window.
+- Technical Swing Trade: a stock in a confirmed strong secular uptrend (above 50-WMA and 200-WMA) that has pulled back to a key support level (20-WMA, 38.2%/50% Fibonacci retracement, or horizontal support) with a clear reversal candlestick pattern.
+- Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play.
 
-Analyze and recommend a stock based on one of the following high-probability strategies for the 3-5 month horizon:
+Mandatory analysis parameters:
+- Fundamentals: low debt-to-equity (or strong asset quality for financials), high/improving ROCE/ROE, and check for promoter/institutional buying last quarter.
+- Latest quarter: net profit and revenue growth both above 20% YoY, with margin expansion.
+- Technicals (3-5M view): price above 20-week and 50-week SMA; weekly RSI trending up but below 70; bullish MACD crossover.
+- Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
+- Risk/reward: minimum 1:2.5 based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss until it does rather than reporting a mismatched ratio.
 
-Momentum Breakout: Identify a large-cap or high-quality mid-cap stock that has recently broken out of a multi-month consolidation pattern (e.g., Cup and Handle, Multi-Year Base, or Symmetrical Triangle on a Weekly Chart) with significantly higher-than-average volume. The breakout must signal the start of a new, sustained intermediate-term uptrend.
-Event-Driven: Select a stock positioned to gain from a major near-term corporate catalyst (e.g., successful regulatory approval, large contract win, major demerger/spinoff, or an M&A arbitrage play). The expected price impact must be clearly quantifiable within the 3-5 month window.
-Technical Swing Trade: Pinpoint a stock in a confirmed, strong secular uptrend (e.g., above the 50-WMA and 200-WMA) that has recently experienced a healthy pullback to a key support level (e.g., 20-WMA, Fibonacci Retracement of 38.2% or 50%, or horizontal support) and shows a clear reversal candlestick pattern.
-Fundamental Short-Term Bet: Choose a stock with a compelling valuation that has recently reported exceptionally strong quarterly earnings (both YoY and QoQ growth, with significant beat on analyst consensus) and provided highly positive future guidance. This is a play on the market repricing the stock to reflect the new fundamental reality.
+Provide TWO stocks: the highest-conviction one from any strategy above, and a second from a different strategy if a genuinely qualifying one exists.
 
-Mandatory Analysis Parameters:
-- Fundamental Quality: Excellent Health -- Low Debt-to-Equity (or strong asset quality for financials), High and improving ROCE/ROE. Check for promoter/institutional buying in the last quarter.
-- Quarterly Performance: Highly Positive -- Latest Quarterly Net Profit and Revenue growth must exceed the 20% YoY threshold, with positive margin expansion.
-- Technical Setup (3-5M View): Strong & Sustainable -- Price must be trading above its 20-week and 50-week Simple Moving Averages (SMAs). Use RSI on the weekly chart (must be trending up but below 70 for entry) and MACD for a bullish crossover confirmation.
-- Market/News Sentiment: Overwhelmingly Positive -- Search for recent positive news catalysts (analyst upgrades, sector tailwinds, large orders) that support the intermediate-term view. Check institutional activity (FII/DII) for confidence.
-- Risk Management: Pro-Grade Risk/Reward -- The setup must provide a minimum Risk/Reward Ratio of 1:2.5 based on the proposed Stop-Loss (SL) and Target (T1/T2) levels. State this explicitly as risk_reward_ratio.
-- Data Recency: Use stock prices, news, and financial data as of {today_str}.
-
-Provide the analysis for TWO stocks -- one based on the highest conviction strategy from the list above, and the second from a different strategy if possible.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Keep every field to plain text/numbers only (no HTML):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
 
 {{
   "stocks": [
     {{
       "name": "Stock name",
-      "ticker": "Exact Yahoo Finance ticker symbol for this stock (e.g. 'RELIANCE.NS' for NSE-listed, 'AAPL' for US-listed) -- required, used to fetch a live quote",
+      "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS' for NSE-listed, 'AAPL' for US-listed) -- must be a real symbol you are confident is correct, since it is used to fetch a live quote; a wrong or invented ticker will silently break that lookup",
       "allocation_pct": "e.g. 5-10%",
       "entry_date": "Targeted entry date",
       "exit_date": "Expected exit date, 3-5 months from entry",
       "strategy_type": "Strategy name used",
-      "confidence_score": "Your conviction in this setup, as a number out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
-      "risk_level": "One word: 'Medium' or 'High' -- overall risk of this specific trade",
-      "key_catalysts": "2-4 near-term catalysts driving the thesis, comma-separated, e.g. 'Earnings, AI Chip Launch, Fed Meeting'",
-      "risk_reward_ratio": "e.g. '1 : 2.5', derived from the stop-loss and target levels below",
+      "confidence_score": "Conviction out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
+      "risk_level": "One word: 'Medium' or 'High'",
+      "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, AI Chip Launch, Fed Meeting'",
+      "risk_reward_ratio": "e.g. '1 : 2.5' -- must arithmetically match stop_loss_pct and target1_pct below",
       "upside_target_pct": "Favourable % for 3-5 months",
       "stop_loss_pct": "Risk % (Stop-Loss)",
       "target1_pct": "Expected Profit % (T1)",
