@@ -124,6 +124,24 @@ LOTTERY_POP_THRESHOLD_PCT = float(os.getenv("OPTIONS_LOTTERY_POP_THRESHOLD_PCT",
 # up in the Trade Quality Score row instead of several scattered heuristics.
 CONSIDER_QUALITY_THRESHOLD = float(os.getenv("OPTIONS_CONSIDER_QUALITY_THRESHOLD", "75"))
 
+# Hard reject an Iron Condor whose short strike(s) sit INSIDE the horizon's
+# own 1-sigma expected move (the ATM-straddle-derived band), rather than
+# only flagging it as a confidence/quality ding the way compute_confidence's
+# short-strike-inside-expected-move check already did. A short strike inside
+# the 1-sigma band is priced richer precisely because it is proportionately
+# more likely to be breached before expiry -- for a defined-risk vertical
+# that can be a legitimate, deliberate premium-for-risk trade-off the trader
+# chose strike-by-strike, but a 4-leg Iron Condor is explicitly sold AS a
+# range-bound, "price stays inside this band" bet, so a short strike already
+# inside that band is the structure contradicting its own thesis, not just
+# a spicier version of it. Scoped to Iron Condor only (an Iron Butterfly's
+# shorts are ATM by definition and are excluded from this check, along with
+# verticals/other structures) so this doesn't silently re-purpose a
+# condor-specific rule into a blanket ban on close-to-the-money premium
+# selling. Defaults to on; set OPTIONS_REJECT_IC_SHORT_INSIDE_EM=false to
+# fall back to the old flag-only (non-rejecting) behavior.
+REJECT_IC_SHORT_INSIDE_EM = os.getenv("OPTIONS_REJECT_IC_SHORT_INSIDE_EM", "true").lower() == "true"
+
 HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly"]
 
 # -----------------------------
@@ -1575,11 +1593,13 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
     """Composite 0-100 Trade Quality Score blending six independently-
     interpretable signals, all derived from already-verified fields (real
     premiums/IV, code-computed EV/POP/R:R, code-scored confidence) -- never
-    from the model's own self-assessment. Returns (score:int, breakdown)
-    where breakdown is an ordered dict of {component: (sub_score 0-100,
-    weight_pct)}, so the report can show both the headline number and
-    exactly what drove it (the same "show your work" pattern used
-    elsewhere in this file, e.g. compute_confidence's checks list).
+    from the model's own self-assessment. Returns (score:int, breakdown,
+    penalty_notes) where breakdown is an ordered dict of {component:
+    (sub_score 0-100, weight_pct)}, so the report can show both the
+    headline number and exactly what drove it (the same "show your work"
+    pattern used elsewhere in this file, e.g. compute_confidence's checks
+    list), and penalty_notes is a list of strings describing any hard cap
+    applied below.
 
     Weights (sum to 100%):
       Expected Value  30% -- the single most decision-relevant number: a
@@ -1605,6 +1625,29 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
                               since it's specific and decision-relevant
                               enough to warrant its own weight rather than
                               being folded silently into Confidence.
+
+    Hard caps (applied AFTER the weighted blend above, not folded into it):
+    a linear blend across six components means a single objectively bad
+    signal can still be outvoted by three or four merely-decent ones (e.g.
+    negative EV dragging its own 30%-weighted sub-score to 0 can still
+    leave R:R/POP/Confidence/Liquidity/OI-Alignment averaging high enough
+    to clear 50 on the other 70% of the weight). Each condition below
+    describes a trade that should never read as "roughly a coin flip or
+    better" regardless of how the other components look, so each caps the
+    final score at a ceiling rather than just contributing its own share:
+      - Negative EV            -> capped at 20.
+      - Reward:Risk < 1         -> capped at 40.
+      - Probability of Profit
+        < 20%                   -> capped at 40.
+    These caps are diagnostic, not the primary enforcement mechanism --
+    negative EV and a below-floor Reward:Risk already reject the horizon
+    outright elsewhere (compute_horizon_recommendation rule 3; the
+    MIN_REWARD_RISK_RATIO gate in apply_verified_payoff), and a low-POP
+    trade paired with an implausibly high R:R already gets its own
+    "Lottery-Like Payoff" Caution verdict. The caps here exist so the raw
+    Trade Quality Score number itself stays honest in every case that
+    reaches this function, rather than only being right when nothing else
+    already caught the problem.
     """
     components = {}
 
@@ -1666,7 +1709,29 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
     components["OI Alignment"] = (round(oi_score), 10)
 
     total = sum(sub_score * weight / 100 for sub_score, weight in components.values())
-    return round(total), components
+    score = round(total)
+
+    # Hard caps -- see docstring. Applied after the weighted blend, on the
+    # same already-verified ev_inr/reward_risk_ratio/pop_pct inputs (never
+    # re-derived), so each cap traces to exactly one concrete number a
+    # reader can check against the report's own EV/R:R/POP fields.
+    penalty_notes = []
+    if ev_inr is not None and ev_inr < 0 and score > 20:
+        score = 20
+        penalty_notes.append("Negative EV caps score at 20")
+    if (
+        reward_risk_ratio is not None
+        and reward_risk_ratio != float("inf")
+        and reward_risk_ratio < 1
+        and score > 40
+    ):
+        score = 40
+        penalty_notes.append("Reward:Risk < 1 caps score at 40")
+    if pop_pct is not None and pop_pct < 20 and score > 40:
+        score = 40
+        penalty_notes.append("POP < 20% caps score at 40")
+
+    return score, components, penalty_notes
 
 
 def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None):
@@ -1952,6 +2017,70 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["strategy_name"] = classified
     elif not (horizon_dict.get("strategy_name") or "").strip():
         horizon_dict["strategy_name"] = classified
+
+    # Hard filter (see REJECT_IC_SHORT_INSIDE_EM): an Iron Condor whose
+    # nearer short strike sits inside the horizon's own 1-sigma expected
+    # move is rejected outright, the same way an undefined-risk or
+    # poor-reward:risk structure is -- not just downgraded to a confidence
+    # flag. Checked BEFORE the reward:risk/credit-width gate below so the
+    # rejection reason a reader sees is the actual root cause (thesis
+    # contradiction) rather than whatever generic reward:risk number falls
+    # out of an inside-the-band short strike's inflated credit. Only
+    # applies to a genuine Iron Condor (classify_structure's strike-derived
+    # label, not the model's own claimed name) -- an Iron Butterfly's
+    # ATM shorts are excluded by construction.
+    if REJECT_IC_SHORT_INSIDE_EM and classified == "Iron Condor":
+        exp_move_for_filter = (horizon_snap or {}).get("expected_move") or {}
+        em_pts = exp_move_for_filter.get("expected_move_pts")
+        short_legs_for_filter = [l for l in priced_legs if l["action"] == "Sell"]
+        if spot is not None and em_pts and short_legs_for_filter:
+            nearest_short_for_filter = min(short_legs_for_filter, key=lambda l: abs(l["strike"] - spot))
+            near_distance_for_filter = abs(nearest_short_for_filter["strike"] - spot)
+            if near_distance_for_filter < em_pts:
+                near_multiple_for_filter = near_distance_for_filter / em_pts
+                reason_text = (
+                    f"Short strike {nearest_short_for_filter['strike']:g} is only "
+                    f"{near_distance_for_filter:.0f} pts from spot ({near_multiple_for_filter:.2f}x the "
+                    f"±{em_pts:g}-pt 1-sigma expected move) -- an Iron Condor's short strikes must sit "
+                    f"outside the expected-move band by construction; this one contradicts its own "
+                    f"range-bound thesis."
+                )
+                horizon_dict["max_loss"] = (
+                    f"SHORT STRIKE INSIDE EXPECTED MOVE -- reject this trade "
+                    f"({nearest_short_for_filter['strike']:g} is {near_distance_for_filter:.0f} pts from spot, "
+                    f"{near_multiple_for_filter:.2f}x expected move)"
+                )
+                horizon_dict["max_profit"] = "n/a"
+                horizon_dict["max_loss_pct_capital"] = "n/a"
+                horizon_dict["max_profit_pct_capital"] = "n/a"
+                horizon_dict["breakeven"] = ", ".join(f"{b:,.2f}" for b in result["breakevens"]) if result["breakevens"] else "n/a"
+                horizon_dict["gap_risk"] = "n/a"
+                horizon_dict["adjustment_trigger"] = "n/a"
+                horizon_dict["expected_move"] = (
+                    f"±{em_pts:g} pts (~{exp_move_for_filter.get('expected_move_pct', 'n/a')}% of spot) "
+                    f"by expiry -- short strike sits inside this band"
+                )
+                horizon_dict["net_greeks"] = "n/a"
+                horizon_dict["probability_of_profit"] = None
+                horizon_dict["probability_of_touch"] = None
+                horizon_dict["expected_win_rate"] = None
+                horizon_dict["expected_value"] = None
+                horizon_dict["kelly_pct"] = None
+                horizon_dict["expectancy_ratio"] = None
+                horizon_dict["reward_risk_ratio"] = None
+                horizon_dict["margin_required"] = "n/a"
+                horizon_dict["return_on_margin"] = "n/a"
+                horizon_dict["capital_efficiency"] = "n/a"
+                horizon_dict["confidence"] = "Not generated"
+                horizon_dict["confidence_pct"] = None
+                horizon_dict["confidence_reasons"] = [(False, reason_text)]
+                horizon_dict["verification"] = f"🛑 Rejected: {reason_text}"
+                horizon_dict["_verified_max_loss_inr"] = 0.0
+                horizon_dict["_net_gamma"] = None
+                horizon_dict["_negative_ev"] = False
+                horizon_dict["_trade_quality_score"] = None
+                horizon_dict["trade_quality_score"] = "n/a"
+                return horizon_dict
 
     max_loss = result["max_loss"]
     max_profit = result["max_profit"]
@@ -2302,13 +2431,15 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     horizon_dict["confidence_pct"] = conf_pct
     horizon_dict["confidence_reasons"] = conf_checks
 
-    tq_score, tq_breakdown = compute_trade_quality_score(
+    tq_score, tq_breakdown, tq_penalty_notes = compute_trade_quality_score(
         priced_legs, horizon_snap, ev_inr, max_loss, pop, reward_risk_ratio, conf_pct, is_eod
     )
     horizon_dict["_trade_quality_score"] = tq_score
     horizon_dict["trade_quality_breakdown"] = " · ".join(
         f"{name} {sub}/100 ({weight}%)" for name, (sub, weight) in tq_breakdown.items()
     )
+    if tq_penalty_notes:
+        horizon_dict["trade_quality_breakdown"] += " · ⚠ " + "; ".join(tq_penalty_notes)
     horizon_dict["trade_quality_score"] = f"{tq_score}/100 -- {horizon_dict['trade_quality_breakdown']}"
 
     horizon_dict["verification"] = (
@@ -2377,6 +2508,7 @@ NON-NEGOTIABLE CONSTRAINTS
 
 7. NIFTY LIQUIDITY FILTER. Only select strikes with adequate live liquidity for Nifty options -- meaningful open interest, tight bid-ask spread, and strikes close to standard NSE strike intervals. Choose legs ONLY from strikes shown with a live premium in the LIVE DATA FEED above for that horizon; if a theoretically ideal strike isn't listed there, state that explicitly and move to the nearest listed liquid strike instead.
    - STRIKE DISTANCE SANITY CHECK: a strike more than ~{_STRIKE_DISTANCE_FACTOR:g}x that horizon's own expected move (the ATM straddle figure in the live data feed) away from spot is only defensible if there's a real, substantial OI wall at that exact strike -- do not pick a far-OTM strike "for extra safety margin" without that OI backing. This is checked and flagged in code against the real OI data after you respond, so an unjustified far-out strike will show up as a lowered-confidence flag rather than silently passing.
+   - IRON CONDOR SHORT-STRIKE-OUTSIDE-EXPECTED-MOVE RULE (hard requirement): for an Iron Condor specifically, BOTH short strikes must sit outside that horizon's own 1-sigma expected move (the ATM straddle figure in the live data feed) from spot -- e.g. if expected move is ±426 pts and spot is 24334, neither short strike may fall between roughly 23908 and 24760. A short strike inside that band is rejected outright in code, not just flagged, because it contradicts the very range-bound thesis an Iron Condor is sold on. (This does not apply to Iron Butterfly, whose shorts are intentionally ATM.)
 
 8. RISK-CONTROLLED SYNTHESIS. Every horizon's final recommendation must simultaneously satisfy constraints #1-#7 above -- risk-defined, gap-protected, capital-capped, correctly bias-sequenced (Weekly), correctly range-biased (Monthly/Quarterly), and liquidity-filtered. If any of these pull in conflicting directions for a given horizon (e.g. the liquid strike sits inside the expected-move band), state the trade-off explicitly in that horizon's bias_reason and resolve it in favor of the tighter risk-defined structure, never in favor of higher theoretical reward.
 
@@ -2765,6 +2897,7 @@ def _scrub_bias_pcr_conflict(bias, pcr):
 _NO_STRATEGY_CLAIM_RE = re.compile(
     r"\bno specific strateg(?:y|ies)\b|\bno strategy recommended\b|"
     r"\bno trade recommended\b|\bwait for confirmation\b|"
+    r"\bno risk-defined structure\b|\bno structure is recommended\b|"
     r"\bconflicting\b[^.!?]*\b(?:pcr|vix|signals?|readings?)\b",
     re.IGNORECASE,
 )
@@ -2789,7 +2922,177 @@ def _model_declared_no_strategy(h):
     return False
 
 
+def _scrub_portfolio_view_contradictions(portfolio_view, horizons):
+    """Fixes portfolio_view when it contradicts a specific horizon's own,
+    actual recommendation (Portfolio Summary Contradiction, highest
+    priority). portfolio_view is a separate free-text paragraph the model
+    writes independently of each horizon's bias_reason/verification --
+    rule 0 in compute_horizon_recommendation already stops a horizon's
+    OWN fields from contradicting each other (the earlier "Weekly
+    Recommendation Contradiction" fix), but nothing was checking this
+    cross-horizon summary paragraph against what each horizon card
+    actually says. E.g. the Weekly card genuinely recommends a Bullish
+    Vertical Spread (verdict "Consider"), but portfolio_view separately
+    claims "No risk-defined structure is recommended for the Weekly" --
+    almost certainly stale text carried over from an earlier draft rather
+    than a real second opinion, since the model never gets a chance to
+    revise portfolio_view after seeing the final per-horizon verdicts.
+
+    Only overrides a sentence that both (a) names a specific horizon and
+    (b) makes a no-strategy/no-structure claim about it, while that
+    horizon's own deterministic verdict says a real trade WAS
+    recommended (i.e. not "No Trade"/"Skip"/"Not Available" -- Consider/
+    Neutral/Caution all mean a structure exists and was evaluated, just
+    with a quality caveat). Every other sentence is left untouched."""
+    if not portfolio_view:
+        return portfolio_view
+    by_name = {str(h.get("horizon") or "").strip(): h for h in (horizons or []) if h.get("horizon")}
+    no_trade_verdicts = {"⚪ No Trade", "❌ Skip", "Not Available"}
+    sentences = re.split(r"(?<=[.!?])\s+", portfolio_view.strip())
+    fixed = []
+    for s in sentences:
+        replaced = False
+        if _NO_STRATEGY_CLAIM_RE.search(s):
+            for name, h in by_name.items():
+                if not name or name.lower() not in s.lower():
+                    continue
+                verdict, _color, _reason = compute_horizon_recommendation(h)
+                if verdict not in no_trade_verdicts:
+                    strategy = h.get("strategy_name") or "a risk-defined structure"
+                    fixed.append(
+                        f"{name} actually carries a recommended {strategy} (see the {name} card "
+                        f"above) -- correcting contradictory text here."
+                    )
+                    replaced = True
+                break
+        if not replaced:
+            fixed.append(s)
+    return " ".join(fixed).strip()
+
+
+def _scrub_portfolio_view_structure_type_contradiction(portfolio_view, horizons):
+    """Fixes portfolio_view when it names the WRONG specific structure
+    type for a horizon -- e.g. "Monthly and Quarterly iron butterflies"
+    when Quarterly's card actually shows an Iron Condor (Quarterly
+    Strategy Description issue). This is a finer-grained check than
+    _scrub_portfolio_view_directional_contradiction: Iron Butterfly and
+    Iron Condor are BOTH range-bound structures, so the directional-stance
+    check alone wouldn't catch a mix-up between the two -- this compares
+    the actual structure name, reusing the same _STRUCTURE_KEYWORDS
+    vocabulary _label_conflicts already uses to check the model's own
+    strategy_name against its own legs, so every consistency check in
+    this file shares one vocabulary rather than three that could
+    silently disagree with each other.
+
+    Deliberately conservative: only fires when a sentence mentions
+    exactly ONE distinct structure keyword (e.g. "iron butterflies"
+    applied to two horizons at once, as in the example above). A
+    sentence naming several different structure types for different
+    horizons in the same breath is too ambiguous to safely attribute
+    which keyword belongs to which horizon, so it's left untouched
+    rather than risk a wrong "correction"."""
+    if not portfolio_view:
+        return portfolio_view
+    by_name = {str(h.get("horizon") or "").strip(): h for h in (horizons or []) if h.get("horizon")}
+    # Regex per canonical keyword, not a plain substring check -- "iron
+    # butterfly" pluralizes irregularly ("iron butterflies"), so a bare
+    # `in` check silently misses exactly the plural phrasing this issue
+    # was reported with ("Monthly and Quarterly iron butterflies").
+    keyword_patterns = {
+        "iron condor": r"iron condors?",
+        "iron butterfly": r"iron butterfl(?:y|ies)",
+        "bull call": r"bull calls?",
+        "bear call": r"bear calls?",
+        "bull put": r"bull puts?",
+        "bear put": r"bear puts?",
+        "straddle": r"straddles?",
+        "strangle": r"strangles?",
+    }
+    sentences = re.split(r"(?<=[.!?])\s+", portfolio_view.strip())
+    fixed = []
+    for s in sentences:
+        s_lower = s.lower()
+        mentioned = {kw for kw, pat in keyword_patterns.items() if re.search(pat, s_lower)}
+        named = [name for name in by_name if name and name.lower() in s_lower]
+        if len(mentioned) == 1 and named:
+            claimed_kw = next(iter(mentioned))
+            contradicted = [
+                name for name in named
+                if claimed_kw not in str(by_name[name].get("strategy_name") or "").lower()
+            ]
+            if contradicted:
+                descriptions = [
+                    f"{name} is {by_name[name].get('strategy_name') or 'an unspecified structure'}"
+                    for name in named
+                ]
+                combined = "; ".join(descriptions) + " -- correcting a structure-type mismatch here."
+                fixed.append(combined[:1].upper() + combined[1:])
+                continue
+        fixed.append(s)
+    return " ".join(fixed).strip()
+
+
 _GAMMA_WORD_RE = re.compile(r"\bgamma\b", re.IGNORECASE)
+
+
+_RANGE_BOUND_CLAIM_RE = re.compile(r"\brange[- ]bound\b|\bsideways\b", re.IGNORECASE)
+
+# Same non-directional keyword list compute_market_regime already uses for
+# its own Weekly range/direction label -- reused here so the two can't
+# silently disagree about what counts as "range-bound".
+_NON_DIRECTIONAL_STRATEGY_KW = ("iron condor", "iron butterfly", "straddle", "strangle", "butterfly")
+
+
+def _is_directional_strategy(strategy_name):
+    """True if strategy_name reads as a directional structure (vertical
+    spread / debit / credit spread with a clear up-or-down bias) rather
+    than a range-bound, theta-harvesting one (Iron Condor/Butterfly,
+    Straddle/Strangle). False (not directional) if strategy_name is
+    empty, since an unlabeled strategy shouldn't be flagged as a
+    contradiction either way."""
+    s = str(strategy_name or "").strip().lower()
+    if not s:
+        return False
+    return not any(kw in s for kw in _NON_DIRECTIONAL_STRATEGY_KW)
+
+
+def _scrub_portfolio_view_directional_contradiction(portfolio_view, horizons):
+    """Fixes portfolio_view when it calls a horizon "range-bound" or
+    "sideways" but that horizon's own actual recommended strategy is a
+    directional structure (Portfolio Description issue) -- e.g. "Weekly
+    and Monthly maintaining a range-bound stance" when Weekly's card
+    actually shows a Bullish Vertical Spread. Same stale-prose problem as
+    _scrub_portfolio_view_contradictions (a "no strategy" claim), just a
+    mischaracterization of an EXISTING strategy's directionality instead
+    of denying one exists.
+
+    A single sentence can legitimately name more than one horizon (as in
+    the example above) where only one of them is actually wrong, so
+    whenever ANY named horizon disagrees the whole sentence is replaced
+    with an explicit per-horizon rebuild -- same whole-sentence-
+    replacement principle as _scrub_pcr_mischaracterization, rather than
+    surgically deleting just the wrong name and risking a broken
+    fragment."""
+    if not portfolio_view:
+        return portfolio_view
+    by_name = {str(h.get("horizon") or "").strip(): h for h in (horizons or []) if h.get("horizon")}
+    sentences = re.split(r"(?<=[.!?])\s+", portfolio_view.strip())
+    fixed = []
+    for s in sentences:
+        if _RANGE_BOUND_CLAIM_RE.search(s):
+            named = [name for name in by_name if name and name.lower() in s.lower()]
+            contradicted = [name for name in named if _is_directional_strategy(by_name[name].get("strategy_name"))]
+            if contradicted:
+                descriptions = []
+                for name in named:
+                    strategy = by_name[name].get("strategy_name") or "an unspecified structure"
+                    stance = "directional" if name in contradicted else "range-bound"
+                    descriptions.append(f"{name} is {stance} ({strategy})")
+                combined = "; ".join(descriptions) + " -- correcting contradictory stance text here."
+                fixed.append(combined[:1].upper() + combined[1:])
+                continue
+        fixed.append(s)
+    return " ".join(fixed).strip()
 
 
 def _strip_gamma_claims(text):
@@ -2991,6 +3294,8 @@ def compute_horizon_recommendation(h):
             reason = "Undefined Risk"
         elif "POOR REWARD/RISK" in ml:
             reason = "Poor Reward:Risk"
+        elif "SHORT STRIKE INSIDE EXPECTED MOVE" in ml:
+            reason = "Short Strike Inside Expected Move"
         else:
             reason = "Unverified"
         return "❌ Skip", red, reason
@@ -3076,14 +3381,40 @@ def render_recommendation_summary_table(horizons):
 """
 
 
+def _suggested_action_for_score(score):
+    """Maps a Trade Quality Score to a coarse, easy-to-scan sizing action --
+    four bands instead of a bare number plus a vague "manual review" aside.
+    This is a quick-glance heuristic keyed ONLY to the score, not a
+    replacement for compute_suggested_sizing's actual lot-count math (which
+    also accounts for per-horizon/aggregate capital caps and the
+    MAX_LOTS_PER_HORIZON liquidity ceiling) -- see the Suggested Sizing
+    section below for the real, capital-based lot recommendation. Bands:
+      80-100 -> Full Size   (highest-conviction tier)
+      60-79  -> Half Size   (tradeable, but reduce size)
+      40-59  -> Watchlist   (not tradeable as-is; track and revisit)
+      <40    -> Skip        (score alone argues against entry)
+    """
+    if score >= 80:
+        return "Full Size", "#2F5233"
+    if score >= 60:
+        return "Half Size", "#3D6690"
+    if score >= 40:
+        return "Watchlist", "#A6812F"
+    return "Skip", "#8B2E2E"
+
+
 def render_trade_quality_table(horizons):
     """Simple Horizon / Trade Quality Score table -- the headline number
     from compute_trade_quality_score for each horizon, with a colored bar
-    so relative quality is scannable at a glance. Full component breakdown
-    (EV/R:R/POP/Confidence/Liquidity/OI Alignment) is shown per-horizon in
-    the detailed card below via the same score's stored breakdown text, so
-    a reader who wants "why" doesn't have to leave this table to get it --
-    they just scroll down to the matching horizon's card."""
+    so relative quality is scannable at a glance, plus a bucketed
+    Suggested Action column (Full Size / Half Size / Watchlist / Skip, see
+    _suggested_action_for_score) so a reader gets a direct read on what to
+    do with the number instead of just the score itself. Full component
+    breakdown (EV/R:R/POP/Confidence/Liquidity/OI Alignment) is shown
+    per-horizon in the detailed card below via the same score's stored
+    breakdown text, so a reader who wants "why" doesn't have to leave this
+    table to get it -- they just scroll down to the matching horizon's
+    card."""
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 
     by_name = {}
@@ -3120,22 +3451,40 @@ def render_trade_quality_table(horizons):
             f'white-space:nowrap;">{score}/100</span></div></td>'
         )
 
-    header_row = f'<tr>{_cell("Horizon", header=True)}{_cell("Trade Quality", header=True)}</tr>'
+    def _action_cell(score):
+        label, color = _suggested_action_for_score(score)
+        return (
+            f'<td style="padding:8px 12px;border-top:1px solid #EDEAE2;">'
+            f'<span style="font-family:{sans};font-size:12px;font-weight:700;color:{color};'
+            f'white-space:nowrap;">{label}</span></td>'
+        )
+
+    header_row = (
+        f'<tr>{_cell("Horizon", header=True)}{_cell("Trade Quality", header=True)}'
+        f'{_cell("Suggested Action", header=True)}</tr>'
+    )
 
     rows = []
     for label in HORIZON_ORDER:
         h = by_name.get(label)
         if not h:
-            rows.append(f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}{_cell("Not Available", color="#8A8F9C")}</tr>')
+            rows.append(
+                f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}'
+                f'{_cell("Not Available", color="#8A8F9C")}'
+                f'{_cell("&mdash;", color="#8A8F9C")}</tr>'
+            )
             continue
         score = h.get("_trade_quality_score")
         if score is None:
             rows.append(
                 f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}'
-                f'{_cell("N/A (Rejected)", color="#8A8F9C")}</tr>'
+                f'{_cell("N/A (Rejected)", color="#8A8F9C")}'
+                f'{_cell("Skip", color="#8B2E2E")}</tr>'
             )
             continue
-        rows.append(f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}{_bar_cell(score)}</tr>')
+        rows.append(
+            f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}{_bar_cell(score)}{_action_cell(score)}</tr>'
+        )
 
     if not rows:
         return ""
@@ -3143,7 +3492,7 @@ def render_trade_quality_table(horizons):
     return f"""
 <div style="margin-bottom:16px;">
   <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Trade Quality Score</div>
-  <div style="font-family:{sans};font-size:10px;color:#8A8F9C;margin-bottom:6px;">Composite of Expected Value (30%), Reward:Risk (20%), Probability of Profit (15%), Confidence (15%), Liquidity (10%), and OI Alignment (10%) -- see each horizon's card below for the exact component breakdown.</div>
+  <div style="font-family:{sans};font-size:10px;color:#8A8F9C;margin-bottom:6px;">Composite of Expected Value (30%), Reward:Risk (20%), Probability of Profit (15%), Confidence (15%), Liquidity (10%), and OI Alignment (10%) -- see each horizon's card below for the exact component breakdown. Suggested Action is a quick-glance score band (80-100 Full Size &middot; 60-79 Half Size &middot; 40-59 Watchlist &middot; &lt;40 Skip); see the Suggested Sizing section below for the actual lot count, which also accounts for capital caps and the per-horizon liquidity ceiling.</div>
   <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
     {header_row}
     {''.join(rows)}
@@ -3302,7 +3651,8 @@ def compute_suggested_sizing(horizons):
         if lots < 1:
             plan.append([name, None, f"Even 1 lot exceeds the {PER_HORIZON_CAP_PCT:.0f}% per-horizon cap"])
             continue
-        note = None if verdict == "✅ Consider" else f"{reason} -- consider reduced size or manual review"
+        action_label, _action_color = _suggested_action_for_score(h.get("_trade_quality_score", 0) or 0)
+        note = None if verdict == "✅ Consider" else f"{reason} -- Trade Quality suggests: {action_label}"
         if lots > MAX_LOTS_PER_HORIZON:
             # The %-of-capital cap alone allowed more lots than is
             # practical to actually execute (liquidity/slippage/margin/
@@ -3436,6 +3786,19 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
     # the authoritative figure (issue #2).
     gamma_summary = compute_portfolio_gamma_summary(horizons)
     portfolio_text = _strip_gamma_claims(_strip_cap_claims(portfolio_view))
+    # Fix any sentence that contradicts a horizon's own actual verdict --
+    # e.g. portfolio_view claiming no structure was recommended for a
+    # horizon that genuinely has one (Portfolio Summary Contradiction).
+    portfolio_text = _scrub_portfolio_view_contradictions(portfolio_text, horizons)
+    # Fix wrong specific structure names (e.g. "iron butterflies" for a
+    # horizon that's actually an Iron Condor) BEFORE the broader
+    # directional-stance check below, so the directional check only ever
+    # sees already-correct structure names in its own comparisons.
+    portfolio_text = _scrub_portfolio_view_structure_type_contradiction(portfolio_text, horizons)
+    # Also fix mischaracterized directionality -- e.g. calling a horizon
+    # "range-bound" when its own card shows a directional strategy
+    # (Portfolio Description issue).
+    portfolio_text = _scrub_portfolio_view_directional_contradiction(portfolio_text, horizons)
     sizing_plan = compute_suggested_sizing(horizons)
     sizing_html = render_suggested_sizing_html(sizing_plan, sans)
     portfolio_html = (
@@ -3680,11 +4043,14 @@ def finalize_horizons(horizons, live_data):
 def _horizon_rejected(h):
     """True if apply_verified_payoff marked this horizon's legs as
     invalid -- either genuinely unparseable/unpriceable ('Unverified'),
-    structurally naked/unbounded ('UNDEFINED RISK'), or capped-risk but a
-    bad trade on reward-quality grounds ('POOR REWARD/RISK')."""
+    structurally naked/unbounded ('UNDEFINED RISK'), capped-risk but a bad
+    trade on reward-quality grounds ('POOR REWARD/RISK'), or an Iron Condor
+    whose short strike sits inside the 1-sigma expected move
+    ('SHORT STRIKE INSIDE EXPECTED MOVE', see REJECT_IC_SHORT_INSIDE_EM)."""
     ml = h.get("max_loss")
     return isinstance(ml, str) and (
         "UNDEFINED RISK" in ml or "Unverified" in ml or "POOR REWARD/RISK" in ml
+        or "SHORT STRIKE INSIDE EXPECTED MOVE" in ml
     )
 
 
@@ -3743,6 +4109,7 @@ RULES YOU MUST FOLLOW EXACTLY:
 2. A 4-leg Iron Condor/Butterfly must pair legs by ROLE, not by strike: the two SHORT legs (one CE, one PE) sit together nearer spot; the two LONG legs (one CE, one PE) sit together as the outer wings, one above and one below. Never write both CE legs with the same action and both PE legs with the same action -- e.g. "Sell 24000 CE, Buy 24000 PE, Sell 24200 CE, Buy 24200 PE" is INVALID. Valid: "Buy 24000 PE, Sell 24200 PE, Sell 24500 CE, Buy 24700 CE".
 3. Use ONLY strikes shown in the live data feed above for that horizon. Keep the SAME directional bias you originally chose unless the live data genuinely cannot support any valid capped-risk structure at that bias -- if so, say so via a Neutral/range-bound structure instead.
 4. If the rejection reason mentions poor Reward:Risk or poor credit relative to spread width, the structure was too WIDE for the premium it collects (or paid too much relative to potential reward) -- fix this by choosing strikes CLOSER TOGETHER (a narrower vertical spread width) and/or moving the short strike nearer the current expected-move band so the premium collected is proportionate to the capital at risk. Do not fix this by widening risk or removing a hedge leg -- keep the structure fully risk-defined.
+5. If the rejection reason says a short strike is inside the expected move for an Iron Condor, this is the OPPOSITE problem from #4 above: move BOTH short strikes further from spot (outside the ATM straddle's expected-move band shown in the live data feed) while keeping the same wing strikes or moving the wings out proportionally, so the structure keeps its risk-defined shape but no longer contradicts its own range-bound thesis. If no listed liquid strike outside the band exists for this horizon, say so explicitly instead of forcing a strike back inside the band.
 
 Respond with ONLY raw JSON (no markdown, no commentary before or after) in exactly this shape, one object per rejected horizon listed above, same order:
 {{
