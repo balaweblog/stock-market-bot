@@ -1241,40 +1241,54 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     return " | ".join(parts), any_leg_inside_band
 
 
-def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix):
+_STRIKE_DISTANCE_FACTOR = float(os.getenv("OPTIONS_STRIKE_DISTANCE_FACTOR", "3"))
+
+
+def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None):
     """Replaces the model's unexplained High/Medium/Low self-rating with a
     percentage score built from checks that are actually verifiable from
     real fetched data -- the same "code wins over the model's own claim"
     principle used for max_loss/Greeks/POP elsewhere in this file
     (issue #7). Returns (label, pct, checks) where checks is a list of
     (passed: bool, reason: str) tuples suitable for a checklist display.
-    Checks included (only when they're actually computable this run):
-      - Short strike aligned with the top open-interest wall on its side
-      - Max Pain sits inside the structure's profit zone (only evaluated
-        for two-breakeven structures like Iron Condor/Butterfly, where
-        "profit zone" is unambiguous)
-      - Live option-chain data was used (vs an EOD Bhavcopy fallback,
-        which carries no IV/live premiums)
-      - VIX regime is calm (<20) at the time of the fetch
-    A missing/unusable input for a check means that check is either
-    counted as failed (VIX unavailable) or omitted from the denominator
-    (Max Pain check on single-breakeven structures, where "profit zone"
-    isn't well-defined) -- never silently assumed favorable."""
+
+    The label and percentage BAND are driven primarily by the data-quality
+    tier this horizon actually had available, per the desk's own scale
+    (issue #4 -- a flat "count of 4 unweighted checks passed" score could
+    not distinguish a fully-verified live trade from one built on a stale
+    EOD Bhavcopy close, and a rejected/unverified trade was showing a
+    literal 0%, which read as "scored zero" rather than "never scored"):
+      - Live chain with both OI data and IV/VIX available -> 80-95%, "High"
+      - EOD Bhavcopy fallback (no live premiums/IV)         -> 65-80%, "Medium"
+      - Live chain but missing OI or VIX data (partial)     -> 40-60%, "Low"
+    (A rejected/unverified trade never reaches this function at all --
+    apply_verified_payoff sets confidence to "Not generated" with no
+    percentage before compute_confidence would otherwise be called.)
+
+    Within that band, the secondary checks below (short strike at the top
+    OI wall, Max Pain inside the profit zone, calm VIX regime, and strike
+    distance vs. the horizon's own expected move -- issue #7) place the
+    exact percentage -- they fine-tune confidence, they don't determine
+    its ceiling."""
     checks = []
 
     top_call_oi = horizon_snap.get("top_call_oi") or []
     top_put_oi = horizon_snap.get("top_put_oi") or []
+    has_oi_data = bool(top_call_oi or top_put_oi)
     top_by_type = {
         "CE": top_call_oi[0][0] if top_call_oi else None,
         "PE": top_put_oi[0][0] if top_put_oi else None,
     }
     short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
-    oi_aligned = any(top_by_type.get(l["type"]) == l["strike"] for l in short_legs) if short_legs else False
-    checks.append((
-        oi_aligned,
-        "Short strike aligned with the top open-interest wall" if oi_aligned
-        else "Short strike is not at the top open-interest wall",
-    ))
+    if has_oi_data:
+        oi_aligned = any(top_by_type.get(l["type"]) == l["strike"] for l in short_legs) if short_legs else False
+        checks.append((
+            oi_aligned,
+            "Short strike aligned with the top open-interest wall" if oi_aligned
+            else "Short strike is not at the top open-interest wall",
+        ))
+    else:
+        checks.append((False, "Open-interest data unavailable this run"))
 
     max_pain = horizon_snap.get("max_pain")
     if max_pain is not None and breakevens and len(breakevens) >= 2:
@@ -1288,12 +1302,6 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix):
     # else: not enough info to call this one either way (e.g. a single-
     # breakeven vertical spread) -- omitted rather than guessed.
 
-    checks.append((
-        not is_eod,
-        "Live option-chain data used" if not is_eod
-        else "Live chain unavailable this run (EOD Bhavcopy fallback used)",
-    ))
-
     if vix is not None:
         calm = vix < 20
         checks.append((
@@ -1304,17 +1312,52 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix):
     else:
         checks.append((False, "VIX unavailable this run"))
 
+    # Strike-distance sanity check (issue #7): a strike sitting many
+    # multiples of the horizon's OWN expected move away from spot (e.g.
+    # Quarterly strikes ~1700 pts from a ~24,300 spot) only makes sense if
+    # there's a real OI wall out there -- otherwise it's not a defensible
+    # pick, just an arbitrary far-OTM strike. Compares against each
+    # horizon's own ATM-straddle-derived expected move, so a Quarterly
+    # horizon (naturally wider) isn't held to a Weekly-sized band.
+    exp_move = horizon_snap.get("expected_move") or {}
+    exp_move_pts = exp_move.get("expected_move_pts")
+    if spot is not None and exp_move_pts and priced_legs:
+        farthest = max(priced_legs, key=lambda l: abs(l["strike"] - spot))
+        distance = abs(farthest["strike"] - spot)
+        max_allowed = _STRIKE_DISTANCE_FACTOR * exp_move_pts
+        oi_wall_strikes = {s for s, _ in top_call_oi} | {s for s, _ in top_put_oi}
+        oi_backed = farthest["strike"] in oi_wall_strikes
+        multiple = distance / exp_move_pts if exp_move_pts else None
+        if distance > max_allowed and not oi_backed:
+            checks.append((
+                False,
+                f"Farthest strike {farthest['strike']:g} is {distance:.0f} pts from spot "
+                f"({multiple:.1f}x expected move) with no supporting OI wall found at that strike",
+            ))
+        else:
+            checks.append((
+                True,
+                f"Farthest strike {farthest['strike']:g} is {distance:.0f} pts from spot "
+                f"({multiple:.1f}x expected move)"
+                + (" -- backed by a real OI wall" if oi_backed else " -- within a reasonable multiple of expected move"),
+            ))
+
+    if is_eod:
+        label, lo_band, hi_band = "Medium", 65, 80
+        tier_desc = "EOD Bhavcopy fallback used (no live premiums/IV)"
+    elif has_oi_data and vix is not None:
+        label, lo_band, hi_band = "High", 80, 95
+        tier_desc = "Live option-chain data with OI and VIX available"
+    else:
+        label, lo_band, hi_band = "Low", 40, 60
+        tier_desc = "Live chain used, but missing OI and/or VIX data"
+
     total = len(checks)
     passed = sum(1 for ok, _ in checks if ok)
-    pct = round(100 * passed / total) if total else None
-    if pct is None:
-        label = "n/a"
-    elif pct >= 75:
-        label = "High"
-    elif pct >= 45:
-        label = "Medium"
-    else:
-        label = "Low"
+    frac = (passed / total) if total else 0.5
+    pct = round(lo_band + frac * (hi_band - lo_band))
+
+    checks = [(True, f"Data tier: {tier_desc}")] + checks
     return label, pct, checks
 
 
@@ -1328,11 +1371,21 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     never silently presents an unverifiable number as if it were checked --
     and never claims 'live' premiums (or live Greeks/POP) when the
     underlying data was actually an EOD Bhavcopy close."""
-    horizon_dict["bias_reason"] = _strip_cap_claims(horizon_dict.get("bias_reason"))
+    horizon_dict["bias_reason"] = _scrub_pcr_mischaracterization(
+        _strip_cap_claims(horizon_dict.get("bias_reason")),
+        (horizon_snap or {}).get("pcr_oi"),
+    )
     legs_text = horizon_dict.get("legs", "")
     result = compute_strategy_payoff(legs_text, horizon_snap)
     is_eod = bool((horizon_snap or {}).get("source"))  # only set on the Bhavcopy fallback path
     premium_label = "EOD Bhavcopy closing prices (not live)" if is_eod else "live NSE premiums"
+    # Override whatever the model wrote for data_status -- it self-reported
+    # "Live" in a run where the direct feed was down and every horizon
+    # actually priced off the EOD Bhavcopy fallback, directly contradicting
+    # the live-feed-status banner elsewhere in the same email (issue #5).
+    # Freshness must come from the same real signal is_eod already uses,
+    # never from the model's own claim.
+    horizon_dict["data_status"] = "eod" if is_eod else "live"
 
     if not result["ok"]:
         horizon_dict["max_loss"] = "Unverified -- do not trade"
@@ -1348,8 +1401,8 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
-        horizon_dict["confidence"] = "Low"
-        horizon_dict["confidence_pct"] = 0
+        horizon_dict["confidence"] = "Not generated"
+        horizon_dict["confidence_pct"] = None
         horizon_dict["confidence_reasons"] = [(False, f"Trade could not be verified: {result['reason']}")]
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
@@ -1372,8 +1425,8 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
-        horizon_dict["confidence"] = "Low"
-        horizon_dict["confidence_pct"] = 0
+        horizon_dict["confidence"] = "Not generated"
+        horizon_dict["confidence_pct"] = None
         horizon_dict["confidence_reasons"] = [(False, "Rejected: legs do not form a capped-risk structure")]
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
         horizon_dict["_verified_max_loss_inr"] = float("inf")
@@ -1522,7 +1575,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["capital_efficiency"] = "n/a"
 
     conf_label, conf_pct, conf_checks = compute_confidence(
-        priced_legs, horizon_snap, result["breakevens"], is_eod, vix
+        priced_legs, horizon_snap, result["breakevens"], is_eod, vix, spot
     )
     horizon_dict["confidence"] = conf_label
     horizon_dict["confidence_pct"] = conf_pct
@@ -1558,6 +1611,7 @@ Horizons are independent from Monthly/Quarterly/Annual onward -- they do not nee
 NON-NEGOTIABLE CONSTRAINTS
 
 1. RISK-DEFINED ONLY. Every recommended strategy must have a mathematically capped maximum loss known before entry (e.g. Bull/Bear Call/Put Spreads, Iron Condors, Iron Butterflies, Calendar Spreads, Ratio Spreads with a protective wing, Debit/Credit Spreads). NEVER recommend a naked/undefined-risk position (naked short call, naked short put, uncovered short straddle/strangle) under any circumstance, for any horizon.
+   - 2-LEG VERTICAL SPREADS MUST BE SAME OPTION TYPE, DIFFERENT STRIKES, ONE LONG + ONE SHORT. A valid 2-leg spread is always CE+CE or PE+PE -- e.g. "Sell 24600 CE, Buy 24800 CE" (Bear Call Spread) or "Buy 24200 PE, Sell 24000 PE" (Bear Put Spread). A recurring mistake is writing one CE leg and one unrelated PE leg with no strike relationship between them (e.g. "Sell 24600 CE, Buy 24800 PE") -- this is WRONG. It is not a spread at all: the short call has no long call above it capping its loss (naked short call, unbounded upside risk), and the long put is a completely separate, unrelated position. If you cannot find two liquid strikes of the SAME option type to form a real vertical spread, do not force a 2-leg CE+PE pairing -- either use a 4-leg Iron Condor/Butterfly (see constraint #6) or state in bias_reason that no valid 2-leg structure was available at adequate liquidity.
 
 2. GAP PROTECTION. Every recommendation must explicitly address overnight/weekend gap risk:
    - Prefer structures whose short strikes sit outside the current expected-move band (VIX-implied 1 standard deviation) for that horizon.
@@ -1574,14 +1628,25 @@ NON-NEGOTIABLE CONSTRAINTS
 
 5. WEEKLY BIAS SEQUENCING.
    - Determine the Current Week's bias (Bullish or Bearish) strictly from the live market data you find (spot/futures trend, OI buildup, PCR, FII/DII flow, global cues) -- never assume a default direction.
-   - CORRECT PCR READING: PCR(OI) > 1 means more puts are written than calls, which is generally read as bullish-to-neutral (put writers expect the market to stay above their strike, building support below spot) -- NOT bearish. PCR < 1 leans bearish-to-neutral. Do not state a bias that contradicts the PCR figure you were given without explaining, in bias_reason, exactly why other data overrides it.
+   - CORRECT PCR READING: use these graduated bands, not a bare >1/<1 binary. PCR(OI) is put OI divided by call OI, so PCR 1.61 means roughly 1.6x as much put open interest as call open interest -- NOT "equal calls and puts" (never describe any PCR other than very close to 1.0 as "equal" or "balanced"; that is a factually wrong reading of the ratio and has been a recurring mistake). Bands:
+       PCR < 0.7            -> Bearish (call writing dominates)
+       PCR 0.7 - 1.2        -> Neutral
+       PCR 1.2 - 1.5        -> Bullish (put writing dominates -- put writers expect the market to stay above their strike, building support below spot)
+       PCR > 1.5            -> Potentially overbullish / contrarian caution -- elevated put writing this extreme can precede consolidation or a pullback rather than confirming further upside; say so explicitly rather than reading it as simply "more bullish."
+     Example of correct wording for PCR 1.61: "PCR(OI) 1.61 indicates relatively strong put writing, suggesting bullish positioning, although elevated PCR can sometimes precede consolidation." Do not state a bias that contradicts the PCR figure you were given without explaining, in bias_reason, exactly why other data overrides it.
    - CORRECT VIX READING: India VIX measures the MAGNITUDE of expected volatility, not direction. A high VIX means bigger expected moves either way (and richer option premiums, favorable for premium-selling structures) -- it does NOT by itself mean bearish. A low VIX (e.g. under ~15) signals calm, range-bound conditions, not bullishness or bearishness. Never write "high/low VIX indicates bullish/bearish trend" -- derive direction only from price/OI/PCR/flow data, and use VIX only for expected-move sizing and premium-selling suitability.
    - DO NOT assume mean reversion for the immediate next weekly expiry. A single week's move is not a quantitative basis for predicting the following week's direction, and the "next_week_bias" field (see schema below) is discarded and overridden in code regardless of what you write here -- do not build the Weekly horizon's legs around a next-week reversal thesis. Size and structure the Weekly horizon for the Current Week only, from the live data you found for it.
 
 6. MONTHLY/QUARTERLY BIAS TOWARD SIDEWAYS/RANGE-BOUND. Unless live data shows a strong, well-supported directional catalyst inside that horizon's window, default the Monthly and Quarterly recommendations to range-bound/theta-positive structures (Iron Condor, Iron Butterfly, Calendar/Diagonal Spread) rather than pure directional debit/credit spreads -- these horizons are for harvesting range and time decay, not chasing the weekly directional call.
-   - IRON BUTTERFLY DEFINITION: an Iron Butterfly sells a call AND a put at the SAME at-the-money strike (e.g. Sell 24500 CE + Sell 24500 PE), then buys further OTM wings on each side for protection. If the short call and short put strikes differ, that is an Iron Condor, not an Iron Butterfly -- do not mislabel one as the other.
+   - IRON BUTTERFLY DEFINITION: an Iron Butterfly sells a call AND a put at the SAME at-the-money strike (e.g. Sell 24500 CE + Sell 24500 PE), then buys further OTM wings on each side for protection -- ONE strike in the middle (both shorts), TWO different strikes on the outside (one long call above, one long put below). If the short call and short put strikes differ, that is an Iron Condor, not an Iron Butterfly -- do not mislabel one as the other.
+   - LEGS MUST BE PAIRED BY ROLE (short straddle vs wings), NEVER BY STRIKE. A recurring mistake is pairing every CE with a PE at the SAME strike for each of the two strikes used (e.g. "Sell 24000 CE, Buy 24000 PE, Sell 24200 CE, Buy 24200 PE") -- this is WRONG. It puts both calls on the same (short, uncapped-upside) side and both puts on the same (long, capped but directionless) side, which is not risk-defined and is not an Iron Butterfly or Condor at all.
+     CORRECT 4-leg pattern for Iron Condor/Butterfly, using two example strikes 24000 (lower wing) and 24500 (short straddle/inner) and 25000 (upper wing):
+       Iron Butterfly (single ATM strike 24500, wings at 24000/25000): "Buy 24000 PE, Sell 24500 PE, Sell 24500 CE, Buy 25000 CE"
+       Iron Condor (short strikes 24300/24700, wings at 24000/25000): "Buy 24000 PE, Sell 24300 PE, Sell 24700 CE, Buy 25000 CE"
+     Notice the shape: the two SHORT legs (one CE, one PE) sit inside, closer to spot; the two LONG legs (one CE, one PE) sit outside as wings, one above and one below. Never write a leg string where both CE legs share one action (Buy/Sell) and both PE legs share the other -- that pattern is always wrong for these structures.
 
 7. NIFTY LIQUIDITY FILTER. Only select strikes with adequate live liquidity for Nifty options -- meaningful open interest, tight bid-ask spread, and strikes close to standard NSE strike intervals. Choose legs ONLY from strikes shown with a live premium in the LIVE DATA FEED above for that horizon; if a theoretically ideal strike isn't listed there, state that explicitly and move to the nearest listed liquid strike instead.
+   - STRIKE DISTANCE SANITY CHECK: a strike more than ~{_STRIKE_DISTANCE_FACTOR:g}x that horizon's own expected move (the ATM straddle figure in the live data feed) away from spot is only defensible if there's a real, substantial OI wall at that exact strike -- do not pick a far-OTM strike "for extra safety margin" without that OI backing. This is checked and flagged in code against the real OI data after you respond, so an unjustified far-out strike will show up as a lowered-confidence flag rather than silently passing.
 
 8. RISK-CONTROLLED SYNTHESIS. Every horizon's final recommendation must simultaneously satisfy constraints #1-#7 above -- risk-defined, gap-protected, capital-capped, correctly bias-sequenced (Weekly), correctly range-biased (Monthly/Quarterly), and liquidity-filtered. If any of these pull in conflicting directions for a given horizon (e.g. the liquid strike sits inside the expected-move band), state the trade-off explicitly in that horizon's bias_reason and resolve it in favor of the tighter risk-defined structure, never in favor of higher theoretical reward.
 
@@ -1606,10 +1671,10 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "next_week_bias": "ONLY for the Weekly horizon object: this field is ignored and overridden in code per constraint #5 -- leave it empty or write 'n/a'. Omit entirely for Monthly/Quarterly/Annual.",
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",
       "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
-      "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'",
+      "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'. For Iron Condor/Butterfly, pair legs by ROLE not by strike -- both short legs (one CE, one PE) go together nearer spot, both long legs (one CE, one PE) go together as the outer wings. Never pair a CE and PE at the same strike as one Buy + one Sell for each of two strikes -- that is not a valid risk-defined structure. See constraint #6 for the correct pattern.",
       "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'anchored beyond the nearest major OI wall on this side'. Do NOT state whether the strike is inside or outside the expected-move band -- that is computed exactly from real fetched premiums and appended automatically after your text; a guessed band claim here risks contradicting it.",
       "confidence": "One of: High / Medium / Low -- your best qualitative guess, but note this is DISCARDED and replaced with a percentage score computed in code from verifiable signals (OI alignment, Max Pain, live-vs-EOD data, VIX regime), same as max_loss/Greeks/POP above.",
-      "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- be honest here"
+      "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- your best honest guess, but note this is DISCARDED and overridden in code from the real live-vs-EOD-Bhavcopy signal for that horizon, precisely because a model claiming 'live' in a run where the direct feed was down and EOD Bhavcopy was actually used would contradict the live-feed-status banner elsewhere in the same report."
     }},
     {{ "horizon": "Monthly", ... same fields ... }},
     {{ "horizon": "Quarterly", ... same fields ... }},
@@ -1662,10 +1727,12 @@ _CONFIDENCE_STYLE = {
     "high": ("#2F5233", "#E7EEE4"),
     "medium": ("#A6812F", "#FDF3D9"),
     "low": ("#8B2E2E", "#FBEAEA"),
+    "not generated": ("#8A8F9C", "#F4F2ED"),
 }
 
 _DATA_STATUS_STYLE = {
     "live": ("#2F5233", "#E7EEE4", "Live"),
+    "eod": ("#A6812F", "#FDF3D9", "EOD / Last Close"),
     "partial": ("#A6812F", "#FDF3D9", "Partial"),
     "stale": ("#8B2E2E", "#FBEAEA", "Stale"),
 }
@@ -1808,6 +1875,55 @@ def _strip_cap_claims(text):
         if not (re.search(r"%", s) and re.search(r"\b(cap|limit)\b", s, re.IGNORECASE))
     ]
     return " ".join(kept).strip()
+
+
+def classify_pcr(pcr):
+    """Graduated PCR(OI) reading, replacing the old bare '>1 bullish-ish,
+    <1 bearish-ish' binary with the desk's actual bands (issue #6):
+      < 0.7          -> Bearish (call writing dominates)
+      0.7 - 1.2      -> Neutral
+      1.2 - 1.5      -> Bullish (put writing dominates)
+      > 1.5          -> Potentially overbullish / contrarian caution
+    Returns None if pcr is None -- callers must handle that rather than
+    guessing a band for missing data."""
+    if pcr is None:
+        return None
+    if pcr < 0.7:
+        return "Bearish (call writing dominates)"
+    if pcr <= 1.2:
+        return "Neutral"
+    if pcr <= 1.5:
+        return "Bullish (put writing dominates)"
+    return "Potentially overbullish / contrarian caution (elevated put writing can precede consolidation)"
+
+
+_PCR_EQUAL_CLAIM_RE = re.compile(
+    r"\bequal\b[^.!?]*\b(calls?|puts?)\b|\bbalanced\b[^.!?]*\b(calls?|puts?)\b",
+    re.IGNORECASE,
+)
+
+
+def _scrub_pcr_mischaracterization(bias_reason, pcr):
+    """Discards the model's bias_reason sentence if it mischaracterizes a
+    real PCR figure as 'equal' or 'balanced' calls and puts -- a PCR of
+    1.61 means roughly 1.6x as much put OI as call OI, not parity, and a
+    model has repeatedly written exactly this kind of description despite
+    being given the real number. Same whole-sentence-replacement pattern
+    as _scrub_false_band_claim: a real graduated PCR reading is computed
+    here from the actual fetched figure and substituted in, rather than
+    surgically editing the model's wording (which risks leaving a
+    grammatically broken fragment behind)."""
+    if not bias_reason or pcr is None:
+        return bias_reason
+    sentences = re.split(r"(?<=[.!?])\s+", bias_reason.strip())
+    band = classify_pcr(pcr)
+    fixed = []
+    for s in sentences:
+        if "pcr" in s.lower() and _PCR_EQUAL_CLAIM_RE.search(s):
+            fixed.append(f"PCR(OI) {pcr:g} indicates {band.lower()}.")
+        else:
+            fixed.append(s)
+    return " ".join(fixed).strip()
 
 
 _GAMMA_WORD_RE = re.compile(r"\bgamma\b", re.IGNORECASE)
@@ -2270,6 +2386,136 @@ def finalize_horizons(horizons, live_data):
     return ordered, aggregate_pct, over_cap
 
 
+def _horizon_rejected(h):
+    """True if apply_verified_payoff marked this horizon's legs as
+    invalid -- either genuinely unparseable/unpriceable ('Unverified')
+    or structurally naked/unbounded ('UNDEFINED RISK'). The Annual
+    horizon's intentional 'N/A -- omitted' placeholder is never
+    'rejected' in this sense."""
+    ml = h.get("max_loss")
+    return isinstance(ml, str) and ("UNDEFINED RISK" in ml or "Unverified" in ml)
+
+
+def reverify_horizons(horizons, live_data, only_names=None):
+    """Re-runs apply_verified_payoff (real premium-based payoff math) for
+    the given horizons -- or all of them if only_names is None -- and
+    recomputes the aggregate capital-at-risk from scratch. Used after the
+    single repair-and-retry pass in run() so the aggregate never drifts
+    out of sync with whatever legs actually ended up in the rendered
+    report. Unlike finalize_horizons, this does NOT skip horizons that
+    already have _verified_max_loss_inr set -- it's meant to be called
+    specifically on horizons whose legs just changed."""
+    for h in horizons:
+        name = h.get("horizon")
+        if only_names is not None and name not in only_names:
+            continue
+        if name == "Annual" and h.get("strategy_name") == "N/A -- omitted":
+            continue
+        snap = (live_data.get("horizons") or {}).get(name, {})
+        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
+
+    total_at_risk = 0.0
+    for h in horizons:
+        v = h.get("_verified_max_loss_inr", 0.0)
+        if v not in (None, float("inf")):
+            total_at_risk += v
+    aggregate_pct = round(total_at_risk / TOTAL_CAPITAL_INR * 100, 2) if TOTAL_CAPITAL_INR else 0.0
+    over_cap = aggregate_pct > AGGREGATE_CAP_PCT
+    return aggregate_pct, over_cap
+
+
+def build_repair_prompt(rejected_horizons, live_data):
+    """Builds a short, targeted follow-up prompt that shows the model
+    exactly which of its own legs were rejected and why, plus the same
+    live data feed, and asks it to fix ONLY those horizons' legs. This is
+    the generator-side fix issue #3 asked for: rather than relying on the
+    validator to catch nonsense legs run after run, give the model one
+    chance to self-correct against its own concrete mistake before the
+    report gives up on that horizon."""
+    live_data_block = format_live_data_block(live_data)
+    bad_lines = []
+    for h in rejected_horizons:
+        bad_lines.append(
+            f"- {h.get('horizon')}: strategy_name='{h.get('strategy_name')}', "
+            f"legs='{h.get('legs')}', bias='{h.get('bias')}' -- REJECTED: {h.get('verification')}"
+        )
+    bad_block = "\n".join(bad_lines)
+
+    return f"""You previously generated a Nifty options strategy report. The horizons below were REJECTED because their legs did not form a valid risk-defined structure. Fix ONLY the legs for these horizons, using the same live data feed as before -- do not change any other horizon.
+
+{live_data_block}
+
+REJECTED HORIZONS TO FIX:
+{bad_block}
+
+RULES YOU MUST FOLLOW EXACTLY:
+1. A 2-leg vertical spread must be CE+CE or PE+PE, same expiry, one Buy + one Sell, different strikes. Never pair one CE leg with an unrelated PE leg -- e.g. "Sell 24600 CE, Buy 24800 PE" is INVALID (naked short call plus an unrelated long put, not a spread at all). Valid: "Sell 24600 CE, Buy 24800 CE".
+2. A 4-leg Iron Condor/Butterfly must pair legs by ROLE, not by strike: the two SHORT legs (one CE, one PE) sit together nearer spot; the two LONG legs (one CE, one PE) sit together as the outer wings, one above and one below. Never write both CE legs with the same action and both PE legs with the same action -- e.g. "Sell 24000 CE, Buy 24000 PE, Sell 24200 CE, Buy 24200 PE" is INVALID. Valid: "Buy 24000 PE, Sell 24200 PE, Sell 24500 CE, Buy 24700 CE".
+3. Use ONLY strikes shown in the live data feed above for that horizon. Keep the SAME directional bias you originally chose unless the live data genuinely cannot support any valid capped-risk structure at that bias -- if so, say so via a Neutral/range-bound structure instead.
+
+Respond with ONLY raw JSON (no markdown, no commentary before or after) in exactly this shape, one object per rejected horizon listed above, same order:
+{{
+  "horizons": [
+    {{"horizon": "<name, exactly as listed above>", "strategy_name": "<corrected strategy name>", "legs": "<corrected legs string>"}}
+  ]
+}}
+"""
+
+
+def repair_rejected_legs(horizons, live_data):
+    """Single self-correction retry (not a loop): if any non-Annual
+    horizon came back rejected from finalize_horizons, send the model one
+    targeted follow-up showing its own bad legs and the exact rule it
+    broke, then re-verify only the patched horizons against real premiums
+    again. If the model's repair prompt fails to parse, or still comes
+    back invalid on re-verification, the original rejection stands --
+    this deliberately does not retry more than once, so a persistently
+    confused backend still degrades to a clearly-labeled rejected trade
+    rather than looping indefinitely."""
+    rejected = [h for h in horizons if h.get("horizon") != "Annual" and _horizon_rejected(h)]
+    if not rejected:
+        return horizons
+
+    repair_prompt = build_repair_prompt(rejected, live_data)
+    try:
+        repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(repair_prompt)
+    except Exception:
+        main.log.warning("Repair pass call failed; keeping original rejection(s).")
+        return horizons
+
+    if not repair_text:
+        main.log.warning("Repair pass produced no output; keeping original rejection(s).")
+        return horizons
+
+    fixed_by_name = {}
+    try:
+        cleaned = swing._strip_code_fences(repair_text)
+        data = json.loads(cleaned)
+        for item in data.get("horizons", []) if isinstance(data, dict) else []:
+            name = str(item.get("horizon") or "").strip()
+            if name and item.get("legs"):
+                fixed_by_name[name] = item
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        main.log.warning("Repair pass returned unparseable JSON; keeping original rejection(s).")
+        return horizons
+
+    if not fixed_by_name:
+        return horizons
+
+    for h in horizons:
+        fix = fixed_by_name.get(h.get("horizon"))
+        if fix:
+            h["legs"] = fix["legs"]
+            if fix.get("strategy_name"):
+                h["strategy_name"] = fix["strategy_name"]
+
+    reverify_horizons(horizons, live_data, only_names=set(fixed_by_name.keys()))
+    still_bad = [h.get("horizon") for h in horizons if h.get("horizon") in fixed_by_name and _horizon_rejected(h)]
+    if still_bad:
+        main.log.warning(f"Repair pass attempted but still rejected after retry: {', '.join(still_bad)}")
+    return horizons
+
+
 # Only these look like credible primary/official sources for a Nifty
 # derivatives report (issue #10) -- everything else (social media,
 # influencer "prediction" videos, unsourced broker marketing blogs) is
@@ -2475,6 +2721,11 @@ def run():
         # aggregate capital-at-risk are computed here from fetched premiums,
         # never trusted from the model's own arithmetic (see finalize_horizons).
         horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data)
+        horizons = repair_rejected_legs(horizons, live_data)
+        # Recompute the aggregate/over-cap verdict in case the repair pass
+        # changed any horizon's verified max loss (a fixed leg goes from
+        # "inf" / excluded to a real capital-at-risk number).
+        aggregate_pct, over_cap = reverify_horizons(horizons, live_data, only_names=None)
         if over_cap:
             main.log.warning(
                 f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "
