@@ -1,136 +1,19 @@
 {
-  "stocks": {
-    "COALINDIA.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 428.8,
-      "target": 463.1,
-      "stop_loss": 407.36,
-      "last_run_at": "2026-07-15T11:12:42.197892+05:30"
-    },
-    "SHRIRAMFIN.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 1040.3,
-      "target": 1123.52,
-      "stop_loss": 988.29,
-      "last_run_at": "2026-07-15T11:12:42.197934+05:30"
-    },
-    "BEL.NS": {
-      "signal": "HOLD",
-      "priority": 2,
-      "price": 414.0,
-      "target": 442.98,
-      "stop_loss": 389.16,
-      "last_run_at": "2026-07-15T11:12:42.206279+05:30"
-    },
-    "ICICIBANK.NS": {
-      "signal": "STRONG BUY",
-      "priority": 1,
-      "price": 1425.5,
-      "target": 1568.05,
-      "stop_loss": 1368.48,
-      "last_run_at": "2026-07-15T11:12:42.230840+05:30"
-    },
-    "LT.NS": {
-      "signal": "HOLD",
-      "priority": 2,
-      "price": 3835.9,
-      "target": 4104.41,
-      "stop_loss": 3605.75,
-      "last_run_at": "2026-07-15T11:12:42.238513+05:30"
-    },
-    "BHARTIARTL.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 1937.7,
-      "target": 2092.72,
-      "stop_loss": 1840.81,
-      "last_run_at": "2026-07-15T11:12:42.349023+05:30"
-    },
-    "SBIN.NS": {
-      "signal": "STRONG BUY",
-      "priority": 1,
-      "price": 1027.9,
-      "target": 1130.69,
-      "stop_loss": 986.78,
-      "last_run_at": "2026-07-15T11:12:42.514432+05:30"
-    },
-    "ASIANPAINT.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 2678.7,
-      "target": 2893.0,
-      "stop_loss": 2544.76,
-      "last_run_at": "2026-07-15T11:12:42.566912+05:30"
-    },
-    "AAPL": {
-      "signal": "HOLD",
-      "priority": 2,
-      "price": NaN,
-      "target": NaN,
-      "stop_loss": NaN,
-      "last_run_at": "2026-07-15T11:12:51.879360+05:30"
-    },
-    "ITC.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 277.4,
-      "target": 299.59,
-      "stop_loss": 263.53,
-      "last_run_at": "2026-07-15T11:12:58.710553+05:30"
-    },
-    "AMZN": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": NaN,
-      "target": NaN,
-      "stop_loss": NaN,
-      "last_run_at": "2026-07-15T11:13:05.712702+05:30"
-    },
-    "GOOG": {
-      "signal": "STRONG BUY",
-      "priority": 1,
-      "price": 357.33,
-      "target": 393.06,
-      "stop_loss": 343.04,
-      "last_run_at": "2026-07-15T11:13:12.592555+05:30"
-    },
-    "SUNPHARMA.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 1958.4,
-      "target": 2115.07,
-      "stop_loss": 1860.48,
-      "last_run_at": "2026-07-15T11:13:18.013162+05:30"
-    },
-    "TCS.NS": {
-      "signal": "BUY / HOLD",
-      "priority": 2,
-      "price": 2184.9,
-      "target": 2359.69,
-      "stop_loss": 2075.65,
-      "last_run_at": "2026-07-15T11:13:19.537889+05:30"
-    },
-    "QQQ": {
-      "signal": "SELL",
-      "priority": 3,
-      "price": NaN,
-      "target": NaN,
-      "stop_loss": NaN,
-      "last_run_at": "2026-07-15T11:13:27.317276+05:30"
-    }
-  },
+  "stocks": {},
   "commodities": {
     "gold": {
       "buy_streak": 0,
       "last_buy_triggered": false,
-      "last_run_at": "2026-07-15T11:13:29.571465+05:30"
+      "last_run_at": "2026-07-19T23:24:08.726940+05:30"
     },
     "silver": {
       "buy_streak": 0,
       "last_buy_triggered": false,
-      "last_run_at": "2026-07-15T11:13:29.571495+05:30"
+      "last_run_at": "2026-07-19T23:24:08.726979+05:30"
     }
+  },
+  "track_record": {
+    "open": {},
+    "closed": []
   }
 }
