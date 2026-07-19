@@ -81,14 +81,17 @@ class CommodityTracker:
         }
 
     # ---------------- Historical ----------------
-    def fetch_history(self, symbol, days=7):
+    def fetch_history(self, symbol, days=7, anchor_price=None):
         history = []
         usd_inr = self.usd_to_inr()
         ticker = "GC=F" if symbol == "XAU" else "SI=F"
 
+        # Pad the requested window for weekends/holidays -- requesting
+        # exactly days+2 calendar days only yields ~days*0.7 trading rows,
+        # so a "30-day" history was quietly coming back as ~22 rows.
         df = yf.download(
             ticker,
-            period=f"{days + 2}d",
+            period=f"{int(days * 1.6) + 5}d",
             interval="1d",
             progress=False,
         )
@@ -110,6 +113,20 @@ class CommodityTracker:
                 "date": self.format_date_short(date.strftime("%Y%m%d")),
                 "price": price_per_gram,
             })
+
+        # The history above is priced off Yahoo futures (GC=F/SI=F), while
+        # the headline "current" price comes from the gold-api.com spot feed.
+        # Futures and spot diverge (contango/backwardation) and the futures
+        # "close" can be a stale prior-session print, so without reconciling
+        # them the last history point wouldn't match the headline number and
+        # buy levels (a % of current price) would sit on a trend line from a
+        # different instrument. Anchor the series to the live spot price,
+        # preserving the shape/trend of the futures data while keeping it
+        # consistent with the number shown as "current price".
+        if anchor_price is not None and history and history[-1]["price"]:
+            scale = anchor_price / history[-1]["price"]
+            for row in history:
+                row["price"] = round(row["price"] * scale, 2)
 
         return history
 
@@ -142,8 +159,12 @@ class CommodityTracker:
         # Fetch a full 30-day window for each metal. The sparkline needs the
         # whole 30 days; the price table only ever shows the most recent 7,
         # so we keep both around rather than fetching twice.
-        gold_history_30d = self.calculate_pct_change(self.fetch_history("XAU", days=30))
-        silver_history_30d = self.calculate_pct_change(self.fetch_history("XAG", days=30))
+        gold_history_30d = self.calculate_pct_change(
+            self.fetch_history("XAU", days=30, anchor_price=current["gold"]["current"])
+        )
+        silver_history_30d = self.calculate_pct_change(
+            self.fetch_history("XAG", days=30, anchor_price=current["silver"]["current"])
+        )
 
         current["gold"]["history"] = gold_history_30d[-7:]
         current["silver"]["history"] = silver_history_30d[-7:]

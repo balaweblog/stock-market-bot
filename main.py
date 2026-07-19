@@ -1652,17 +1652,24 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         news_text = ", ".join(headlines[:3])
         
         # Get risk management data
-        risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"])
-        risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
-        range_52w = calculate_52_week_range(df, latest)
-
+        # Build the EMA/volume portion of entry_context first so it can be
+        # passed into apply_risk_management -- previously this was built
+        # afterward, so apply_risk_management always ran with entry_context
+        # defaulted to 0/None, while choose_stock_entry (below) used the real
+        # values. That meant the buy-level numbers and the chosen entry-style
+        # label were computed from inconsistent inputs.
         entry_context = {
             "current_price": round(latest["close"], 2),
             "price_vs_ema20_pct": round(((latest["close"] - latest["ema20"]) / latest["ema20"]) * 100, 2) if pd.notna(latest["ema20"]) and latest["ema20"] else None,
             "price_vs_ema50_pct": round(((latest["close"] - latest["ema50"]) / latest["ema50"]) * 100, 2) if pd.notna(latest["ema50"]) and latest["ema50"] else None,
             "volume_vs_avg_pct": round(((latest["volume"] - latest["vol_avg"]) / latest["vol_avg"]) * 100, 2) if pd.notna(latest["vol_avg"]) and latest["vol_avg"] else None,
-            "risk_reward_ratio": round((risk_data["target"] - latest["close"]) / max(latest["close"] - risk_data["stop_loss"], 1e-6), 2) if latest["close"] > risk_data["stop_loss"] else None,
         }
+
+        risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
+        risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
+        range_52w = calculate_52_week_range(df, latest)
+
+        entry_context["risk_reward_ratio"] = round((risk_data["target"] - latest["close"]) / max(latest["close"] - risk_data["stop_loss"], 1e-6), 2) if latest["close"] > risk_data["stop_loss"] else None
 
         recommended_entry = get_recommended_entry(signal, total_score, latest, market_context, entry_context)
         risk_data["recommended_entry"] = recommended_entry

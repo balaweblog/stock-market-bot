@@ -3,7 +3,7 @@ import yfinance as yf
 
 def fetch_advanced_fundamentals(symbol):
     ticker = yf.Ticker(symbol)
-    info = ticker.fast_info if hasattr(ticker, "fast_info") else {}
+    info = ticker.info if hasattr(ticker, "info") else {}
     financials = ticker.financials if hasattr(ticker, "financials") else None
     cashflow = ticker.cashflow if hasattr(ticker, "cashflow") else None
 

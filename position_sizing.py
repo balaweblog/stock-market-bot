@@ -11,7 +11,7 @@ def calculate_position_size(cash, confidence, risk_per_trade=0.01, stop_loss_pct
             stop_loss_pct = 0.06
 
     risk_amount = cash * risk_per_trade
-    position_size = risk_amount / (stop_loss_pct * confidence)
+    position_size = (risk_amount / stop_loss_pct) * confidence
     return max(0, position_size)
 
 
@@ -27,7 +27,7 @@ def apply_risk_management(signal, total_score, cash, price, entry_context=None):
         return {
             "confidence": round(confidence, 2),
             "size": 0,
-            "target": round(price * 0.95, 2),
+            "target": round(price, 2),
             "stop_loss": round(price * 0.95, 2),
             "buy_levels": {
                 "patient_entry": round(price * 0.95, 2),
