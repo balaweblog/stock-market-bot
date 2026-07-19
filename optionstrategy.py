@@ -1478,6 +1478,108 @@ def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
 _STRIKE_DISTANCE_FACTOR = float(os.getenv("OPTIONS_STRIKE_DISTANCE_FACTOR", "3"))
 
 
+def _clamp01_100(x):
+    return max(0, min(100, x))
+
+
+def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop_pct, reward_risk_ratio, conf_pct, is_eod):
+    """Composite 0-100 Trade Quality Score blending six independently-
+    interpretable signals, all derived from already-verified fields (real
+    premiums/IV, code-computed EV/POP/R:R, code-scored confidence) -- never
+    from the model's own self-assessment. Returns (score:int, breakdown)
+    where breakdown is an ordered dict of {component: (sub_score 0-100,
+    weight_pct)}, so the report can show both the headline number and
+    exactly what drove it (the same "show your work" pattern used
+    elsewhere in this file, e.g. compute_confidence's checks list).
+
+    Weights (sum to 100%):
+      Expected Value  30% -- the single most decision-relevant number: a
+                              structure with negative EV is a bad trade
+                              regardless of how the other five look, so it
+                              gets the largest single weight.
+      Reward:Risk     20% -- upside on offer per rupee risked.
+      Probability of
+        Profit        15% -- win-rate alone, without EV context, so it's
+                              weighted below EV/R:R rather than driving the
+                              score by itself (a 90% POP credit spread with
+                              negative EV should NOT score well here).
+      Confidence      15% -- reuses compute_confidence's existing
+                              code-verified checklist (OI wall alignment,
+                              Max Pain, VIX regime, strike-distance sanity)
+                              rather than re-deriving it.
+      Liquidity       10% -- whether this run had live OI/chain data to
+                              price and vet the trade against, vs. a stale
+                              EOD Bhavcopy fallback with no OI/IV at all.
+      OI Alignment    10% -- specifically whether the SHORT strike(s) sit
+                              at a real, current open-interest wall
+                              (support/resistance) -- scored independently
+                              since it's specific and decision-relevant
+                              enough to warrant its own weight rather than
+                              being folded silently into Confidence.
+    """
+    components = {}
+
+    # EV, normalized as EV / max_loss (edge per rupee risked) -- a
+    # scale-free ratio so a Weekly and a Quarterly trade compare on the
+    # same footing regardless of their absolute rupee size.
+    if ev_inr is not None and max_loss:
+        ev_score = _clamp01_100(50 + (ev_inr / max_loss) * 100)
+    else:
+        ev_score = 0
+    components["Expected Value"] = (round(ev_score), 30)
+
+    # Reward:Risk -- MIN_REWARD_RISK_RATIO (0.5 by default) is the bare
+    # pass/fail floor already enforced elsewhere in apply_verified_payoff;
+    # 1.5 is treated as a strong R:R for a defined-risk Nifty spread and
+    # maps to a full 100.
+    if reward_risk_ratio is not None and reward_risk_ratio != float("inf"):
+        rr_score = _clamp01_100((reward_risk_ratio / 1.5) * 100)
+    else:
+        rr_score = 0
+    components["Reward:Risk"] = (round(rr_score), 20)
+
+    # POP -- already a 0-100 percentage from compute_pop.
+    pop_score = _clamp01_100(pop_pct) if pop_pct is not None else 0
+    components["Probability of Profit"] = (round(pop_score), 15)
+
+    # Confidence -- reuse the existing verifiable-checks score as-is.
+    conf_score = _clamp01_100(conf_pct) if conf_pct is not None else 0
+    components["Confidence"] = (round(conf_score), 15)
+
+    # Liquidity -- proxy for real, current tradeable liquidity: live chain
+    # with OI data beats live chain without OI beats a stale EOD Bhavcopy
+    # close (no OI/IV at all, since that's the degraded-data path).
+    top_call_oi = (horizon_snap or {}).get("top_call_oi") or []
+    top_put_oi = (horizon_snap or {}).get("top_put_oi") or []
+    has_oi_data = bool(top_call_oi or top_put_oi)
+    if is_eod:
+        liq_score = 30
+    elif has_oi_data:
+        liq_score = 90
+    else:
+        liq_score = 55
+    components["Liquidity"] = (round(liq_score), 10)
+
+    # OI Alignment -- do the SHORT strikes sit at a real current OI wall
+    # (support/resistance)? Same signal compute_confidence checks, but
+    # scored on its own here rather than only being one of several inputs
+    # folded into the blended Confidence percentage above.
+    top_by_type = {
+        "CE": top_call_oi[0][0] if top_call_oi else None,
+        "PE": top_put_oi[0][0] if top_put_oi else None,
+    }
+    short_legs = [l for l in (priced_legs or []) if l["action"] == "Sell"]
+    if not has_oi_data or not short_legs:
+        oi_score = 50  # unknown -- neither rewarded nor penalized
+    else:
+        aligned = any(top_by_type.get(l["type"]) == l["strike"] for l in short_legs)
+        oi_score = 100 if aligned else 35
+    components["OI Alignment"] = (round(oi_score), 10)
+
+    total = sum(sub_score * weight / 100 for sub_score, weight in components.values())
+    return round(total), components
+
+
 def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None):
     """Replaces the model's unexplained High/Medium/Low self-rating with a
     percentage score built from checks that are actually verifiable from
@@ -1653,6 +1755,9 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["verification"] = f"⚠ Not verified: {result['reason']}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
         horizon_dict["_net_gamma"] = None
+        horizon_dict["_negative_ev"] = False
+        horizon_dict["_trade_quality_score"] = None
+        horizon_dict["trade_quality_score"] = "n/a"
         return horizon_dict
 
     if result["unbounded_risk"]:
@@ -1683,6 +1788,9 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["verification"] = "🛑 Rejected: legs do not form a capped-risk structure (naked exposure detected)."
         horizon_dict["_verified_max_loss_inr"] = float("inf")
         horizon_dict["_net_gamma"] = None
+        horizon_dict["_negative_ev"] = False
+        horizon_dict["_trade_quality_score"] = None
+        horizon_dict["trade_quality_score"] = "n/a"
         return horizon_dict
 
     priced_legs = result["priced_legs"]
@@ -1805,6 +1913,9 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["verification"] = f"🛑 Rejected: {reason_text}"
         horizon_dict["_verified_max_loss_inr"] = 0.0
         horizon_dict["_net_gamma"] = None
+        horizon_dict["_negative_ev"] = False
+        horizon_dict["_trade_quality_score"] = None
+        horizon_dict["trade_quality_score"] = "n/a"
         return horizon_dict
 
     horizon_dict["max_loss"] = f"₹{max_loss:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
@@ -1962,8 +2073,12 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     # a bare POP figure to imply "good trade" on its own.
     expectancy = compute_expectancy_metrics(pop, max_profit, max_loss)
     ev_inr = expectancy["ev_inr"]
+    horizon_dict["_negative_ev"] = ev_inr is not None and ev_inr < 0
     horizon_dict["expected_value"] = (
-        f"₹{ev_inr:,.0f} per lot ({'positive' if ev_inr >= 0 else 'negative'} expectancy at the "
+        (
+            "❌ Avoid — negative expected value under current assumptions. "
+            if ev_inr < 0 else ""
+        ) + f"₹{ev_inr:,.0f} per lot ({'positive' if ev_inr >= 0 else 'negative'} expectancy at the "
         f"modeled POP -- avg outcome if this exact setup repeated many times, not a guarantee)"
         if ev_inr is not None else None
     )
@@ -2011,6 +2126,15 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     horizon_dict["confidence"] = conf_label
     horizon_dict["confidence_pct"] = conf_pct
     horizon_dict["confidence_reasons"] = conf_checks
+
+    tq_score, tq_breakdown = compute_trade_quality_score(
+        priced_legs, horizon_snap, ev_inr, max_loss, pop, reward_risk_ratio, conf_pct, is_eod
+    )
+    horizon_dict["_trade_quality_score"] = tq_score
+    horizon_dict["trade_quality_breakdown"] = " · ".join(
+        f"{name} {sub}/100 ({weight}%)" for name, (sub, weight) in tq_breakdown.items()
+    )
+    horizon_dict["trade_quality_score"] = f"{tq_score}/100 -- {horizon_dict['trade_quality_breakdown']}"
 
     horizon_dict["verification"] = (
         f"✅ Verified from {premium_label}: net {'credit' if net_premium >= 0 else 'debit'} "
@@ -2240,6 +2364,45 @@ def _data_status_badge(status):
 SENSIBULL_STRATEGY_BUILDER_URL = "https://web.sensibull.com/option-strategy-builder?instrument_symbol=NIFTY"
 
 
+def _execution_cell_html(h, sans, expiry):
+    """Structured Broker / Status / Verification block, replacing the old
+    bare 'Open Sensibull' link. Status is never the model's own framing --
+    it's derived from the same real signals the rest of the card already
+    uses: _horizon_rejected (unparseable legs / undefined risk / poor
+    reward:risk) and data_status (live NSE chain vs. stale EOD Bhavcopy
+    fallback), so a rejected or stale-data horizon can never show 'Ready'
+    here while its own Payoff Verification row above says otherwise."""
+    if _horizon_rejected(h):
+        status_text, status_color = "🛑 Not Ready", "#8B2E2E"
+        verification_text = "Rejected -- do not place this trade until the legs are corrected (see Payoff Verification above)."
+    elif str(h.get("data_status") or "").strip().lower() == "eod":
+        status_text, status_color = "⚠ Verify First", "#A6812F"
+        verification_text = "Priced off EOD Bhavcopy (stale close, not live) -- confirm live premiums with your broker before placing this order."
+    else:
+        status_text, status_color = "✅ Ready", "#2F5233"
+        verification_text = "Confirm live premium before placing order."
+
+    broker_line = (
+        f'<a href="{SENSIBULL_STRATEGY_BUILDER_URL}" style="color:#8A6D3B;font-weight:600;'
+        f'text-decoration:none;">Sensibull</a> '
+        f'<span style="color:#8A8F9C;font-size:11px;">(select {expiry} expiry, then add the legs above)</span>'
+    )
+
+    def _line(label, value_html):
+        return (
+            f'<div style="margin-top:4px;">'
+            f'<span style="font-family:{sans};font-size:11px;font-weight:700;color:#8A8F9C;'
+            f'text-transform:uppercase;letter-spacing:0.04em;">{label}</span><br>'
+            f'<span style="font-family:{sans};font-size:12px;color:#14213D;">{value_html}</span></div>'
+        )
+
+    return "".join([
+        _line("Broker", broker_line),
+        _line("Status", f'<span style="font-weight:700;color:{status_color};">{status_text}</span>'),
+        _line("Verification", f'<span style="color:#4A5063;">{html.escape(verification_text)}</span>'),
+    ])
+
+
 def _horizon_card_html(h, sans, serif):
     """One risk-defined-strategy card per horizon (Weekly/Monthly/
     Quarterly), styled consistently with the swing-trade note's
@@ -2264,16 +2427,10 @@ def _horizon_card_html(h, sans, serif):
             f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html or "—"}</td></tr>'
         )
 
-    sensibull_cell = (
-        f'<a href="{SENSIBULL_STRATEGY_BUILDER_URL}" style="color:#8A6D3B;font-weight:600;'
-        f'text-decoration:none;">Open Nifty Strategy Builder on Sensibull &rarr;</a> '
-        f'<span style="color:#8A8F9C;font-size:11px;">(select {expiry} expiry, then add the legs above)</span>'
-    )
-
     rows = "".join([
         row("Strategy", "strategy_name", bold=True),
         row("Legs", "legs"),
-        raw_row("Trade This", sensibull_cell),
+        raw_row("Execution", _execution_cell_html(h, sans, expiry)),
         raw_row("Directional Bias (Current Week)" if h.get("next_week_bias") else "Directional Bias", _bias_badge(h.get("bias"))),
         *([raw_row("Directional Bias (Next Week)", _bias_badge(h.get("next_week_bias")))] if h.get("next_week_bias") else []),
         row("Bias Rationale", "bias_reason"),
@@ -2300,6 +2457,7 @@ def _horizon_card_html(h, sans, serif):
         row("Gap Risk", "gap_risk"),
         row("Adjustment / Exit Trigger", "adjustment_trigger"),
         *([row("Reward : Risk", "reward_risk_ratio")] if h.get("reward_risk_ratio") else []),
+        row("Trade Quality Score", "trade_quality_score"),
         raw_row("Confidence", _confidence_cell_html(h, sans)),
         raw_row("Data Freshness", _data_status_badge(h.get("data_status"))),
         row("Payoff Verification", "verification"),
@@ -2516,6 +2674,184 @@ def compute_market_regime(live_data, horizons):
     return " · ".join(parts) if parts else None
 
 
+def compute_horizon_recommendation(h):
+    """Deterministic Consider/Skip/Caution verdict for one horizon, built
+    entirely from fields apply_verified_payoff already computed from real
+    premiums -- never from the model's own framing. Checked in this order
+    (first match wins), each one a real, code-verified failure mode rather
+    than a vibe:
+
+      1. Rejected outright (unparseable legs, undefined/naked risk, or
+         failed the reward:risk / credit-width quality gate)
+      2. Negative expected value at the modeled POP -- a defined-risk trade
+         can still be a net loser in expectation (see
+         compute_expectancy_metrics's docstring)
+      3. Exceeds the per-horizon capital cap (constraint #3 in the prompt
+         asks the MODEL to respect this, but nothing downstream actually
+         verified it against the real priced max_loss until now)
+      4. Confidence tier came back "Low" -- verifiable-checks score, not
+         the model's own self-rating
+
+    Returns (verdict, css_color, reason) where verdict is one of
+    "✅ Consider", "⚠ Caution", "❌ Skip", "Not Available"."""
+    green, amber, red, gray = "#2F5233", "#A6812F", "#8B2E2E", "#8A8F9C"
+
+    if _horizon_rejected(h):
+        ml = str(h.get("max_loss") or "")
+        if "UNDEFINED RISK" in ml:
+            reason = "Undefined Risk"
+        elif "POOR REWARD/RISK" in ml:
+            reason = "Poor Reward:Risk"
+        else:
+            reason = "Unverified"
+        return "❌ Skip", red, reason
+
+    ev_text = h.get("expected_value")
+    if ev_text and "negative" in str(ev_text).lower():
+        return "❌ Skip", red, "Negative EV"
+
+    loss_pct = h.get("max_loss_pct_capital")
+    if isinstance(loss_pct, (int, float)) and loss_pct > PER_HORIZON_CAP_PCT:
+        return "❌ Skip", red, f"Exceeds {PER_HORIZON_CAP_PCT:.0f}% Per-Horizon Cap"
+
+    if str(h.get("confidence") or "").strip().lower() == "low":
+        return "⚠ Caution", amber, "Low Confidence"
+
+    return "✅ Consider", green, None
+
+
+def render_recommendation_summary_table(horizons):
+    """Top-of-report Horizon/Recommendation table so the reader gets a
+    single fast-scan verdict before the detailed metrics below -- every
+    verdict traces back to compute_horizon_recommendation, which only reads
+    already-verified fields, so this table can never show "Consider" for a
+    horizon the detailed card below marks rejected, negative-EV, or
+    over-cap."""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+    by_name = {}
+    for h in horizons:
+        key = str(h.get("horizon") or "").strip()
+        if key:
+            by_name[key] = h
+
+    def _cell(text, header=False, color="#14213D", bold=False):
+        weight = "font-weight:700;" if (header or bold) else ""
+        bg = "background:#14213D;color:#ffffff;" if header else f"color:{color};"
+        border = "" if header else "border-top:1px solid #EDEAE2;"
+        return (
+            f'<td style="padding:8px 12px;font-size:12px;{weight}font-family:{sans};'
+            f'{bg}{border}text-align:left;">{text}</td>'
+        )
+
+    header_row = f'<tr>{_cell("Horizon", header=True)}{_cell("Recommendation", header=True)}</tr>'
+
+    rows = []
+    for label in HORIZON_ORDER:
+        h = by_name.get(label)
+        if not h:
+            rows.append(
+                f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}'
+                f'{_cell("Not Available", color="#8A8F9C")}</tr>'
+            )
+            continue
+        verdict, color, reason = compute_horizon_recommendation(h)
+        display = f"{verdict} ({html.escape(reason)})" if reason else verdict
+        rows.append(
+            f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}'
+            f'{_cell(display, color=color, bold=True)}</tr>'
+        )
+
+    if not rows:
+        return ""
+
+    return f"""
+<div style="margin-bottom:16px;">
+  <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Overall Recommendation</div>
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
+    {header_row}
+    {''.join(rows)}
+  </table>
+</div>
+"""
+
+
+def render_trade_quality_table(horizons):
+    """Simple Horizon / Trade Quality Score table -- the headline number
+    from compute_trade_quality_score for each horizon, with a colored bar
+    so relative quality is scannable at a glance. Full component breakdown
+    (EV/R:R/POP/Confidence/Liquidity/OI Alignment) is shown per-horizon in
+    the detailed card below via the same score's stored breakdown text, so
+    a reader who wants "why" doesn't have to leave this table to get it --
+    they just scroll down to the matching horizon's card."""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+
+    by_name = {}
+    for h in horizons:
+        key = str(h.get("horizon") or "").strip()
+        if key:
+            by_name[key] = h
+
+    def _cell(text, header=False, color="#14213D"):
+        weight = "font-weight:700;" if header else ""
+        bg = "background:#14213D;color:#ffffff;" if header else f"color:{color};"
+        border = "" if header else "border-top:1px solid #EDEAE2;"
+        return (
+            f'<td style="padding:8px 12px;font-size:12px;{weight}font-family:{sans};'
+            f'{bg}{border}text-align:left;">{text}</td>'
+        )
+
+    def _score_color(score):
+        if score >= 70:
+            return "#2F5233"
+        if score >= 45:
+            return "#A6812F"
+        return "#8B2E2E"
+
+    def _bar_cell(score):
+        color = _score_color(score)
+        filled = round(score)
+        return (
+            f'<td style="padding:8px 12px;border-top:1px solid #EDEAE2;">'
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<div style="flex:1;height:8px;background:#EDEAE2;border-radius:4px;overflow:hidden;">'
+            f'<div style="width:{filled}%;height:100%;background:{color};"></div></div>'
+            f'<span style="font-family:{sans};font-size:12px;font-weight:700;color:{color};'
+            f'white-space:nowrap;">{score}/100</span></div></td>'
+        )
+
+    header_row = f'<tr>{_cell("Horizon", header=True)}{_cell("Trade Quality", header=True)}</tr>'
+
+    rows = []
+    for label in HORIZON_ORDER:
+        h = by_name.get(label)
+        if not h:
+            rows.append(f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}{_cell("Not Available", color="#8A8F9C")}</tr>')
+            continue
+        score = h.get("_trade_quality_score")
+        if score is None:
+            rows.append(
+                f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}'
+                f'{_cell("N/A (Rejected)", color="#8A8F9C")}</tr>'
+            )
+            continue
+        rows.append(f'<tr>{_cell(f"<b>{html.escape(label)}</b>")}{_bar_cell(score)}</tr>')
+
+    if not rows:
+        return ""
+
+    return f"""
+<div style="margin-bottom:16px;">
+  <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Trade Quality Score</div>
+  <div style="font-family:{sans};font-size:10px;color:#8A8F9C;margin-bottom:6px;">Composite of Expected Value (30%), Reward:Risk (20%), Probability of Profit (15%), Confidence (15%), Liquidity (10%), and OI Alignment (10%) -- see each horizon's card below for the exact component breakdown.</div>
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
+    {header_row}
+    {''.join(rows)}
+  </table>
+</div>
+"""
+
+
 def render_strategy_summary_table(horizons):
     """One-line-per-horizon overview table (Horizon / Strategy / Bias /
     Expected Move / POP / Max Profit / Profit % / Max Loss / Loss % / EV /
@@ -2577,7 +2913,9 @@ def render_strategy_summary_table(horizons):
         loss_pct = _pct(h.get("max_loss_pct_capital"))
         ev_text = h.get("expected_value")
         ev = _extract(_EV_FIGURE_RE, ev_text)
-        ev_color = "#2F5233" if ev != "n/a" and not ev.startswith("₹-") else "#8B2E2E"
+        is_negative_ev = bool(h.get("_negative_ev"))
+        ev_color = "#8B2E2E" if is_negative_ev else ("#2F5233" if ev != "n/a" else "#8B2E2E")
+        ev_display = f"❌ Avoid ({ev})" if is_negative_ev and ev != "n/a" else ev
         rr = _extract(_RR_RATIO_RE, h.get("reward_risk_ratio"))
         rr_display = f"{rr}" if rr != "n/a" else "n/a"
         conf_pct = h.get("confidence_pct")
@@ -2594,7 +2932,7 @@ def render_strategy_summary_table(horizons):
             _cell(html.escape(profit_pct), color="#2F5233"),
             _cell(html.escape(max_loss), color="#8B2E2E"),
             _cell(html.escape(loss_pct), color="#8B2E2E"),
-            _cell(html.escape(ev), color=ev_color),
+            _cell(html.escape(ev_display), color=ev_color, header=False),
             _cell(html.escape(rr_display)),
             _cell(html.escape(confidence)),
         ])
@@ -2611,6 +2949,116 @@ def render_strategy_summary_table(horizons):
   </table>
 </div>
 """
+
+
+def compute_suggested_sizing(horizons):
+    """Deterministic per-horizon lot-sizing suggestion -- code-derived from
+    already-verified max_loss figures and the two capital caps this file
+    already enforces (PER_HORIZON_CAP_PCT for a single horizon,
+    AGGREGATE_CAP_PCT for all three combined), never from the model's own
+    text. This turns "exceeds the aggregate cap" from a bare warning into
+    something directly actionable: how many lots (or none at all) to
+    actually place per horizon.
+
+    Two passes:
+      1. Per-horizon cap: a rejected/negative-EV/low-quality horizon (per
+         compute_horizon_recommendation) is sized 0 outright. Otherwise,
+         lots = floor(PER_HORIZON_CAP_PCT% of capital / that horizon's own
+         verified per-lot max loss) -- if even 1 lot alone breaches the
+         per-horizon cap, it's skipped.
+      2. Aggregate cap: if the combined worst-case loss at that sizing
+         still exceeds AGGREGATE_CAP_PCT, lots are trimmed one at a time
+         from the LOWEST Trade-Quality-Score horizon first (weakest trade
+         gives up size before a stronger one does), down to zero if
+         necessary, until the combined figure fits.
+
+    Returns an ordered list of (horizon_name, lots:int|None, note:str|None)
+    tuples in HORIZON_ORDER -- lots is None for "skip this horizon
+    entirely", with note explaining why."""
+    by_name = {str(h.get("horizon") or "").strip(): h for h in horizons}
+    per_horizon_cap_inr = PER_HORIZON_CAP_PCT / 100 * TOTAL_CAPITAL_INR
+    aggregate_cap_inr = AGGREGATE_CAP_PCT / 100 * TOTAL_CAPITAL_INR
+
+    plan = []
+    for name in HORIZON_ORDER:
+        h = by_name.get(name)
+        if not h:
+            plan.append([name, None, "Not available this run"])
+            continue
+        verdict, _color, reason = compute_horizon_recommendation(h)
+        if verdict == "❌ Skip":
+            plan.append([name, None, reason])
+            continue
+        max_loss_per_lot = h.get("_verified_max_loss_inr")
+        if not isinstance(max_loss_per_lot, (int, float)) or max_loss_per_lot <= 0:
+            plan.append([name, None, "Unverified max loss"])
+            continue
+        lots = int(per_horizon_cap_inr // max_loss_per_lot)
+        if lots < 1:
+            plan.append([name, None, f"Even 1 lot exceeds the {PER_HORIZON_CAP_PCT:.0f}% per-horizon cap"])
+            continue
+        note = None if verdict == "✅ Consider" else "Low Confidence -- consider reduced size or manual review"
+        plan.append([name, lots, note])
+
+    def total_risk():
+        return sum(
+            by_name[name].get("_verified_max_loss_inr", 0.0) * lots
+            for name, lots, _note in plan if lots
+        )
+
+    def quality(name):
+        h = by_name.get(name) or {}
+        s = h.get("_trade_quality_score")
+        return s if s is not None else -1
+
+    guard = 0
+    while total_risk() > aggregate_cap_inr and guard < 50:
+        guard += 1
+        candidates = [row for row in plan if row[1]]
+        if not candidates:
+            break
+        candidates.sort(key=lambda row: quality(row[0]))
+        weakest = candidates[0]
+        if weakest[1] > 1:
+            weakest[1] -= 1
+            weakest[2] = "Reduced size to stay within the {:.0f}% aggregate cap".format(AGGREGATE_CAP_PCT)
+        else:
+            weakest[1] = None
+            weakest[2] = f"Skipped to stay within the {AGGREGATE_CAP_PCT:.0f}% aggregate cap"
+
+    return [tuple(row) for row in plan]
+
+
+def render_suggested_sizing_html(plan, sans):
+    """Renders compute_suggested_sizing's plan as the small, directly
+    actionable "Suggested Sizing" block the reader can act on immediately
+    -- lots per horizon, or an explicit Skip with the real reason."""
+    lines = []
+    for name, lots, note in plan:
+        if lots:
+            text = f"{lots} lot{'s' if lots != 1 else ''}"
+            color = "#2F5233"
+        else:
+            text = f"Skip{f' ({html.escape(note)})' if note else ''}"
+            color = "#8B2E2E"
+        extra = (
+            f' <span style="color:#8A6D3B;">— {html.escape(note)}</span>'
+            if lots and note else ""
+        )
+        lines.append(
+            f'<div style="display:flex;justify-content:space-between;padding:3px 0;">'
+            f'<span style="color:#4A5063;">{html.escape(name)}</span>'
+            f'<span style="font-weight:700;color:{color};">{text}</span>{extra}</div>'
+        )
+    return (
+        f'<div style="margin-top:10px;padding:10px 12px;background:#FFFFFF;'
+        f'border:1px solid #EDEAE2;border-radius:4px;">'
+        f'<div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;'
+        f'text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Suggested Sizing '
+        f'<span style="text-transform:none;font-weight:400;color:#8A8F9C;">(₹{TOTAL_CAPITAL_INR:,.0f} capital pool assumed -- override with OPTIONS_TOTAL_CAPITAL_INR)</span></div>'
+        f'<div style="font-family:{sans};font-size:12px;">{"".join(lines)}</div>'
+        f'</div>'
+    )
 
 
 def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None):
@@ -2670,6 +3118,8 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
     # the authoritative figure (issue #2).
     gamma_summary = compute_portfolio_gamma_summary(horizons)
     portfolio_text = _strip_gamma_claims(_strip_cap_claims(portfolio_view))
+    sizing_plan = compute_suggested_sizing(horizons)
+    sizing_html = render_suggested_sizing_html(sizing_plan, sans)
     portfolio_html = (
         f'<div style="margin-top:16px;padding:12px 14px;background:#FAF9F6;'
         f'border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;">'
@@ -2686,11 +3136,14 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(gamma_summary)}</div>'
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;margin-top:8px;">{_esc(portfolio_text)}</div>'
         f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{agg_color};margin-top:8px;">{verdict}</div>'
+        f'{sizing_html}'
         f'</div>'
     )
 
+    recommendation_table_html = render_recommendation_summary_table(horizons)
+    trade_quality_table_html = render_trade_quality_table(horizons)
     summary_table_html = render_strategy_summary_table(horizons)
-    return regime_html + summary_table_html + cards + portfolio_html
+    return regime_html + recommendation_table_html + trade_quality_table_html + summary_table_html + cards + portfolio_html
 
 
 # -----------------------------
