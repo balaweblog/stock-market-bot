@@ -3,7 +3,7 @@ optionstrategy.py
 
 Standalone companion to main.py, structured the same way as
 swing_trade_advisor.py. Runs a single "recommend the best risk-defined
-Nifty options strategy across Weekly / Monthly / Quarterly / Annual
+Nifty options strategy across Weekly / Monthly / Quarterly
 horizons" prompt against whichever free LLM backend main.py already knows
 how to set up (Groq free tier -> Gemini 2.5 Flash free tier -> local
 Qwen2.5-1.5B fallback), then emails the result to the same recipients
@@ -72,7 +72,22 @@ import swing_trade_advisor as swing  # reuses generate_analysis() + helpers, no 
 PER_HORIZON_CAP_PCT = float(os.getenv("OPTIONS_PER_HORIZON_CAP_PCT", "5"))
 AGGREGATE_CAP_PCT = float(os.getenv("OPTIONS_AGGREGATE_CAP_PCT", "15"))
 
-HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly", "Annual"]
+# Quality filters applied in code AFTER pricing (apply_verified_payoff), on
+# top of the risk-defined-only rule -- a capped-risk spread can still be a
+# bad trade if the reward on offer doesn't justify the capital locked up as
+# max loss. Both are checked independently; either failing rejects the
+# horizon and triggers the same repair-and-retry pass used for structurally
+# invalid legs (see _horizon_rejected / repair_rejected_legs).
+#   - MIN_REWARD_RISK_RATIO: max_profit / max_loss must be at least this
+#     (0.5 = risking at most 2x what you stand to make).
+#   - MIN_CREDIT_WIDTH_PCT: for a credit spread, net credit collected must
+#     be at least this % of the strike width -- e.g. a 300-point-wide Bear
+#     Call Spread collecting only a few rupees of credit per point of width
+#     is technically "risk-defined" but not worth the capital at risk.
+MIN_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MIN_REWARD_RISK_RATIO", "0.5"))
+MIN_CREDIT_WIDTH_PCT = float(os.getenv("OPTIONS_MIN_CREDIT_WIDTH_PCT", "15"))
+
+HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly"]
 
 # -----------------------------
 # Live data fetch (NSE India option-chain API + Yahoo Finance)
@@ -266,55 +281,11 @@ def fetch_nse_fii_dii(timeout=12, max_attempts=2):
     return None
 
 
-# A NIFTY index-options "Annual" horizon is only meaningful if the farthest
-# listed expiry is genuinely long-dated AND has real open interest. NSE's
-# current Nifty 50 listing convention (weekly -> monthly -> quarterly ->
-# semi-annual) tops out at semi-annual (~6 months / ~180 days out) -- NSE
-# does not list a true ~12-month/LEAPS-style index option at all right now.
-# The bar used to be 300 days, which is ABOVE what NSE ever lists for Nifty
-# today, so this horizon was unconditionally "N/A -- omitted" on every run
-# regardless of real data. Lowered to 150 days so the semi-annual contract
-# (when NSE actually has one listed) can qualify -- but the OI floor below
-# remains the real "is there tradable value here" gate, so an illiquid or
-# unlisted long-dated expiry still correctly comes back unusable rather
-# than forcing a strategy into a contract nobody could actually trade.
-ANNUAL_MIN_DAYS_OUT = int(os.getenv("ANNUAL_MIN_DAYS_OUT", "150"))
-ANNUAL_MIN_TOTAL_OI = int(os.getenv("ANNUAL_MIN_TOTAL_OI", "500"))
-# Below this, even a usable long-dated expiry is realistically NSE's
-# semi-annual contract rather than a genuine 12-month/LEAPS-style one --
-# used only to keep the report's own wording honest about which it is.
-ANNUAL_TRUE_LEAPS_DAYS_OUT = int(os.getenv("ANNUAL_TRUE_LEAPS_DAYS_OUT", "300"))
-
-
-def _annual_usability(weekly_dt, annual_dt, total_oi=None):
-    """Returns (usable: bool, reason: str, days_out: int|None). Checked
-    independently of whatever the LLM says -- if this comes back
-    usable=False, the Annual horizon is rendered as omitted regardless of
-    model output (see finalize_horizons())."""
-    if not weekly_dt or not annual_dt:
-        return False, "No expiries available to evaluate.", None
-    days_out = (annual_dt - weekly_dt).days
-    if days_out < ANNUAL_MIN_DAYS_OUT:
-        return False, (
-            f"Farthest listed expiry is only {days_out} days out (< {ANNUAL_MIN_DAYS_OUT} "
-            f"required) -- NSE does not currently list a sufficiently long-dated Nifty "
-            f"options expiry (semi-annual is the longest tenor NSE currently lists for Nifty)."
-        ), days_out
-    if total_oi is not None and total_oi < ANNUAL_MIN_TOTAL_OI:
-        return False, (
-            f"Farthest listed expiry ({days_out} days out) has only {total_oi:,} combined "
-            f"OI -- too illiquid to trade at any meaningful size."
-        ), days_out
-    tenor = "annual/LEAPS-style" if days_out >= ANNUAL_TRUE_LEAPS_DAYS_OUT else "semi-annual"
-    return True, f"Farthest listed expiry is {days_out} days out ({tenor}) with adequate OI.", days_out
-
-
 def _pick_horizon_expiry_dates(dt_list):
     """Shared horizon-selection logic, operating on plain datetime objects
     so both the live option-chain JSON path (DD-Mon-YYYY strings) and the
     Bhavcopy fallback path (YYYY-MM-DD strings) pick horizons identically:
-    nearest weekly / current monthly / nearest Mar-Jun-Sep-Dec quarterly /
-    farthest available."""
+    nearest weekly / current monthly / nearest Mar-Jun-Sep-Dec quarterly."""
     dts = sorted(set(dt_list))
     if not dts:
         return {}
@@ -323,13 +294,12 @@ def _pick_horizon_expiry_dates(dt_list):
     monthly_dt = same_month[-1] if same_month else weekly_dt
     quarter_candidates = [dt for dt in dts if dt.month in (3, 6, 9, 12) and dt >= monthly_dt]
     quarterly_dt = quarter_candidates[0] if quarter_candidates else dts[-1]
-    annual_dt = dts[-1]
-    return {"Weekly": weekly_dt, "Monthly": monthly_dt, "Quarterly": quarterly_dt, "Annual": annual_dt}
+    return {"Weekly": weekly_dt, "Monthly": monthly_dt, "Quarterly": quarterly_dt}
 
 
 def _pick_horizon_expiries(expiry_dates):
     """Maps NSE's raw list of listed expiry-date STRINGS (live option-chain
-    JSON, DD-Mon-YYYY format) onto the four horizon definitions used in the
+    JSON, DD-Mon-YYYY format) onto the three horizon definitions used in the
     prompt, via the shared datetime-based picker above."""
     by_dt = {_parse_nse_date(d): d for d in expiry_dates}
     picked = _pick_horizon_expiry_dates(by_dt.keys())
@@ -385,6 +355,14 @@ def _extract_expiry_snapshot(rows, expiry_str):
     # OI" (issue #3).
     call_oi_chg_pct = {s: c.get("pchangeinOpenInterest") for s, c in calls.items() if c.get("pchangeinOpenInterest") is not None}
     put_oi_chg_pct = {s: p.get("pchangeinOpenInterest") for s, p in puts.items() if p.get("pchangeinOpenInterest") is not None}
+    # Absolute OI change (contracts, vs previous session) and absolute LTP
+    # change, both straight from NSE's own chain -- together these are what
+    # let compute_oi_trend() below classify Call Writing / Put Writing /
+    # Unwinding instead of just showing a bare OI-change percentage (issue #8).
+    call_oi_chg_abs = {s: c.get("changeinOpenInterest") for s, c in calls.items() if c.get("changeinOpenInterest") is not None}
+    put_oi_chg_abs = {s: p.get("changeinOpenInterest") for s, p in puts.items() if p.get("changeinOpenInterest") is not None}
+    call_price_chg = {s: c.get("change") for s, c in calls.items() if c.get("change") is not None}
+    put_price_chg = {s: p.get("change") for s, p in puts.items() if p.get("change") is not None}
 
     return {
         "expiry": expiry_str,
@@ -400,7 +378,78 @@ def _extract_expiry_snapshot(rows, expiry_str):
         "put_iv": put_iv,
         "call_oi_chg_pct": call_oi_chg_pct,
         "put_oi_chg_pct": put_oi_chg_pct,
+        "call_oi_chg_abs": call_oi_chg_abs,
+        "put_oi_chg_abs": put_oi_chg_abs,
+        "call_price_chg": call_price_chg,
+        "put_price_chg": put_price_chg,
     }
+
+
+def compute_oi_trend(horizon_snap):
+    """Classifies each side of the chain (Calls / Puts) into the standard
+    OI-buildup categories traders actually look for -- Writing (OI up while
+    premium falls: fresh short positions), Buying (OI up while premium
+    rises: fresh long positions), or Unwinding (OI down: positions
+    closing) -- instead of just showing a bare aggregate OI-change number.
+
+    Both signals are aggregated across every strike in the chain (not just
+    the top-5-by-OI subset shown elsewhere), OI-weighted so a large move at
+    a high-OI strike counts more than the same move at a thin one:
+      - total OI change = sum of each strike's absolute change in OI
+      - premium direction = OI-weighted average of each strike's absolute
+        LTP change (sign only matters here, not the magnitude)
+
+    Needs NSE's live-JSON 'changeinOpenInterest' and 'change' fields, which
+    only exist on the live option-chain path -- the EOD Bhavcopy fallback
+    has no previous-session comparison baked into a single day's file, so
+    this returns None for that path (honest 'n/a' rather than a guess)."""
+    def _classify(oi_chg_map, price_chg_map, oi_map):
+        if not oi_chg_map:
+            return None
+        total_oi_chg = sum(oi_chg_map.values())
+        weighted_price_chg = sum(
+            price_chg_map.get(s, 0) * oi_map.get(s, 0) for s in price_chg_map
+        )
+        if total_oi_chg > 0:
+            label = "Writing" if weighted_price_chg <= 0 else "Buying"
+        elif total_oi_chg < 0:
+            label = "Unwinding"
+        else:
+            label = "Flat"
+        return {"total_oi_chg": total_oi_chg, "label": label}
+
+    call_oi_chg_abs = horizon_snap.get("call_oi_chg_abs") or {}
+    put_oi_chg_abs = horizon_snap.get("put_oi_chg_abs") or {}
+    if not call_oi_chg_abs and not put_oi_chg_abs:
+        return None
+
+    calls = _classify(call_oi_chg_abs, horizon_snap.get("call_price_chg") or {}, horizon_snap.get("call_ltp") or {})
+    puts = _classify(put_oi_chg_abs, horizon_snap.get("put_price_chg") or {}, horizon_snap.get("put_ltp") or {})
+    if not calls and not puts:
+        return None
+
+    parts = []
+    if calls:
+        parts.append(f"Call {calls['label']} ({calls['total_oi_chg']:+,} OI)")
+    if puts:
+        parts.append(f"Put {puts['label']} ({puts['total_oi_chg']:+,} OI)")
+
+    # A plain-English read of the two sides together, using the same
+    # framework NSE terminals use: put writing = bullish support building,
+    # call writing = bearish resistance building, unwinding on either side
+    # = conviction fading rather than a fresh directional bet.
+    read = None
+    if calls and puts:
+        if calls["label"] == "Writing" and puts["label"] == "Writing":
+            read = "both sides writing premium -- range-bound expectation building"
+        elif puts["label"] == "Writing" and calls["label"] != "Writing":
+            read = "put writing dominant -- bullish support building"
+        elif calls["label"] == "Writing" and puts["label"] != "Writing":
+            read = "call writing dominant -- bearish resistance building"
+        elif calls["label"] == "Unwinding" and puts["label"] == "Unwinding":
+            read = "unwinding on both sides -- conviction fading, not a fresh directional bet"
+
+    return " · ".join(parts) + (f" -- {read}" if read else "")
 
 
 # -----------------------------
@@ -624,18 +673,6 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
             snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
             data["horizons"][horizon] = snap
 
-        annual_snap = data["horizons"].get("Annual")
-        annual_total_oi = (
-            (annual_snap.get("total_call_oi", 0) + annual_snap.get("total_put_oi", 0))
-            if annual_snap else None
-        )
-        usable, reason, days_out = _annual_usability(
-            horizon_dts.get("Weekly"), horizon_dts.get("Annual"), annual_total_oi
-        )
-        data["annual_usable"], data["annual_reason"], data["annual_days_out"] = usable, reason, days_out
-        if not usable:
-            notes.append(f"Annual horizon not usable: {reason}")
-
         notes.append(
             f"Live NSE option-chain feed was unavailable this run -- per-horizon OI/PCR/max-pain "
             f"were filled from NSE's official EOD Bhavcopy dated {bhav_date.strftime('%d %b %Y')} "
@@ -672,9 +709,6 @@ def fetch_live_market_data():
         "fii_dii_source": None,
         "horizons": {},
         "notes": notes,
-        "annual_usable": None,   # None = not yet evaluated (e.g. total fetch failure)
-        "annual_reason": None,
-        "annual_days_out": None,
     }
 
     if yf is not None:
@@ -737,19 +771,6 @@ def fetch_live_market_data():
             snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
             data["horizons"][horizon] = snap
 
-        by_dt = {_parse_nse_date(d): d for d in records.get("expiryDates", [])}
-        horizon_dts = _pick_horizon_expiry_dates(by_dt.keys())
-        annual_snap = data["horizons"].get("Annual")
-        annual_total_oi = (
-            (annual_snap.get("total_call_oi", 0) + annual_snap.get("total_put_oi", 0))
-            if annual_snap else None
-        )
-        usable, reason, days_out = _annual_usability(
-            horizon_dts.get("Weekly"), horizon_dts.get("Annual"), annual_total_oi
-        )
-        data["annual_usable"], data["annual_reason"], data["annual_days_out"] = usable, reason, days_out
-        if not usable:
-            notes.append(f"Annual horizon not usable: {reason}")
         data["status"] = "ok"
     except Exception as e:
         notes.append(f"NSE option-chain data was fetched but could not be parsed -- trying the EOD Bhavcopy fallback: {e}")
@@ -843,13 +864,6 @@ def format_live_data_block(data):
                 "top OI concentration') -- do not state a delta value or POP number, since those are "
                 "verified figures the code will compute and display separately."
             )
-
-    if data.get("annual_usable") is False:
-        lines.append(
-            f"- ANNUAL HORIZON: NOT USABLE this run ({data.get('annual_reason')}). Do not invent an "
-            f"annual strategy -- set strategy_name to 'N/A' and bias_reason to explain why, for the "
-            f"Annual horizon object only."
-        )
 
     if data.get("notes"):
         lines.append("Fetch notes: " + "; ".join(data["notes"]))
@@ -989,6 +1003,34 @@ def compute_expected_move(call_ltp, put_ltp, spot):
     }
 
 
+def _pop_diagnostics(spot, t_years, iv, breakevens):
+    """Surfaces the raw inputs behind compute_pop's number, in the units a
+    person can actually sanity-check by eye: the flat sigma used (as a %),
+    days to expiry, the model-implied 1-sigma move in points, and how many
+    sigmas away the NEAREST breakeven sits. This exists because a POP can
+    look surprisingly low for a structure that 'looks wide' in absolute
+    strike-point terms -- e.g. a several-hundred-point-wide Monthly Iron
+    Condor is not actually wide relative to a full month's sigma*sqrt(T)
+    move the way the same point-width would be for a Weekly one. Showing
+    the sigma multiple directly lets the reader confirm the number is a
+    property of the model's inputs (time + IV), not a bug. Returns None if
+    inputs are unusable."""
+    sigma = _iv_to_frac(iv)
+    if spot is None or sigma is None or t_years is None or t_years <= 0 or sigma <= 0 or not breakevens:
+        return None
+    one_sigma_move_pts = spot * sigma * math.sqrt(t_years)
+    if one_sigma_move_pts <= 0:
+        return None
+    nearest_gap_pts = min(abs(b - spot) for b in breakevens)
+    return {
+        "iv_pct": round(sigma * 100, 1),
+        "days_to_expiry": round(t_years * 365, 1),
+        "one_sigma_move_pts": round(one_sigma_move_pts, 0),
+        "nearest_breakeven_gap_pts": round(nearest_gap_pts, 0),
+        "nearest_breakeven_sigma_mult": round(nearest_gap_pts / one_sigma_move_pts, 2),
+    }
+
+
 def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
     """Approximate risk-neutral probability of profit at expiry: integrates
     a flat-IV lognormal distribution (the ATM implied vol for this expiry --
@@ -1056,6 +1098,62 @@ def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE):
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
     return round(max(0.0, min(1.0, prob)) * 100, 1)
+
+
+def compute_expectancy_metrics(pop_pct, max_profit_inr, max_loss_inr):
+    """Turns POP + verified max profit/loss into expectancy-style stats that
+    catch the classic high-win-rate/negative-expectancy trap credit spreads
+    are prone to: a defined-risk spread can show a POP of 75%+ while still
+    being a net loser in expectation if the loss leg dwarfs the credit
+    collected. A high POP alone doesn't tell you that; these three do.
+
+    - Expected Value (EV): p*max_profit - (1-p)*max_loss, in INR per lot --
+      the average per-trade outcome if this exact setup were repeated many
+      times at the modeled POP. Negative EV means the trade is a net loser
+      in expectation despite a possibly-high win rate.
+    - Kelly %: the classic Kelly-criterion optimal-bet fraction for a binary
+      win/lose payoff, f* = p - (1-p)/b where b = max_profit/max_loss is the
+      payoff odds (win amount per unit risked). Clamped to [0, 100]; a
+      negative raw Kelly (shown as 0%) means the modeled edge is negative
+      and the criterion says risk nothing. This is a sizing heuristic that
+      assumes the binary win/lose model is correct -- not a margin or
+      capital-allocation instruction on its own.
+    - Sharpe-like expectancy: EV divided by the standard deviation of the
+      binary payoff (max_profit w.p. p, -max_loss w.p. 1-p) -- a crude
+      reward-per-unit-of-payoff-volatility ratio, analogous to a single-
+      trade Sharpe ratio. Higher is better; it penalizes a high-POP trade
+      whose rare loss is disproportionately large relative to its typical win.
+
+    All three are only as good as the flat-IV lognormal POP feeding them --
+    they inherit the same approximation caveats as compute_pop, not a
+    verified statistical edge. Returns a dict with all values None if the
+    inputs are unusable, so callers render an 'n/a'/hidden row instead of
+    crashing the run."""
+    if (
+        pop_pct is None or max_profit_inr is None or max_loss_inr is None
+        or max_loss_inr <= 0 or not (0 <= pop_pct <= 100)
+    ):
+        return {"ev_inr": None, "kelly_pct": None, "sharpe_like": None}
+
+    p = pop_pct / 100.0
+    q = 1.0 - p
+    ev = p * max_profit_inr - q * max_loss_inr
+
+    b = max_profit_inr / max_loss_inr  # payoff odds: win amount per unit risked
+    kelly_pct = None
+    if b > 0:
+        kelly_raw = p - (q / b)
+        kelly_pct = round(max(0.0, min(1.0, kelly_raw)) * 100, 1)
+
+    variance = p * (max_profit_inr - ev) ** 2 + q * (-max_loss_inr - ev) ** 2
+    std = math.sqrt(variance) if variance > 0 else 0.0
+    sharpe_like = round(ev / std, 2) if std > 0 else None
+
+    return {
+        "ev_inr": round(ev, 0),
+        "kelly_pct": kelly_pct,
+        "sharpe_like": sharpe_like,
+    }
 
 
 def estimate_margin_and_rom(max_loss_inr, max_profit_inr, priced_legs, lot_size):
@@ -1511,6 +1609,12 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         _strip_cap_claims(horizon_dict.get("bias_reason")),
         (horizon_snap or {}).get("pcr_oi"),
     )
+    # OI trend (Call/Put Writing vs Buying vs Unwinding) -- computed from
+    # the chain snapshot alone, so it's set unconditionally here rather
+    # than inside the payoff-verification branches below: it doesn't
+    # depend on whether the chosen legs price/verify successfully, only on
+    # whether the live NSE chain (not EOD Bhavcopy) was available this run.
+    horizon_dict["oi_trend"] = compute_oi_trend(horizon_snap or {})
     legs_text = horizon_dict.get("legs", "")
     result = compute_strategy_payoff(legs_text, horizon_snap)
     is_eod = bool((horizon_snap or {}).get("source"))  # only set on the Bhavcopy fallback path
@@ -1536,6 +1640,10 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["probability_of_profit"] = None
         horizon_dict["probability_of_touch"] = None
         horizon_dict["expected_win_rate"] = None
+        horizon_dict["expected_value"] = None
+        horizon_dict["kelly_pct"] = None
+        horizon_dict["expectancy_ratio"] = None
+        horizon_dict["reward_risk_ratio"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
@@ -1562,6 +1670,10 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["probability_of_profit"] = None
         horizon_dict["probability_of_touch"] = None
         horizon_dict["expected_win_rate"] = None
+        horizon_dict["expected_value"] = None
+        horizon_dict["kelly_pct"] = None
+        horizon_dict["expectancy_ratio"] = None
+        horizon_dict["reward_risk_ratio"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
@@ -1612,8 +1724,21 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     # impossible (it happens for ATM short straddle-style structures), but
     # it's unusual enough to warrant flagging for a manual premium check
     # rather than presenting it silently as fully verified.
-    strikes = sorted(set(l["strike"] for l in priced_legs))
-    width = strikes[-1] - strikes[0] if len(strikes) > 1 else 0
+    #
+    # "Width" here must be the width of whichever side actually determines
+    # max_loss -- for a 2-leg vertical, that's simply the distance between
+    # its two strikes, so strikes[-1]-strikes[0] happened to work. But for a
+    # 4-leg Iron Condor/Butterfly, strikes[-1]-strikes[0] is the OUTER
+    # wing-to-wing span (e.g. 1000 pts for wings at 24000/25000), not the
+    # width that caps risk (e.g. 300 pts for shorts at 24300/24700) -- using
+    # the outer span understated credit_width_pct by 3x+ and could wrongly
+    # reject a perfectly good condor. Deriving width from the already-
+    # verified max_loss instead (max_loss = width_of_breached_side -
+    # net_credit, so width = max_loss + net_credit) is exact for any leg
+    # count because it comes from the real payoff evaluation, not strike
+    # geometry.
+    max_loss_pts = result["max_loss"] / NIFTY_LOT_SIZE if NIFTY_LOT_SIZE else 0
+    width = (max_loss_pts + net_premium) if net_premium > 0 else 0
     rich_credit_flag = ""
     if width > 0 and net_premium > 0 and (net_premium / width) > 0.5:
         pct_of_width = net_premium / width * 100
@@ -1622,10 +1747,79 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
             f"double-check these premiums against a live broker terminal before trusting this figure."
         )
 
+    # Reward-quality filter: a structure can be genuinely risk-defined (max
+    # loss is capped) and still be a bad trade if the reward on offer barely
+    # justifies the capital locked up -- e.g. a wide credit spread collecting
+    # only a sliver of its own width as premium. Checked independently of
+    # the naked/unbounded check above; either failing here REJECTS the
+    # horizon the same way (feeds into _horizon_rejected -> one repair-and-
+    # retry pass -> degrades to a clearly-labeled rejected trade if the
+    # model can't fix it), rather than silently presenting a 25:1
+    # risk-to-reward spread as if it were a normal recommendation.
+    reward_risk_ratio = (max_profit / max_loss) if max_loss > 0 else float("inf")
+    credit_width_pct = (net_premium / width * 100) if width > 0 and net_premium > 0 else None
+    poor_reward_risk = max_loss > 0 and reward_risk_ratio < MIN_REWARD_RISK_RATIO
+    poor_credit_width = credit_width_pct is not None and credit_width_pct < MIN_CREDIT_WIDTH_PCT
+
+    if poor_reward_risk or poor_credit_width:
+        reasons = []
+        if poor_reward_risk:
+            reasons.append(
+                f"Reward:Risk is only {reward_risk_ratio:.2f} (₹{max_profit:,.0f} max profit vs "
+                f"₹{max_loss:,.0f} max loss per lot) -- below the {MIN_REWARD_RISK_RATIO:g} minimum."
+            )
+        if poor_credit_width:
+            reasons.append(
+                f"Net credit is only {credit_width_pct:.1f}% of the {width:g}-point spread width -- "
+                f"below the {MIN_CREDIT_WIDTH_PCT:g}% minimum for a credit spread to be worth the capped risk."
+            )
+        reason_text = " ".join(reasons)
+        horizon_dict["max_loss"] = (
+            f"POOR REWARD/RISK -- reject this trade (₹{max_loss:,.0f} at risk for only "
+            f"₹{max_profit:,.0f} potential, per lot)"
+        )
+        horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
+        horizon_dict["max_loss_pct_capital"] = "n/a"
+        horizon_dict["max_profit_pct_capital"] = "n/a"
+        horizon_dict["breakeven"] = be
+        horizon_dict["gap_risk"] = "n/a"
+        horizon_dict["adjustment_trigger"] = "n/a"
+        horizon_dict["expected_move"] = "n/a"
+        horizon_dict["net_greeks"] = "n/a"
+        horizon_dict["probability_of_profit"] = None
+        horizon_dict["probability_of_touch"] = None
+        horizon_dict["expected_win_rate"] = None
+        horizon_dict["expected_value"] = None
+        horizon_dict["kelly_pct"] = None
+        horizon_dict["expectancy_ratio"] = None
+        horizon_dict["reward_risk_ratio"] = (
+            f"{reward_risk_ratio:.2f} -- below the {MIN_REWARD_RISK_RATIO:g} minimum (rejected)"
+            if max_loss > 0 else None
+        )
+        horizon_dict["margin_required"] = "n/a"
+        horizon_dict["return_on_margin"] = "n/a"
+        horizon_dict["capital_efficiency"] = "n/a"
+        horizon_dict["confidence"] = "Not generated"
+        horizon_dict["confidence_pct"] = None
+        horizon_dict["confidence_reasons"] = [(False, reason_text)]
+        horizon_dict["verification"] = f"🛑 Rejected: {reason_text}"
+        horizon_dict["_verified_max_loss_inr"] = 0.0
+        horizon_dict["_net_gamma"] = None
+        return horizon_dict
+
     horizon_dict["max_loss"] = f"₹{max_loss:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
     horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
     horizon_dict["max_loss_pct_capital"] = round(max_loss / TOTAL_CAPITAL_INR * 100, 2)
     horizon_dict["max_profit_pct_capital"] = round(max_profit / TOTAL_CAPITAL_INR * 100, 2)
+    # Reward:Risk = max_profit / max_loss, the same ratio already computed
+    # above to enforce MIN_REWARD_RISK_RATIO -- surfaced here as its own
+    # field rather than left buried in the rejection-only code path, since
+    # it's a standard number traders expect to see even for an ACCEPTED
+    # trade (not just as a reason a trade got rejected).
+    horizon_dict["reward_risk_ratio"] = (
+        f"{reward_risk_ratio:.2f} (₹{max_profit:,.0f} potential vs ₹{max_loss:,.0f} at risk, per lot)"
+        if max_loss > 0 else "n/a (no capital at risk)"
+    )
     horizon_dict["breakeven"] = be
     # Correct, code-derived statement of gap risk: for any genuinely
     # risk-defined structure, loss can never exceed max_loss regardless of
@@ -1709,8 +1903,16 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
             effective_iv, pop_source = vix, "India VIX proxy IV -- approximate"
     if effective_iv:
         pop = compute_pop(spot, t_years, effective_iv, result["payoff_fn"], result["breakevens"])
+    pop_diag = _pop_diagnostics(spot, t_years, effective_iv, result["breakevens"]) if pop is not None else None
+    diag_note = (
+        f"; IV≈{pop_diag['iv_pct']:g}%, T≈{pop_diag['days_to_expiry']:g}d implies a 1σ move of "
+        f"±{pop_diag['one_sigma_move_pts']:,.0f}pts, nearest breakeven is only "
+        f"{pop_diag['nearest_breakeven_gap_pts']:,.0f}pts away (~{pop_diag['nearest_breakeven_sigma_mult']:g}σ) "
+        f"-- a longer horizon needs a proportionally wider structure for the same POP"
+        if pop_diag else ""
+    )
     horizon_dict["probability_of_profit"] = (
-        f"~{pop:.0f}% ({pop_source}, lognormal price at expiry -- not a guarantee)"
+        f"~{pop:.0f}% ({pop_source}, lognormal price at expiry -- not a guarantee{diag_note})"
         if pop is not None else None  # sentinel: render step hides this row rather than printing n/a
     )
 
@@ -1751,6 +1953,30 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         f"~{pop:.0f}% if held to expiry ({pop_source}) -- typically higher in practice "
         f"if the position is actively managed/closed early rather than held to expiry"
         if pop is not None else None
+    )
+
+    # --- Expected Value / Kelly % / Sharpe-like expectancy ---
+    # A high POP is common with credit spreads and can coexist with a net
+    # negative expectancy if the loss leg dwarfs the credit collected --
+    # these three numbers make that trade-off explicit rather than leaving
+    # a bare POP figure to imply "good trade" on its own.
+    expectancy = compute_expectancy_metrics(pop, max_profit, max_loss)
+    ev_inr = expectancy["ev_inr"]
+    horizon_dict["expected_value"] = (
+        f"₹{ev_inr:,.0f} per lot ({'positive' if ev_inr >= 0 else 'negative'} expectancy at the "
+        f"modeled POP -- avg outcome if this exact setup repeated many times, not a guarantee)"
+        if ev_inr is not None else None
+    )
+    horizon_dict["kelly_pct"] = (
+        f"~{expectancy['kelly_pct']:.1f}% of capital (Kelly criterion, floored at 0% -- a sizing "
+        f"heuristic assuming the binary win/lose model holds, not a margin recommendation)"
+        if expectancy["kelly_pct"] is not None else None
+    )
+    horizon_dict["expectancy_ratio"] = (
+        f"{expectancy['sharpe_like']:.2f} (EV / payoff std-dev -- single-trade, Sharpe-like reward "
+        f"per unit of payoff volatility; penalizes a high-POP trade with a disproportionately large "
+        f"rare loss)"
+        if expectancy["sharpe_like"] is not None else None
     )
 
     # --- Margin (approximate) and Return on Margin ---
@@ -1802,21 +2028,21 @@ def build_prompt(live_data=None):
     session_label, in_session = _market_session_label()
     live_data_block = format_live_data_block(live_data)
 
-    return f"""Core Objective: You are an expert at analysing Nifty options-related data. A LIVE DATA FEED has already been fetched for you and is provided below -- use those figures as ground truth for this run rather than searching for or guessing them yourself. Using that feed (plus web search only for what it doesn't cover), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across FOUR time horizons:
+    return f"""Core Objective: You are an expert at analysing Nifty options-related data. A LIVE DATA FEED has already been fetched for you and is provided below -- use those figures as ground truth for this run rather than searching for or guessing them yourself. Using that feed (plus web search only for what it doesn't cover), recommend the best risk-defined strategy -- or combination of strategies -- for the current moment, independently across THREE time horizons:
 
 {live_data_block}
 
 1. Nifty Weekly -- Buy, Sell, or a Combination of both (current/nearest weekly expiry)
 2. Nifty Monthly -- Buy, Sell, or a Combination of both (current monthly expiry)
 3. Nifty Quarterly -- Buy, Sell, or a Combination of both (nearest quarterly expiry on the Mar/Jun/Sep/Dec cycle)
-4. Nifty Annual -- Buy, Sell, or a Combination of both (farthest available annual/LEAPS-style expiry)
 
-Horizons are independent from Monthly/Quarterly/Annual onward -- they do not need to agree with each other. For example Monthly can be a bullish debit spread while Quarterly is a range-bound Iron Condor, if the data supports it. The Weekly horizon, however, follows the bias-sequencing rule below (constraint #5), which explicitly couples the current week to the next week.
+Horizons are independent from Monthly/Quarterly onward -- they do not need to agree with each other. For example Monthly can be a bullish debit spread while Quarterly is a range-bound Iron Condor, if the data supports it. The Weekly horizon, however, follows the bias-sequencing rule below (constraint #5), which explicitly couples the current week to the next week.
 
 NON-NEGOTIABLE CONSTRAINTS
 
 1. RISK-DEFINED ONLY. Every recommended strategy must have a mathematically capped maximum loss known before entry (e.g. Bull/Bear Call/Put Spreads, Iron Condors, Iron Butterflies, Calendar Spreads, Ratio Spreads with a protective wing, Debit/Credit Spreads). NEVER recommend a naked/undefined-risk position (naked short call, naked short put, uncovered short straddle/strangle) under any circumstance, for any horizon.
    - 2-LEG VERTICAL SPREADS MUST BE SAME OPTION TYPE, DIFFERENT STRIKES, ONE LONG + ONE SHORT. A valid 2-leg spread is always CE+CE or PE+PE -- e.g. "Sell 24600 CE, Buy 24800 CE" (Bear Call Spread) or "Buy 24200 PE, Sell 24000 PE" (Bear Put Spread). A recurring mistake is writing one CE leg and one unrelated PE leg with no strike relationship between them (e.g. "Sell 24600 CE, Buy 24800 PE") -- this is WRONG. It is not a spread at all: the short call has no long call above it capping its loss (naked short call, unbounded upside risk), and the long put is a completely separate, unrelated position. If you cannot find two liquid strikes of the SAME option type to form a real vertical spread, do not force a 2-leg CE+PE pairing -- either use a 4-leg Iron Condor/Butterfly (see constraint #6) or state in bias_reason that no valid 2-leg structure was available at adequate liquidity.
+   - REWARD MUST BE PROPORTIONATE TO RISK. Capped risk is necessary but not sufficient -- a spread whose maximum loss is many multiples of its maximum profit is still a bad trade even though it's technically risk-defined. Do NOT pick strikes so far apart that the reward-to-risk ratio falls below {MIN_REWARD_RISK_RATIO:g}, and for credit spreads specifically, do NOT collect a net credit worth less than {MIN_CREDIT_WIDTH_PCT:g}% of the strike width. Both are checked exactly in code after you respond and a violation gets the whole horizon rejected, so prefer strikes CLOSER TOGETHER (narrower width) that collect adequate premium relative to the capital at risk, rather than defaulting to a wide, low-credit spread "for safety."
 
 2. GAP PROTECTION. Every recommendation must explicitly address overnight/weekend gap risk:
    - Prefer structures whose short strikes sit outside the current expected-move band (VIX-implied 1 standard deviation) for that horizon.
@@ -1825,7 +2051,7 @@ NON-NEGOTIABLE CONSTRAINTS
 
 3. CAPITAL PROTECTION RULES.
    - Max capital at risk per horizon must not exceed {PER_HORIZON_CAP_PCT:.0f}% of a hypothetical total options-trading capital pool.
-   - Worst-case combined maximum loss across all four horizons (the plain sum of each horizon's own max loss, as if all were hit simultaneously -- a conservative ceiling, not a probabilistic portfolio-risk estimate) must not exceed {AGGREGATE_CAP_PCT:.0f}%.
+   - Worst-case combined maximum loss across all three horizons (the plain sum of each horizon's own max loss, as if all were hit simultaneously -- a conservative ceiling, not a probabilistic portfolio-risk estimate) must not exceed {AGGREGATE_CAP_PCT:.0f}%.
    - Do NOT write a stop-loss/adjustment trigger yourself -- a standard one (short-strike breach, or loss reaching a set multiple of credit/premium) is generated in code from your chosen strikes after you respond.
    - Do NOT compute the rupee max loss/profit or the % of capital yourself -- those are calculated from real fetched premiums after you respond (see OUTPUT FORMAT). Focus only on choosing strikes/legs that keep risk within the caps once priced.
 
@@ -1855,8 +2081,6 @@ NON-NEGOTIABLE CONSTRAINTS
 
 8. RISK-CONTROLLED SYNTHESIS. Every horizon's final recommendation must simultaneously satisfy constraints #1-#7 above -- risk-defined, gap-protected, capital-capped, correctly bias-sequenced (Weekly), correctly range-biased (Monthly/Quarterly), and liquidity-filtered. If any of these pull in conflicting directions for a given horizon (e.g. the liquid strike sits inside the expected-move band), state the trade-off explicitly in that horizon's bias_reason and resolve it in favor of the tighter risk-defined structure, never in favor of higher theoretical reward.
 
-9. ANNUAL HORIZON MAY BE UNAVAILABLE. If the LIVE DATA FEED above marks the Annual horizon as not usable, do not invent a strategy for it -- set its strategy_name to "N/A" and explain why in bias_reason. Never fabricate a long-dated strategy just to fill the field.
-
 ADDITIONAL LIVE DATA TO SEARCH FOR (only for what the LIVE DATA FEED above does not already give you -- do not re-search or contradict anything already provided there; if you cannot find a real current figure, say so for that field rather than inventing one):
 - Nifty futures price (weekly/monthly, for basis) -- the feed above gives spot, not futures
 - Confirmation/context on options-chain levels for any horizon the feed marked unavailable
@@ -1873,19 +2097,18 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "horizon": "Weekly",
       "expiry_date": "The actual expiry date used, e.g. '24 Jul 2026'",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "ONLY for the Weekly horizon object: this field is ignored and overridden in code per constraint #5 -- leave it empty or write 'n/a'. Omit entirely for Monthly/Quarterly/Annual.",
+      "next_week_bias": "ONLY for the Weekly horizon object: this field is ignored and overridden in code per constraint #5 -- leave it empty or write 'n/a'. Omit entirely for Monthly/Quarterly.",
       "bias_reason": "One or two sentences grounded in the live data you found, internally consistent with the PCR/VIX reading rules in constraint #5",
-      "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor' (or 'N/A' for Annual if marked not usable)",
+      "strategy_name": "e.g. 'Bear Call Spread' or 'Iron Condor'",
       "legs": "Full leg structure using ONLY strikes shown in the live data, e.g. 'Sell 25000 CE, Buy 25200 CE (1 lot)'. For Iron Condor/Butterfly, pair legs by ROLE not by strike -- both short legs (one CE, one PE) go together nearer spot, both long legs (one CE, one PE) go together as the outer wings. Never pair a CE and PE at the same strike as one Buy + one Sell for each of two strikes -- that is not a valid risk-defined structure. See constraint #6 for the correct pattern.",
       "strike_rationale": "One sentence, qualitative only (no delta/POP numbers -- those are computed and shown separately): why THIS short strike, e.g. 'anchored beyond the nearest major OI wall on this side'. Do NOT state whether the strike is inside or outside the expected-move band -- that is computed exactly from real fetched premiums and appended automatically after your text; a guessed band claim here risks contradicting it.",
       "confidence": "One of: High / Medium / Low -- your best qualitative guess, but note this is DISCARDED and replaced with a percentage score computed in code from verifiable signals (OI alignment, Max Pain, live-vs-EOD data, VIX regime), same as max_loss/Greeks/POP above.",
       "data_status": "One of: 'live' (found real current data), 'partial' (some fields estimated), 'stale' (data may be several hours old or unavailable) -- your best honest guess, but note this is DISCARDED and overridden in code from the real live-vs-EOD-Bhavcopy signal for that horizon, precisely because a model claiming 'live' in a run where the direct feed was down and EOD Bhavcopy was actually used would contradict the live-feed-status banner elsewhere in the same report."
     }},
     {{ "horizon": "Monthly", ... same fields ... }},
-    {{ "horizon": "Quarterly", ... same fields ... }},
-    {{ "horizon": "Annual", ... same fields ... }}
+    {{ "horizon": "Quarterly", ... same fields ... }}
   ],
-  "portfolio_view": "One paragraph on whether the combined structure over- or under-hedges overall market gap risk across the four horizons, and how the horizons relate to each other qualitatively (e.g. does Weekly's directional stance conflict with Monthly/Quarterly's range-bound stance). Do NOT state or estimate a net long/short gamma verdict for the combined portfolio -- that figure is computed in code from real per-leg Black-Scholes gamma (live IV) after you respond, and any gamma claim you make here will be discarded. Do NOT state or estimate the worst-case combined max-loss percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
+  "portfolio_view": "One paragraph on whether the combined structure over- or under-hedges overall market gap risk across the three horizons, and how the horizons relate to each other qualitatively (e.g. does Weekly's directional stance conflict with Monthly/Quarterly's range-bound stance). Do NOT state or estimate a net long/short gamma verdict for the combined portfolio -- that figure is computed in code from real per-leg Black-Scholes gamma (live IV) after you respond, and any gamma claim you make here will be discarded. Do NOT state or estimate the worst-case combined max-loss percentage or whether it stays within the {AGGREGATE_CAP_PCT:.0f}% cap -- that figure is summed from verified per-horizon numbers in code after you respond, and any claim you make about it here will be discarded."
 }}
 """
 
@@ -2003,9 +2226,23 @@ def _data_status_badge(status):
     return _badge(label, color, bg)
 
 
+# Sensibull doesn't publish a documented URL spec for pre-filling arbitrary
+# custom multi-leg strategies (strikes/actions/expiry) via query params, so
+# this deliberately does NOT try to guess one -- a wrong guess would produce
+# a link that looks legitimate but silently loads the wrong (or an empty)
+# strategy, which is worse than no link at all. What IS a confirmed, stable
+# public route is the NIFTY strategy builder itself
+# (https://web.sensibull.com/option-strategy-builder?instrument_symbol=NIFTY),
+# so every horizon card links there -- the reader lands straight on
+# Sensibull's Nifty builder and only needs to pick the expiry (shown right
+# next to this link) and add the exact legs already spelled out in the row
+# above, rather than starting from Sensibull's home page.
+SENSIBULL_STRATEGY_BUILDER_URL = "https://web.sensibull.com/option-strategy-builder?instrument_symbol=NIFTY"
+
+
 def _horizon_card_html(h, sans, serif):
     """One risk-defined-strategy card per horizon (Weekly/Monthly/
-    Quarterly/Annual), styled consistently with the swing-trade note's
+    Quarterly), styled consistently with the swing-trade note's
     per-stock parameter tables."""
     name = _esc(h.get("horizon"))
     expiry = _esc(h.get("expiry_date"))
@@ -2027,12 +2264,20 @@ def _horizon_card_html(h, sans, serif):
             f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html or "—"}</td></tr>'
         )
 
+    sensibull_cell = (
+        f'<a href="{SENSIBULL_STRATEGY_BUILDER_URL}" style="color:#8A6D3B;font-weight:600;'
+        f'text-decoration:none;">Open Nifty Strategy Builder on Sensibull &rarr;</a> '
+        f'<span style="color:#8A8F9C;font-size:11px;">(select {expiry} expiry, then add the legs above)</span>'
+    )
+
     rows = "".join([
         row("Strategy", "strategy_name", bold=True),
         row("Legs", "legs"),
+        raw_row("Trade This", sensibull_cell),
         raw_row("Directional Bias (Current Week)" if h.get("next_week_bias") else "Directional Bias", _bias_badge(h.get("bias"))),
         *([raw_row("Directional Bias (Next Week)", _bias_badge(h.get("next_week_bias")))] if h.get("next_week_bias") else []),
         row("Bias Rationale", "bias_reason"),
+        *([row("OI Trend", "oi_trend")] if h.get("oi_trend") else []),
         row("Strike Selection Rationale", "strike_rationale"),
         row("Expected Move (ATM Straddle)", "expected_move"),
         row("Max Loss", "max_loss", value_color="#8B2E2E", bold=True),
@@ -2043,12 +2288,18 @@ def _horizon_card_html(h, sans, serif):
         *([row("Probability of Profit", "probability_of_profit")] if h.get("probability_of_profit") else []),
         *([row("Probability of Touch", "probability_of_touch")] if h.get("probability_of_touch") else []),
         *([row("Expected Win Rate", "expected_win_rate")] if h.get("expected_win_rate") else []),
+        *([row("Expected Value (EV)", "expected_value",
+               value_color="#2F5233" if "positive" in str(h.get("expected_value")) else "#8B2E2E")]
+          if h.get("expected_value") else []),
+        *([row("Kelly %", "kelly_pct")] if h.get("kelly_pct") else []),
+        *([row("Expectancy Ratio (Sharpe-like)", "expectancy_ratio")] if h.get("expectancy_ratio") else []),
         row("Net Greeks (per lot)", "net_greeks"),
         row("Margin Required", "margin_required"),
         row("Return on Margin", "return_on_margin"),
         row("Capital Efficiency", "capital_efficiency"),
         row("Gap Risk", "gap_risk"),
         row("Adjustment / Exit Trigger", "adjustment_trigger"),
+        *([row("Reward : Risk", "reward_risk_ratio")] if h.get("reward_risk_ratio") else []),
         raw_row("Confidence", _confidence_cell_html(h, sans)),
         raw_row("Data Freshness", _data_status_badge(h.get("data_status"))),
         row("Payoff Verification", "verification"),
@@ -2202,17 +2453,78 @@ def compute_portfolio_gamma_summary(horizons):
 
 _EXPECTED_MOVE_RE = re.compile(r"±[\d,]+(?:\.\d+)?")
 _POP_RE = re.compile(r"~[\d.]+%")
-_MAX_LOSS_RE = re.compile(r"₹[\d,]+")
+_RUPEE_FIGURE_RE = re.compile(r"₹[\d,]+")
+_EV_FIGURE_RE = re.compile(r"₹-?[\d,]+")
+_RR_RATIO_RE = re.compile(r"^[\d.]+")
+
+
+def compute_market_regime(live_data, horizons):
+    """Builds the one-line 'Market Regime' summary as a scannable header,
+    composed ENTIRELY from data already computed or shown elsewhere in the
+    report -- never a new inference of its own:
+
+    - Volatility read comes from the same verified VIX figure used
+      elsewhere (fetch_live_market_data / compute_confidence), bucketed
+      with the same <20 'calm' cutoff already used for confidence scoring
+      (so this label can't contradict that one) plus a <13 sub-cutoff for
+      a plain 'Low' read.
+    - Range-bound vs. Directional comes from the nearest-term (Weekly)
+      horizon's own strategy choice: a non-directional structure (Iron
+      Condor/Butterfly/Straddle/Strangle) reads as 'Range-bound';
+      anything else falls back to whatever directional bias that same
+      horizon already states.
+    - Bias phrase is a plain-English echo of that same Weekly horizon's
+      already-displayed 'bias' field, not a new directional call.
+
+    Returns None if there's neither a usable VIX figure nor a usable
+    Weekly horizon, rather than fabricating a regime label."""
+    vix = live_data.get("vix") if live_data else None
+    vol_label = None
+    if isinstance(vix, (int, float)):
+        if vix < 13:
+            vol_label = f"Low-volatility (VIX {vix:g})"
+        elif vix < 20:
+            vol_label = f"Moderate-volatility (VIX {vix:g})"
+        else:
+            vol_label = f"Elevated-volatility (VIX {vix:g})"
+
+    by_name = {str(h.get("horizon") or "").strip(): h for h in (horizons or []) if h.get("horizon")}
+    weekly = by_name.get("Weekly") or (horizons[0] if horizons else None)
+
+    range_label = None
+    bias_label = None
+    if weekly:
+        strategy = str(weekly.get("strategy_name") or "").lower()
+        bias = str(weekly.get("bias") or "").strip()
+        non_directional_kw = ("iron condor", "iron butterfly", "straddle", "strangle", "butterfly")
+        if any(kw in strategy for kw in non_directional_kw):
+            range_label = "Range-bound"
+        elif bias:
+            range_label = "Directional"
+        if bias:
+            bias_lower = bias.lower()
+            if "bull" in bias_lower:
+                bias_label = "Bullish bias"
+            elif "bear" in bias_lower:
+                bias_label = "Bearish bias"
+            elif "neutral" in bias_lower or "range" in bias_lower:
+                bias_label = "Neutral bias"
+            else:
+                bias_label = f"{bias} bias"
+
+    parts = [p for p in (vol_label, range_label, bias_label) if p]
+    return " · ".join(parts) if parts else None
 
 
 def render_strategy_summary_table(horizons):
     """One-line-per-horizon overview table (Horizon / Strategy / Bias /
-    Expected Move / POP / Max Risk / Confidence) shown before the detailed
-    per-horizon cards, so the reader gets the shape of the whole
-    recommendation at a glance. Every cell is extracted from the same
-    authoritative, already-computed strings shown in the detailed cards
-    below (never recomputed or re-derived here) -- so the summary can never
-    drift from or contradict the detail it's summarizing."""
+    Expected Move / POP / Max Profit / Profit % / Max Loss / Loss % / EV /
+    R:R / Confidence) shown before the detailed per-horizon cards, so the
+    reader gets the shape of the whole recommendation at a glance. Every
+    cell is extracted from the same authoritative, already-computed values
+    shown in the detailed cards below (never recomputed or re-derived
+    here) -- so the summary can never drift from or contradict the detail
+    it's summarizing."""
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 
     by_name = {}
@@ -2225,6 +2537,15 @@ def render_strategy_summary_table(horizons):
         m = pattern.search(text or "")
         return m.group(0) if m else default
 
+    def _pct(value):
+        # max_loss_pct_capital / max_profit_pct_capital are either a real
+        # rounded float (from apply_verified_payoff) or the literal string
+        # "n/a" for a rejected/unverified horizon -- never guess a number
+        # for the latter case.
+        if isinstance(value, (int, float)):
+            return f"{value:g}%"
+        return "n/a"
+
     def _cell(text, header=False, color="#14213D"):
         weight = "font-weight:700;" if header else ""
         bg = "background:#14213D;color:#ffffff;" if header else f"color:{color};"
@@ -2236,7 +2557,8 @@ def render_strategy_summary_table(horizons):
 
     header_cells = "".join(
         _cell(h, header=True) for h in
-        ("Horizon", "Strategy", "Bias", "Expected Move", "POP", "Max Risk", "Confidence")
+        ("Horizon", "Strategy", "Bias", "Expected Move", "POP", "Max Profit",
+         "Profit %", "Max Loss", "Loss %", "EV", "R:R", "Confidence")
     )
     header_row = f'<tr>{header_cells}</tr>'
 
@@ -2249,7 +2571,15 @@ def render_strategy_summary_table(horizons):
         bias = _esc(h.get("bias"))
         exp_move = _extract(_EXPECTED_MOVE_RE, h.get("expected_move"))
         pop = _extract(_POP_RE, h.get("probability_of_profit"))
-        max_risk = _extract(_MAX_LOSS_RE, h.get("max_loss"))
+        max_profit = _extract(_RUPEE_FIGURE_RE, h.get("max_profit"))
+        max_loss = _extract(_RUPEE_FIGURE_RE, h.get("max_loss"))
+        profit_pct = _pct(h.get("max_profit_pct_capital"))
+        loss_pct = _pct(h.get("max_loss_pct_capital"))
+        ev_text = h.get("expected_value")
+        ev = _extract(_EV_FIGURE_RE, ev_text)
+        ev_color = "#2F5233" if ev != "n/a" and not ev.startswith("₹-") else "#8B2E2E"
+        rr = _extract(_RR_RATIO_RE, h.get("reward_risk_ratio"))
+        rr_display = f"{rr}" if rr != "n/a" else "n/a"
         conf_pct = h.get("confidence_pct")
         confidence = _esc(h.get("confidence"))
         if isinstance(conf_pct, (int, float)) and confidence != "—":
@@ -2260,7 +2590,12 @@ def render_strategy_summary_table(horizons):
             _cell(html.escape(bias)),
             _cell(html.escape(exp_move)),
             _cell(html.escape(pop)),
-            _cell(html.escape(max_risk), color="#8B2E2E"),
+            _cell(html.escape(max_profit), color="#2F5233"),
+            _cell(html.escape(profit_pct), color="#2F5233"),
+            _cell(html.escape(max_loss), color="#8B2E2E"),
+            _cell(html.escape(loss_pct), color="#8B2E2E"),
+            _cell(html.escape(ev), color=ev_color),
+            _cell(html.escape(rr_display)),
             _cell(html.escape(confidence)),
         ])
         body_rows.append(f'<tr>{cells}</tr>')
@@ -2278,11 +2613,20 @@ def render_strategy_summary_table(horizons):
 """
 
 
-def render_horizons_html(horizons, aggregate_pct, portfolio_view):
+def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None):
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     serif = "Georgia,'Times New Roman',serif"
 
-    # Render in the fixed Weekly -> Monthly -> Quarterly -> Annual order
+    regime_text = compute_market_regime(live_data, horizons)
+    regime_html = (
+        f'<div style="margin-bottom:12px;padding:8px 14px;background:#F4F2ED;'
+        f'border:1px solid #EDEAE2;border-radius:4px;font-family:{sans};font-size:12px;'
+        f'font-weight:700;color:#14213D;letter-spacing:0.01em;">'
+        f'Market Regime: <span style="font-weight:400;color:#4A5063;">{_esc(regime_text)}</span></div>'
+        if regime_text else ""
+    )
+
+    # Render in the fixed Weekly -> Monthly -> Quarterly order
     # regardless of what order the model returned them in.
     by_name = {}
     for h in horizons:
@@ -2336,7 +2680,7 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
         f'(cap {AGGREGATE_CAP_PCT:.0f}%)</div>'
         f'<div style="font-family:{sans};font-size:11px;color:#8A8F9C;font-style:italic;margin-bottom:8px;">'
         f'This is a conservative ceiling -- the plain sum of each horizon\'s own max loss, as if Weekly, '
-        f'Monthly, Quarterly, and Annual ALL hit max loss simultaneously. It is not a probabilistic '
+        f'Monthly, and Quarterly ALL hit max loss simultaneously. It is not a probabilistic '
         f'estimate of actual combined portfolio risk, which would normally be lower since the horizons '
         f'won\'t all lose the maximum at the same time.</div>'
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(gamma_summary)}</div>'
@@ -2346,7 +2690,7 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view):
     )
 
     summary_table_html = render_strategy_summary_table(horizons)
-    return summary_table_html + cards + portfolio_html
+    return regime_html + summary_table_html + cards + portfolio_html
 
 
 # -----------------------------
@@ -2439,7 +2783,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
             <td style="background:#14213D;padding:26px 28px 22px;" class="email-padding">
               <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#B08D57;">Market Intelligence &nbsp;&bull;&nbsp; Derivatives Desk</div>
               <h1 style="margin:8px 0 0;font-family:{serif};font-weight:400;font-size:23px;line-height:1.3;color:#ffffff;letter-spacing:0.01em;">Nifty Options Strategy Note</h1>
-              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Monthly &middot; Quarterly &middot; Annual &mdash; Risk-Defined Only</p>
+              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Monthly &middot; Quarterly &mdash; Risk-Defined Only</p>
             </td>
           </tr>
           <tr>
@@ -2523,14 +2867,11 @@ def send_option_strategy_email(html_body):
 # Entry point
 # -----------------------------
 # -----------------------------
-# Post-processing: enforce Annual omission + real aggregate-risk arithmetic
+# Post-processing: real aggregate-risk arithmetic
 # -----------------------------
 def finalize_horizons(horizons, live_data):
     """Runs every horizon's legs through apply_verified_payoff() (real
-    premium-based math, not LLM arithmetic), forcibly overrides the Annual
-    horizon with an omitted placeholder if it was flagged unusable
-    (regardless of what the model returned -- the model's compliance with
-    constraint #9 is not trusted on its own), and recomputes the aggregate
+    premium-based math, not LLM arithmetic), and recomputes the aggregate
     capital-at-risk as a plain sum of the per-horizon figures instead of
     trusting a self-reported total (this is what issue #8's arithmetic
     mismatch traces back to). Returns (horizons, aggregate_pct, over_cap)."""
@@ -2546,55 +2887,10 @@ def finalize_horizons(horizons, live_data):
     if "Weekly" in by_name:
         by_name["Weekly"]["next_week_bias"] = "Neutral (insufficient evidence)"
 
-    if live_data.get("annual_usable") is False and "Annual" in by_name:
-        by_name["Annual"] = {
-            "horizon": "Annual",
-            "expiry_date": "n/a",
-            "bias": "N/A",
-            "bias_reason": live_data.get("annual_reason") or "Long-dated option chain unavailable.",
-            "strategy_name": "N/A -- omitted",
-            "legs": "n/a",
-            "max_loss": "n/a",
-            "max_profit": "n/a",
-            "max_loss_pct_capital": "n/a",
-            "max_profit_pct_capital": "n/a",
-            "breakeven": "n/a",
-            "gap_risk": "n/a",
-            "adjustment_trigger": "n/a",
-            "strike_rationale": "n/a",
-            "expected_move": "n/a",
-            "net_greeks": "n/a",
-            "probability_of_profit": None,
-            "margin_required": "n/a",
-            "return_on_margin": "n/a",
-            "capital_efficiency": "n/a",
-            "confidence": "n/a",
-            "data_status": "unavailable",
-            "verification": "Omitted: long-dated option chain unavailable or insufficiently liquid.",
-            "_verified_max_loss_inr": 0.0,
-        }
-    elif (
-        live_data.get("annual_usable") is True
-        and "Annual" in by_name
-        and (live_data.get("annual_days_out") or 0) < ANNUAL_TRUE_LEAPS_DAYS_OUT
-    ):
-        # Usable, but NSE's farthest listed Nifty expiry right now is its
-        # semi-annual contract (~150-300 days out), not a genuine ~12-month/
-        # LEAPS-style one -- flag that plainly in the report rather than let
-        # the "Annual" section header silently imply a full year's tenor.
-        days_out = live_data.get("annual_days_out")
-        note = (
-            f"Note: NSE's farthest currently-listed Nifty expiry is {days_out} days out -- "
-            f"this is NSE's semi-annual contract, not a true 12-month/LEAPS-style expiry "
-            f"(NSE does not currently list one for Nifty)."
-        )
-        existing_reason = (by_name["Annual"].get("bias_reason") or "").strip()
-        by_name["Annual"]["bias_reason"] = f"{existing_reason} {note}".strip() if existing_reason else note
-
     total_at_risk = 0.0
     for name, h in by_name.items():
         if h.get("_verified_max_loss_inr") is not None:
-            continue  # Annual placeholder already finalized above
+            continue
         snap = (live_data.get("horizons") or {}).get(name, {})
         apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
 
@@ -2612,12 +2908,13 @@ def finalize_horizons(horizons, live_data):
 
 def _horizon_rejected(h):
     """True if apply_verified_payoff marked this horizon's legs as
-    invalid -- either genuinely unparseable/unpriceable ('Unverified')
-    or structurally naked/unbounded ('UNDEFINED RISK'). The Annual
-    horizon's intentional 'N/A -- omitted' placeholder is never
-    'rejected' in this sense."""
+    invalid -- either genuinely unparseable/unpriceable ('Unverified'),
+    structurally naked/unbounded ('UNDEFINED RISK'), or capped-risk but a
+    bad trade on reward-quality grounds ('POOR REWARD/RISK')."""
     ml = h.get("max_loss")
-    return isinstance(ml, str) and ("UNDEFINED RISK" in ml or "Unverified" in ml)
+    return isinstance(ml, str) and (
+        "UNDEFINED RISK" in ml or "Unverified" in ml or "POOR REWARD/RISK" in ml
+    )
 
 
 def reverify_horizons(horizons, live_data, only_names=None):
@@ -2632,8 +2929,6 @@ def reverify_horizons(horizons, live_data, only_names=None):
     for h in horizons:
         name = h.get("horizon")
         if only_names is not None and name not in only_names:
-            continue
-        if name == "Annual" and h.get("strategy_name") == "N/A -- omitted":
             continue
         snap = (live_data.get("horizons") or {}).get(name, {})
         apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
@@ -2676,6 +2971,7 @@ RULES YOU MUST FOLLOW EXACTLY:
 1. A 2-leg vertical spread must be CE+CE or PE+PE, same expiry, one Buy + one Sell, different strikes. Never pair one CE leg with an unrelated PE leg -- e.g. "Sell 24600 CE, Buy 24800 PE" is INVALID (naked short call plus an unrelated long put, not a spread at all). Valid: "Sell 24600 CE, Buy 24800 CE".
 2. A 4-leg Iron Condor/Butterfly must pair legs by ROLE, not by strike: the two SHORT legs (one CE, one PE) sit together nearer spot; the two LONG legs (one CE, one PE) sit together as the outer wings, one above and one below. Never write both CE legs with the same action and both PE legs with the same action -- e.g. "Sell 24000 CE, Buy 24000 PE, Sell 24200 CE, Buy 24200 PE" is INVALID. Valid: "Buy 24000 PE, Sell 24200 PE, Sell 24500 CE, Buy 24700 CE".
 3. Use ONLY strikes shown in the live data feed above for that horizon. Keep the SAME directional bias you originally chose unless the live data genuinely cannot support any valid capped-risk structure at that bias -- if so, say so via a Neutral/range-bound structure instead.
+4. If the rejection reason mentions poor Reward:Risk or poor credit relative to spread width, the structure was too WIDE for the premium it collects (or paid too much relative to potential reward) -- fix this by choosing strikes CLOSER TOGETHER (a narrower vertical spread width) and/or moving the short strike nearer the current expected-move band so the premium collected is proportionate to the capital at risk. Do not fix this by widening risk or removing a hedge leg -- keep the structure fully risk-defined.
 
 Respond with ONLY raw JSON (no markdown, no commentary before or after) in exactly this shape, one object per rejected horizon listed above, same order:
 {{
@@ -2687,16 +2983,16 @@ Respond with ONLY raw JSON (no markdown, no commentary before or after) in exact
 
 
 def repair_rejected_legs(horizons, live_data):
-    """Single self-correction retry (not a loop): if any non-Annual
-    horizon came back rejected from finalize_horizons, send the model one
-    targeted follow-up showing its own bad legs and the exact rule it
-    broke, then re-verify only the patched horizons against real premiums
-    again. If the model's repair prompt fails to parse, or still comes
-    back invalid on re-verification, the original rejection stands --
-    this deliberately does not retry more than once, so a persistently
-    confused backend still degrades to a clearly-labeled rejected trade
-    rather than looping indefinitely."""
-    rejected = [h for h in horizons if h.get("horizon") != "Annual" and _horizon_rejected(h)]
+    """Single self-correction retry (not a loop): if any horizon came back
+    rejected from finalize_horizons, send the model one targeted follow-up
+    showing its own bad legs and the exact rule it broke, then re-verify
+    only the patched horizons against real premiums again. If the model's
+    repair prompt fails to parse, or still comes back invalid on
+    re-verification, the original rejection stands -- this deliberately
+    does not retry more than once, so a persistently confused backend
+    still degrades to a clearly-labeled rejected trade rather than looping
+    indefinitely."""
+    rejected = [h for h in horizons if _horizon_rejected(h)]
     if not rejected:
         return horizons
 
@@ -3001,7 +3297,7 @@ def run():
                 f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "
                 f"{AGGREGATE_CAP_PCT:.0f}% cap -- flagging in the report rather than silently sending."
             )
-        horizons_html = render_horizons_html(horizons, aggregate_pct, portfolio_view)
+        horizons_html = render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data)
     else:
         main.log.error(
             "Could not parse JSON from LLM output; falling back to raw text display."
