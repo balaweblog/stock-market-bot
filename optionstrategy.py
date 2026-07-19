@@ -3444,11 +3444,12 @@ def render_trade_quality_table(horizons):
         filled = round(score)
         return (
             f'<td style="padding:8px 12px;border-top:1px solid #EDEAE2;">'
-            f'<div style="display:flex;align-items:center;gap:8px;">'
-            f'<div style="flex:1;height:8px;background:#EDEAE2;border-radius:4px;overflow:hidden;">'
+            f'<div style="position:relative;height:8px;min-width:44px;max-width:100px;'
+            f'background:#EDEAE2;border-radius:4px;overflow:hidden;display:inline-block;'
+            f'vertical-align:middle;width:100%;">'
             f'<div style="width:{filled}%;height:100%;background:{color};"></div></div>'
-            f'<span style="font-family:{sans};font-size:12px;font-weight:700;color:{color};'
-            f'white-space:nowrap;">{score}/100</span></div></td>'
+            f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{color};'
+            f'white-space:nowrap;margin-top:3px;">{score}/100</div></td>'
         )
 
     def _action_cell(score):
@@ -3531,20 +3532,19 @@ def render_strategy_summary_table(horizons):
             return f"{value:g}%"
         return "n/a"
 
-    def _cell(text, header=False, color="#14213D"):
+    def _cell(text, header=False, color="#14213D", label=None):
         weight = "font-weight:700;" if header else ""
         bg = "background:#14213D;color:#ffffff;" if header else f"color:{color};"
         border = "" if header else "border-top:1px solid #EDEAE2;"
+        data_label = f' data-label="{html.escape(label)}"' if (label and not header) else ""
         return (
-            f'<td style="padding:7px 10px;font-size:11px;{weight}font-family:{sans};'
+            f'<td{data_label} style="padding:7px 10px;font-size:11px;{weight}font-family:{sans};'
             f'{bg}{border}text-align:left;">{text}</td>'
         )
 
-    header_cells = "".join(
-        _cell(h, header=True) for h in
-        ("Horizon", "Strategy", "Bias", "Expected Move", "POP", "Max Profit",
-         "Profit %", "Max Loss", "Loss %", "EV", "R:R", "Confidence")
-    )
+    columns = ("Horizon", "Strategy", "Bias", "Expected Move", "POP", "Max Profit",
+               "Profit %", "Max Loss", "Loss %", "EV", "R:R", "Confidence")
+    header_cells = "".join(_cell(h, header=True) for h in columns)
     header_row = f'<tr>{header_cells}</tr>'
 
     body_rows = []
@@ -3572,18 +3572,18 @@ def render_strategy_summary_table(horizons):
         if isinstance(conf_pct, (int, float)) and confidence != "—":
             confidence = f"{confidence} ({conf_pct}%)"
         cells = "".join([
-            _cell(f"<b>{html.escape(label)}</b>"),
-            _cell(html.escape(strategy)),
-            _cell(html.escape(bias)),
-            _cell(html.escape(exp_move)),
-            _cell(html.escape(pop)),
-            _cell(html.escape(max_profit), color="#2F5233"),
-            _cell(html.escape(profit_pct), color="#2F5233"),
-            _cell(html.escape(max_loss), color="#8B2E2E"),
-            _cell(html.escape(loss_pct), color="#8B2E2E"),
-            _cell(html.escape(ev_display), color=ev_color, header=False),
-            _cell(html.escape(rr_display)),
-            _cell(html.escape(confidence)),
+            _cell(f"<b>{html.escape(label)}</b>", label="Horizon"),
+            _cell(html.escape(strategy), label="Strategy"),
+            _cell(html.escape(bias), label="Bias"),
+            _cell(html.escape(exp_move), label="Expected Move"),
+            _cell(html.escape(pop), label="POP"),
+            _cell(html.escape(max_profit), color="#2F5233", label="Max Profit"),
+            _cell(html.escape(profit_pct), color="#2F5233", label="Profit %"),
+            _cell(html.escape(max_loss), color="#8B2E2E", label="Max Loss"),
+            _cell(html.escape(loss_pct), color="#8B2E2E", label="Loss %"),
+            _cell(html.escape(ev_display), color=ev_color, header=False, label="EV"),
+            _cell(html.escape(rr_display), label="R:R"),
+            _cell(html.escape(confidence), label="Confidence"),
         ])
         body_rows.append(f'<tr>{cells}</tr>')
 
@@ -3591,10 +3591,10 @@ def render_strategy_summary_table(horizons):
         return ""
 
     return f"""
-<div style="margin-bottom:16px;overflow-x:auto;">
-  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
-    {header_row}
-    {''.join(body_rows)}
+<div style="margin-bottom:16px;overflow-x:auto;-webkit-overflow-scrolling:touch;">
+  <table class="responsive-table" width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
+    <thead>{header_row}</thead>
+    <tbody>{''.join(body_rows)}</tbody>
   </table>
 </div>
 """
@@ -3902,9 +3902,40 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
 <style>
   body {{ margin:0; padding:0; background:#F2F0EC; }}
   table {{ border-collapse:collapse !important; }}
+  img {{ max-width:100%; height:auto; }}
   @media screen and (max-width:600px) {{
+    body {{ -webkit-text-size-adjust:100%; }}
     .email-container {{ width:100% !important; max-width:100% !important; border-radius:0 !important; }}
-    .email-padding {{ padding-left:16px !important; padding-right:16px !important; }}
+    .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}
+    h1 {{ font-size:20px !important; }}
+
+    /* Turn the wide multi-column strategy summary table into stacked
+       label/value rows on phone screens instead of relying on
+       overflow-x scrolling, which many mobile mail apps ignore. */
+    table.responsive-table thead {{ display:none !important; }}
+    table.responsive-table, table.responsive-table tbody,
+    table.responsive-table tr, table.responsive-table td {{
+      display:block !important; width:100% !important; box-sizing:border-box;
+    }}
+    table.responsive-table tr {{
+      padding:8px 10px !important; border-top:1px solid #EDEAE2 !important;
+    }}
+    table.responsive-table tr:first-child {{ border-top:none !important; }}
+    table.responsive-table td {{
+      padding:2px 0 !important; border-top:none !important;
+      text-align:right !important; position:relative;
+      padding-left:46% !important; min-height:18px;
+    }}
+    table.responsive-table td[data-label]:before {{
+      content: attr(data-label);
+      position:absolute; left:0; top:2px; width:44%;
+      text-align:left; font-weight:700; color:#8A8F9C;
+      font-size:10px; text-transform:uppercase; letter-spacing:0.03em;
+    }}
+
+    /* Other data tables keep their columns but get tighter padding so
+       labels and numbers fit comfortably on a phone-width screen. */
+    table:not(.responsive-table) td {{ padding:6px 8px !important; }}
   }}
 </style>
 </head>
