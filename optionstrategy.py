@@ -197,34 +197,116 @@ def _parse_nse_date(d):
     return datetime.strptime(d, "%d-%b-%Y")
 
 
+def fetch_nse_fii_dii(timeout=12, max_attempts=2):
+    """Pulls the latest FII/DII net cash-market trading activity straight
+    from NSE's own JSON endpoint -- the same one https://www.nseindia.com
+    /reports/fii-dii calls client-side (and the endpoint the widely-used
+    nsepython library wraps as nse_fiidii()). Returns
+    {"fii_net_cr": float, "dii_net_cr": float, "fii_dii_date": str,
+    "fii_dii_source": str}, or None on any failure/unexpected shape.
+
+    This is what lets the Market Data Inputs table show a real ₹ Cr net
+    figure with a clean source label, instead of dumping the raw list of
+    (title, url) search-result tuples the FII/DII row previously fell back
+    to whenever this category came from the LLM's own web search rather
+    than a direct fetch."""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            session = requests.Session()
+            session.headers.update(_NSE_HEADERS)
+            _nse_warm_session(session, timeout, "/reports/fii-dii")
+            resp = session.get("https://www.nseindia.com/api/fiidiiTradeReact", timeout=timeout)
+            resp.raise_for_status()
+            rows = resp.json()
+
+            fii_net = dii_net = fii_dii_date = None
+            for row in rows or []:
+                cat = str(row.get("category", "")).upper()
+                net = row.get("netValue")
+                if net is None:
+                    continue
+                try:
+                    net = float(net)
+                except (TypeError, ValueError):
+                    continue
+                # NSE labels these e.g. "FII/FPI *" and "DII **" -- match on
+                # substring rather than an exact string so a trailing
+                # asterisk/spacing change upstream doesn't silently break this.
+                if "FII" in cat or "FPI" in cat:
+                    fii_net = net
+                    fii_dii_date = row.get("date") or fii_dii_date
+                elif "DII" in cat:
+                    dii_net = net
+                    fii_dii_date = row.get("date") or fii_dii_date
+
+            if fii_net is None and dii_net is None:
+                main.log.warning(
+                    "NSE FII/DII fetch succeeded but returned no recognizable "
+                    "FII/DII rows -- endpoint shape may have changed."
+                )
+                return None
+            return {
+                "fii_net_cr": fii_net,
+                "dii_net_cr": dii_net,
+                "fii_dii_date": fii_dii_date,
+                "fii_dii_source": "NSE FII/DII Trading Activity report (Cash Market, net ₹ Cr)",
+            }
+        except Exception as e:
+            last_err = e
+            main.log.warning(
+                f"NSE FII/DII fetch attempt {attempt}/{max_attempts} failed: {_describe_http_error(e)}"
+            )
+            if attempt < max_attempts and _is_retryable_nse_error(e):
+                time.sleep(1.5 * attempt)
+            elif attempt < max_attempts:
+                main.log.warning("NSE FII/DII fetch: error looks like a block -- skipping remaining retries.")
+                break
+    main.log.warning(f"NSE FII/DII fetch failed: {_describe_http_error(last_err)}")
+    return None
+
+
 # A NIFTY index-options "Annual" horizon is only meaningful if the farthest
-# listed expiry is genuinely long-dated AND has real open interest -- NSE
-# rarely lists a liquid 12-month-out index option, so naively using
-# dts[-1] regardless of how far out (or how thin) it is produces a
-# strategy recommendation for an expiry nobody can actually trade at size.
-ANNUAL_MIN_DAYS_OUT = int(os.getenv("ANNUAL_MIN_DAYS_OUT", "300"))
+# listed expiry is genuinely long-dated AND has real open interest. NSE's
+# current Nifty 50 listing convention (weekly -> monthly -> quarterly ->
+# semi-annual) tops out at semi-annual (~6 months / ~180 days out) -- NSE
+# does not list a true ~12-month/LEAPS-style index option at all right now.
+# The bar used to be 300 days, which is ABOVE what NSE ever lists for Nifty
+# today, so this horizon was unconditionally "N/A -- omitted" on every run
+# regardless of real data. Lowered to 150 days so the semi-annual contract
+# (when NSE actually has one listed) can qualify -- but the OI floor below
+# remains the real "is there tradable value here" gate, so an illiquid or
+# unlisted long-dated expiry still correctly comes back unusable rather
+# than forcing a strategy into a contract nobody could actually trade.
+ANNUAL_MIN_DAYS_OUT = int(os.getenv("ANNUAL_MIN_DAYS_OUT", "150"))
 ANNUAL_MIN_TOTAL_OI = int(os.getenv("ANNUAL_MIN_TOTAL_OI", "500"))
+# Below this, even a usable long-dated expiry is realistically NSE's
+# semi-annual contract rather than a genuine 12-month/LEAPS-style one --
+# used only to keep the report's own wording honest about which it is.
+ANNUAL_TRUE_LEAPS_DAYS_OUT = int(os.getenv("ANNUAL_TRUE_LEAPS_DAYS_OUT", "300"))
 
 
 def _annual_usability(weekly_dt, annual_dt, total_oi=None):
-    """Returns (usable: bool, reason: str). Checked independently of
-    whatever the LLM says -- if this comes back False, the Annual horizon
-    is rendered as omitted regardless of model output (see run())."""
+    """Returns (usable: bool, reason: str, days_out: int|None). Checked
+    independently of whatever the LLM says -- if this comes back
+    usable=False, the Annual horizon is rendered as omitted regardless of
+    model output (see finalize_horizons())."""
     if not weekly_dt or not annual_dt:
-        return False, "No expiries available to evaluate."
+        return False, "No expiries available to evaluate.", None
     days_out = (annual_dt - weekly_dt).days
     if days_out < ANNUAL_MIN_DAYS_OUT:
         return False, (
             f"Farthest listed expiry is only {days_out} days out (< {ANNUAL_MIN_DAYS_OUT} "
-            f"required for a genuine annual/LEAPS-style horizon) -- NSE does not currently "
-            f"list a sufficiently long-dated Nifty options expiry."
-        )
+            f"required) -- NSE does not currently list a sufficiently long-dated Nifty "
+            f"options expiry (semi-annual is the longest tenor NSE currently lists for Nifty)."
+        ), days_out
     if total_oi is not None and total_oi < ANNUAL_MIN_TOTAL_OI:
         return False, (
             f"Farthest listed expiry ({days_out} days out) has only {total_oi:,} combined "
             f"OI -- too illiquid to trade at any meaningful size."
-        )
-    return True, f"Farthest listed expiry is {days_out} days out with adequate OI."
+        ), days_out
+    tenor = "annual/LEAPS-style" if days_out >= ANNUAL_TRUE_LEAPS_DAYS_OUT else "semi-annual"
+    return True, f"Farthest listed expiry is {days_out} days out ({tenor}) with adequate OI.", days_out
 
 
 def _pick_horizon_expiry_dates(dt_list):
@@ -547,10 +629,10 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
             (annual_snap.get("total_call_oi", 0) + annual_snap.get("total_put_oi", 0))
             if annual_snap else None
         )
-        usable, reason = _annual_usability(
+        usable, reason, days_out = _annual_usability(
             horizon_dts.get("Weekly"), horizon_dts.get("Annual"), annual_total_oi
         )
-        data["annual_usable"], data["annual_reason"] = usable, reason
+        data["annual_usable"], data["annual_reason"], data["annual_days_out"] = usable, reason, days_out
         if not usable:
             notes.append(f"Annual horizon not usable: {reason}")
 
@@ -584,10 +666,15 @@ def fetch_live_market_data():
         "vix_change_pct": None,
         "vix_source": None,
         "option_chain_source": None,
+        "fii_net_cr": None,
+        "dii_net_cr": None,
+        "fii_dii_date": None,
+        "fii_dii_source": None,
         "horizons": {},
         "notes": notes,
         "annual_usable": None,   # None = not yet evaluated (e.g. total fetch failure)
         "annual_reason": None,
+        "annual_days_out": None,
     }
 
     if yf is not None:
@@ -610,6 +697,19 @@ def fetch_live_market_data():
             notes.append(f"Yahoo Finance Nifty spot fetch failed: {e}")
     else:
         notes.append("yfinance not installed -- spot/VIX cross-check skipped (pip install yfinance).")
+
+    try:
+        fii_dii = fetch_nse_fii_dii()
+        if fii_dii:
+            data.update(fii_dii)
+        else:
+            notes.append(
+                "NSE FII/DII trading-activity fetch failed (blocked, rate-limited, or "
+                "endpoint shape changed) -- Market Data Inputs will fall back to "
+                "search-link attribution for this category, if any turned up."
+            )
+    except Exception as e:
+        notes.append(f"NSE FII/DII trading-activity fetch failed: {_describe_http_error(e)}")
 
     chain = fetch_nse_option_chain("NIFTY")
     if chain is None:
@@ -644,10 +744,10 @@ def fetch_live_market_data():
             (annual_snap.get("total_call_oi", 0) + annual_snap.get("total_put_oi", 0))
             if annual_snap else None
         )
-        usable, reason = _annual_usability(
+        usable, reason, days_out = _annual_usability(
             horizon_dts.get("Weekly"), horizon_dts.get("Annual"), annual_total_oi
         )
-        data["annual_usable"], data["annual_reason"] = usable, reason
+        data["annual_usable"], data["annual_reason"], data["annual_days_out"] = usable, reason, days_out
         if not usable:
             notes.append(f"Annual horizon not usable: {reason}")
         data["status"] = "ok"
@@ -920,6 +1020,42 @@ def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
     return round(max(0.0, min(1.0, prob_profit)) * 100, 1)
+
+
+def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE):
+    """Exact reflection-principle probability that price touches `barrier`
+    at ANY point before expiry (not just at expiry), under the same flat-IV
+    lognormal assumption as compute_pop. This is the closed-form
+    first-passage-time probability for GBM -- not the common desk shortcut
+    of "~2x the expiration probability" (that shortcut is itself just an
+    approximation of this same formula, historically used because it's
+    easier to eyeball off a delta than to compute the exact integral by
+    hand). Since we already have a clean flat sigma here, we use the exact
+    formula rather than the approximation.
+
+    Returns a percentage, or None if inputs are unusable."""
+    sigma = _iv_to_frac(iv)
+    if (
+        spot is None or sigma is None or t_years is None or t_years <= 0
+        or sigma <= 0 or barrier is None or barrier <= 0
+    ):
+        return None
+    try:
+        mu = r - 0.5 * sigma ** 2  # drift of log-price under risk-neutral GBM
+        a = math.log(barrier / spot)  # log-distance from spot to the barrier
+        sqrt_t = math.sqrt(t_years)
+        if a > 0:  # barrier above spot -- P(running max reaches it)
+            d1 = (mu * t_years - a) / (sigma * sqrt_t)
+            d2 = (-mu * t_years - a) / (sigma * sqrt_t)
+        elif a < 0:  # barrier below spot -- P(running min reaches it)
+            d1 = (a - mu * t_years) / (sigma * sqrt_t)
+            d2 = (a + mu * t_years) / (sigma * sqrt_t)
+        else:
+            return 100.0  # spot is already sitting at the barrier
+        prob = _norm_cdf(d1) + math.exp(2 * mu * a / sigma ** 2) * _norm_cdf(d2)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+    return round(max(0.0, min(1.0, prob)) * 100, 1)
 
 
 def estimate_margin_and_rom(max_loss_inr, max_profit_inr, priced_legs, lot_size):
@@ -1398,6 +1534,8 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["expected_move"] = "n/a"
         horizon_dict["net_greeks"] = "n/a"
         horizon_dict["probability_of_profit"] = None
+        horizon_dict["probability_of_touch"] = None
+        horizon_dict["expected_win_rate"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
@@ -1422,6 +1560,8 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["expected_move"] = "n/a"
         horizon_dict["net_greeks"] = "n/a"
         horizon_dict["probability_of_profit"] = None
+        horizon_dict["probability_of_touch"] = None
+        horizon_dict["expected_win_rate"] = None
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
@@ -1436,7 +1576,18 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     priced_legs = result["priced_legs"]
 
     rationale_addendum, any_leg_inside_band = build_strike_rationale_addendum(priced_legs, horizon_snap, spot)
-    existing = _scrub_false_band_claim((horizon_dict.get("strike_rationale") or "").strip(), any_leg_inside_band)
+    # apply_verified_payoff runs more than once per horizon in the real
+    # pipeline (once in finalize_horizons, again in reverify_horizons after
+    # the repair pass) and must be idempotent. Reading strike_rationale
+    # directly here would read back whatever the PREVIOUS call already
+    # appended to it, so a second call re-appends the same addendum onto
+    # its own prior output -- "Highest CE OI... Highest PE OI..." showing
+    # up twice. Instead, cache the model's original raw text the first
+    # time this runs, and always rebuild from that untouched original on
+    # every subsequent call.
+    if "_raw_strike_rationale" not in horizon_dict:
+        horizon_dict["_raw_strike_rationale"] = (horizon_dict.get("strike_rationale") or "").strip()
+    existing = _scrub_false_band_claim(horizon_dict["_raw_strike_rationale"], any_leg_inside_band)
     if rationale_addendum:
         horizon_dict["strike_rationale"] = (
             f"{existing} ({rationale_addendum})" if existing else rationale_addendum
@@ -1538,14 +1689,68 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["net_greeks"] = f"Greeks unavailable -- {greeks_reason}"
         horizon_dict["_net_gamma"] = None
 
-    # --- Probability of profit (flat-IV lognormal, ATM IV for this expiry) ---
-    pop = None
-    if not is_eod and spot is not None and t_years is not None and exp_move:
+    # --- Probability of profit (flat-IV lognormal) ---
+    # Prefers live per-strike ATM IV. When only the EOD Bhavcopy fallback is
+    # available (no IV column on that feed), falls back to India VIX as a
+    # flat-IV proxy instead of giving up -- less precise than a real
+    # per-expiry IV (VIX is a 30-day NIFTY-wide figure, not this specific
+    # expiry's own smile), but it's the same proxy the whole options
+    # industry reaches for when a clean per-expiry IV isn't available, and
+    # it's clearly labeled as an estimate either way so nobody mistakes it
+    # for a live-IV number. This is what actually eliminates the "n/a"
+    # that showed on every EOD-fallback run.
+    pop = pop_source = None
+    effective_iv = None
+    if spot is not None and t_years is not None and exp_move:
         atm_iv = _leg_iv(horizon_snap, exp_move["atm_strike"], "CE") or _leg_iv(horizon_snap, exp_move["atm_strike"], "PE")
-        pop = compute_pop(spot, t_years, atm_iv, result["payoff_fn"], result["breakevens"])
+        if atm_iv and not is_eod:
+            effective_iv, pop_source = atm_iv, "live ATM IV"
+        elif vix:
+            effective_iv, pop_source = vix, "India VIX proxy IV -- approximate"
+    if effective_iv:
+        pop = compute_pop(spot, t_years, effective_iv, result["payoff_fn"], result["breakevens"])
     horizon_dict["probability_of_profit"] = (
-        f"~{pop:.0f}% (model: flat ATM IV, lognormal price at expiry -- not a guarantee)"
+        f"~{pop:.0f}% ({pop_source}, lognormal price at expiry -- not a guarantee)"
         if pop is not None else None  # sentinel: render step hides this row rather than printing n/a
+    )
+
+    # --- Probability of touch ---
+    # Reports the WORST (highest) touch probability across the structure's
+    # breakeven level(s) -- i.e. whichever one the underlying is most
+    # likely to reach first -- since that's the level that would actually
+    # trigger an early adjustment/exit decision, not just the expiry
+    # outcome POP already covers.
+    pot = None
+    if effective_iv and result["breakevens"]:
+        touch_probs = [
+            p for p in (
+                compute_touch_probability(spot, t_years, effective_iv, b)
+                for b in result["breakevens"]
+            ) if p is not None
+        ]
+        if touch_probs:
+            pot = max(touch_probs)
+    horizon_dict["probability_of_touch"] = (
+        f"~{pot:.0f}% ({pop_source}) -- chance price touches breakeven at some point "
+        f"before expiry, not just at expiry; commonly used as an early-management trigger"
+        if pot is not None else None
+    )
+
+    # --- Expected win rate ---
+    # Industry convention: for a position held to expiry, "win rate" and
+    # "probability of profit" are the same figure by definition (share of
+    # terminal-price outcomes where payoff > 0). Shown as its own row since
+    # reports conventionally list it next to POP, but it intentionally
+    # reuses the same computed number rather than inventing a second,
+    # different-looking figure with no extra real signal behind it. If the
+    # position is actively managed (e.g. closed at 50% of max profit) the
+    # realized win rate is typically higher than this -- noted explicitly
+    # rather than estimated, since that requires a management-rule backtest
+    # this file doesn't have live data to run.
+    horizon_dict["expected_win_rate"] = (
+        f"~{pop:.0f}% if held to expiry ({pop_source}) -- typically higher in practice "
+        f"if the position is actively managed/closed early rather than held to expiry"
+        if pop is not None else None
     )
 
     # --- Margin (approximate) and Return on Margin ---
@@ -1836,6 +2041,8 @@ def _horizon_card_html(h, sans, serif):
         row("Max Profit (% of horizon capital)", "max_profit_pct_capital", value_color="#2F5233"),
         row("Breakeven", "breakeven"),
         *([row("Probability of Profit", "probability_of_profit")] if h.get("probability_of_profit") else []),
+        *([row("Probability of Touch", "probability_of_touch")] if h.get("probability_of_touch") else []),
+        *([row("Expected Win Rate", "expected_win_rate")] if h.get("expected_win_rate") else []),
         row("Net Greeks (per lot)", "net_greeks"),
         row("Margin Required", "margin_required"),
         row("Return on Margin", "return_on_margin"),
@@ -2366,6 +2573,23 @@ def finalize_horizons(horizons, live_data):
             "verification": "Omitted: long-dated option chain unavailable or insufficiently liquid.",
             "_verified_max_loss_inr": 0.0,
         }
+    elif (
+        live_data.get("annual_usable") is True
+        and "Annual" in by_name
+        and (live_data.get("annual_days_out") or 0) < ANNUAL_TRUE_LEAPS_DAYS_OUT
+    ):
+        # Usable, but NSE's farthest listed Nifty expiry right now is its
+        # semi-annual contract (~150-300 days out), not a genuine ~12-month/
+        # LEAPS-style one -- flag that plainly in the report rather than let
+        # the "Annual" section header silently imply a full year's tenor.
+        days_out = live_data.get("annual_days_out")
+        note = (
+            f"Note: NSE's farthest currently-listed Nifty expiry is {days_out} days out -- "
+            f"this is NSE's semi-annual contract, not a true 12-month/LEAPS-style expiry "
+            f"(NSE does not currently list one for Nifty)."
+        )
+        existing_reason = (by_name["Annual"].get("bias_reason") or "").strip()
+        by_name["Annual"]["bias_reason"] = f"{existing_reason} {note}".strip() if existing_reason else note
 
     total_at_risk = 0.0
     for name, h in by_name.items():
@@ -2530,29 +2754,53 @@ _OFFICIAL_SOURCE_DOMAINS = (
 _BLOCKED_SOURCE_HINTS = ("instagram.com", "youtube.com", "youtu.be", "twitter.com", "x.com", "facebook.com", "tiktok.com")
 
 
+def _source_url_title(s):
+    """Normalizes whatever shape a single 'source' entry comes in as --
+    a dict (url/link + title/name keys), a (title, url) or (url, title)
+    2-tuple/list (some live-search backends return these instead of
+    dicts), or a plain URL string -- into a consistent (url, title) pair.
+
+    Without this, a bare tuple like ('FII/DII Trading Activity - July
+    2026', 'https://...') fell through to `str(s)` on the whole tuple,
+    which is exactly why the FII/DII row was showing raw Python
+    tuple-repr text instead of a clean link."""
+    if isinstance(s, dict):
+        url = str(s.get("url") or s.get("link") or "")
+        title = str(s.get("title") or s.get("name") or url)
+        return url, title
+    if isinstance(s, (tuple, list)) and len(s) == 2:
+        a, b = s
+        # Whichever element looks like a URL is the url; the other is the title.
+        if isinstance(a, str) and a.strip().lower().startswith(("http://", "https://")):
+            return a, (str(b) if b else a)
+        if isinstance(b, str) and b.strip().lower().startswith(("http://", "https://")):
+            return b, (str(a) if a else b)
+        # Neither looks like a URL -- fall back to treating the first as title.
+        return "", str(a)
+    text = str(s)
+    return (text, text) if text.strip().lower().startswith(("http://", "https://")) else ("", text)
+
+
 def _filter_sources(sources):
     """Defensive filter over whatever shape swing.generate_analysis()
-    returns for 'sources' (list of dicts with a url/link key, or plain
-    strings). swing.generate_analysis() is shared with swing_trade_advisor.py
-    (a stock-picking report), so its own live-search path can just as easily
-    surface breakout-stock roundups, broker marketing blogs, or generic
-    "swing trading" content -- none of which should back a derivatives
-    report (issue #6). This is now a strict ALLOWLIST: a source survives
-    only if its URL matches one of the recognized official/primary NSE-
-    adjacent or major-financial-press domains in _OFFICIAL_SOURCE_DOMAINS,
-    on top of the existing social-media/video blocklist. Anything else --
-    including a legitimate-looking source the allowlist doesn't happen to
-    name -- is dropped rather than risk showing an unvetted stock-picking
-    link next to option strikes."""
+    returns for 'sources' (list of dicts with a url/link key, (title, url)
+    tuples, or plain strings). swing.generate_analysis() is shared with
+    swing_trade_advisor.py (a stock-picking report), so its own live-search
+    path can just as easily surface breakout-stock roundups, broker
+    marketing blogs, or generic "swing trading" content -- none of which
+    should back a derivatives report (issue #6). This is now a strict
+    ALLOWLIST: a source survives only if its URL matches one of the
+    recognized official/primary NSE-adjacent or major-financial-press
+    domains in _OFFICIAL_SOURCE_DOMAINS, on top of the existing
+    social-media/video blocklist. Anything else -- including a
+    legitimate-looking source the allowlist doesn't happen to name -- is
+    dropped rather than risk showing an unvetted stock-picking link next
+    to option strikes."""
     if not sources:
         return sources
     out = []
     for s in sources:
-        url = ""
-        if isinstance(s, dict):
-            url = str(s.get("url") or s.get("link") or "")
-        else:
-            url = str(s)
+        url, _title = _source_url_title(s)
         low_url = url.lower()
         if any(bad in low_url for bad in _BLOCKED_SOURCE_HINTS):
             continue
@@ -2586,11 +2834,7 @@ def _categorize_source(s):
     callers drop those rather than showing them under a generic catch-all
     bucket, so a stray "top breakout stocks this week" link that happened
     to sit on an allowlisted domain still can't surface here."""
-    if isinstance(s, dict):
-        url = str(s.get("url") or s.get("link") or "")
-        title = str(s.get("title") or s.get("name") or "")
-    else:
-        url, title = str(s), ""
+    url, title = _source_url_title(s)
     text = f"{url} {title}".lower()
     for cat, keywords in _CATEGORY_KEYWORDS.items():
         if any(kw in text for kw in keywords):
@@ -2628,6 +2872,11 @@ def render_market_data_inputs_html(live_data, sources, sans):
         or "unavailable this run (direct fetch and EOD Bhavcopy fallback both failed)"
     )
 
+    fii_val = live_data.get("fii_net_cr")
+    dii_val = live_data.get("dii_net_cr")
+    fii_dii_date = live_data.get("fii_dii_date")
+    fii_dii_src = live_data.get("fii_dii_source")
+
     rows = [
         _row("Spot", f'{spot_val} &nbsp;&middot;&nbsp; <span style="color:#8A8F9C;">{spot_src}</span>'),
         _row("Option Chain / Bhavcopy", f'<span style="color:#8A8F9C;">{oc_src}</span>'),
@@ -2643,22 +2892,43 @@ def render_market_data_inputs_html(live_data, sources, sans):
     def _links_cell(cat_sources):
         links = []
         for s in cat_sources[:3]:
-            if isinstance(s, dict):
-                url = s.get("url") or s.get("link") or ""
-                title = s.get("title") or s.get("name") or url
-            else:
-                url, title = str(s), str(s)
+            url, title = _source_url_title(s)
             if url:
-                links.append(f'<a href="{html.escape(str(url))}" style="color:#8A6D3B;">{html.escape(str(title))}</a>')
+                links.append(f'<a href="{html.escape(url)}" style="color:#8A6D3B;">{html.escape(title)}</a>')
             elif title:
-                links.append(html.escape(str(title)))
+                links.append(html.escape(title))
         if links:
             return "<br>".join(links)
         return '<span style="color:#8A8F9C;">not found in this run&#8217;s search</span>'
 
+    def _flow_cell(val, label):
+        if val is None:
+            return None
+        sign = "+" if val >= 0 else "&minus;"
+        color = "#2F5233" if val >= 0 else "#8B2E2E"
+        return f'<span style="color:{color};font-weight:700;">{sign}₹{abs(val):,.0f} Cr</span> <span style="color:#8A8F9C;">({label})</span>'
+
+    if fii_val is not None or dii_val is not None:
+        # Real code-fetched net figures (NSE's own FII/DII report) -- shown
+        # as structured Net ₹ Cr numbers with a clean source line, instead
+        # of the raw search-result link dump this category used to fall
+        # back to whenever the LLM's own web search was all that was
+        # available.
+        parts = [p for p in (_flow_cell(fii_val, "FII, cash mkt"), _flow_cell(dii_val, "DII, cash mkt")) if p]
+        date_note = f" &middot; {html.escape(str(fii_dii_date))}" if fii_dii_date else ""
+        cell = (
+            "<br>".join(parts)
+            + f'<div style="margin-top:2px;color:#8A8F9C;font-size:11px;">Source: {html.escape(str(fii_dii_src or "NSE"))}{date_note}</div>'
+        )
+        rows.append(_row("FII/DII Activity", cell))
+    else:
+        # Direct NSE fetch failed this run -- fall back to whatever the
+        # LLM's own live search turned up, same as the other search-only
+        # categories below.
+        rows.append(_row("FII/DII Activity", _links_cell(by_cat.get("FII/DII Activity", []))))
+
     for label, cat_key in (
         ("Nifty Futures", "Nifty Futures"),
-        ("FII/DII Activity", "FII/DII Activity"),
         ("GIFT Nifty", "GIFT Nifty / Pre-Market"),
         ("Event Calendar", "Event Calendar"),
     ):
