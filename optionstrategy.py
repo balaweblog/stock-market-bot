@@ -65,6 +65,7 @@ from email.mime.text import MIMEText
 
 import main                 # LLM init + email config/credentials (via config.py)
 import swing_trade_advisor as swing  # reuses generate_analysis() + helpers, no duplication
+from compliance import build_compliance_block_html
 
 # -----------------------------
 # Config (env-overridable capital caps, per the prompt's constraint #3)
@@ -438,6 +439,35 @@ def _extract_expiry_snapshot(rows, expiry_str):
         "call_price_chg": call_price_chg,
         "put_price_chg": put_price_chg,
     }
+
+
+def describe_max_pain(horizon_snap, spot):
+    """Turns the raw max_pain strike (already computed in
+    _extract_expiry_snapshot from real OI, per-strike) into a
+    client-readable line: the strike, its % distance from spot, and which
+    side it sits on. Max pain theory holds that option writers -- who are
+    net short gamma and control far more capital than option buyers -- have
+    a mild pull on price toward the strike where the total value of
+    outstanding options is smallest at expiry. It's a soft bias, not a
+    prediction, and the note says so rather than overclaiming it. Returns
+    None if max_pain or spot isn't available, so the row is simply omitted
+    rather than shown as a bare 'n/a'."""
+    max_pain = (horizon_snap or {}).get("max_pain")
+    if max_pain is None or not spot:
+        return None
+
+    diff_pct = ((spot - max_pain) / spot) * 100
+    if abs(diff_pct) < 0.15:
+        position = "essentially at spot"
+    elif diff_pct > 0:
+        position = f"{abs(diff_pct):.1f}% below spot"
+    else:
+        position = f"{abs(diff_pct):.1f}% above spot"
+
+    return (
+        f"{max_pain} ({position}) — the strike where option writers' aggregate "
+        f"payout is smallest at expiry; a soft magnet for price into expiry, not a target"
+    )
 
 
 def compute_oi_trend(horizon_snap):
@@ -1908,6 +1938,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     # depend on whether the chosen legs price/verify successfully, only on
     # whether the live NSE chain (not EOD Bhavcopy) was available this run.
     horizon_dict["oi_trend"] = compute_oi_trend(horizon_snap or {})
+    horizon_dict["max_pain_note"] = describe_max_pain(horizon_snap, spot)
     legs_text = horizon_dict.get("legs", "")
     result = compute_strategy_payoff(legs_text, horizon_snap)
     is_eod = bool((horizon_snap or {}).get("source"))  # only set on the Bhavcopy fallback path
@@ -2738,6 +2769,7 @@ def _horizon_card_html(h, sans, serif):
         *([raw_row("Directional Bias (Next Week)", _bias_badge(h.get("next_week_bias")))] if h.get("next_week_bias") else []),
         row("Bias Rationale", "bias_reason"),
         *([row("OI Trend", "oi_trend")] if h.get("oi_trend") else []),
+        *([row("Max Pain (OI-Derived)", "max_pain_note")] if h.get("max_pain_note") else []),
         row("Strike Selection Rationale", "strike_rationale"),
         row("Expected Move (ATM Straddle)", "expected_move"),
         row("Max Loss", "max_loss", value_color="#8B2E2E", bold=True),
@@ -3962,12 +3994,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
               {sources_html}
             </td>
           </tr>
-          <tr>
-            <td style="padding:16px 28px 22px;border-top:1px solid #EDEAE2;" class="email-padding">
-              <p style="margin:0;font-family:{sans};font-size:11px;line-height:1.6;color:#9AA0AC;">{disclaimer}</p>
-              <p style="margin:10px 0 0;font-family:{sans};font-size:10px;letter-spacing:0.04em;color:#B9BEC7;">&copy; Portfolio Research Desk</p>
-            </td>
-          </tr>
+{build_compliance_block_html(report_kind="options", run_note=disclaimer)}
         </table>
       </td>
     </tr>

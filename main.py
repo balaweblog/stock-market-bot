@@ -45,6 +45,9 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logger import log
 from commodity_tracker import CommodityTracker
+from compliance import build_compliance_block_html
+from track_record import update_track_record, build_track_record_html
+from support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
 
 import threading
 
@@ -82,9 +85,10 @@ def load_run_history():
             data = json.load(f)
             data.setdefault("stocks", {})
             data.setdefault("commodities", {})
+            data.setdefault("track_record", {"open": {}, "closed": []})
             return data
     except Exception:
-        return {"stocks": {}, "commodities": {}}
+        return {"stocks": {}, "commodities": {}, "track_record": {"open": {}, "closed": []}}
 
 
 def save_run_history(history):
@@ -734,9 +738,13 @@ def _fallback_stock_story(stock_name, signal, tech_score, fund_score, sentiment_
     already on hand for this stock -- no extra AI call.
     """
     headline = headlines[0] if headlines else "No recent headlines available."
+    if sentiment_label == "Data Unavailable":
+        sentiment_line = "Sentiment: data unavailable -- news fetch failed this run."
+    else:
+        sentiment_line = f"Sentiment reads {sentiment_label.lower()} ({round(sentiment_score, 1)})."
     return [
         f"Signal: {signal}, technical score {tech_score}, fundamentals {fund_score}.",
-        f"Sentiment reads {sentiment_label.lower()} ({round(sentiment_score, 1)}).",
+        sentiment_line,
         f"Latest headline: {headline}",
     ]
 
@@ -1612,10 +1620,17 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         adv_raw = fetch_advanced_fundamentals(ticker)
         adv_fund_score = score_advanced_fundamentals(adv_raw)
 
-        headlines = get_news(stock_name)
-        sentiment = score_headlines(headlines)
+        news_result = get_news(stock_name)
+        headlines = news_result["headlines"]
+        news_available = news_result["available"]
+        if not news_available:
+            print(f"News fetch failed for {stock_name}: sources_failed={news_result.get('sources_failed')}")
+        sentiment = score_headlines(headlines, available=news_available)
         sentiment_score = sentiment.get("score", 50.0)
         sentiment_label = sentiment.get("label", "Neutral")
+        # Grey out the sentiment display when we couldn't fetch news at all,
+        # so a failed fetch doesn't read the same as a real neutral score.
+        sentiment_color = "#8A8F9C" if sentiment_label == "Data Unavailable" else "#0f172a"
 
         try:
             market_context = build_market_context(ticker)
@@ -1668,6 +1683,8 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
         risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
         range_52w = calculate_52_week_range(df, latest)
+        pivot_levels = compute_pivot_levels(df)
+        swing_zones = compute_swing_zones(df)
 
         entry_context["risk_reward_ratio"] = round((risk_data["target"] - latest["close"]) / max(latest["close"] - risk_data["stop_loss"], 1e-6), 2) if latest["close"] > risk_data["stop_loss"] else None
 
@@ -1820,13 +1837,14 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                             </tr>
                             <tr>
                                 <td style="padding:6px 0;"><strong>Technical Score</strong><div style="color:#0f172a;margin-top:4px;">{tech_score}</div></td>
-                                <td style="padding:6px 0;"><strong>Sentiment</strong><div style="color:#0f172a;margin-top:4px;">{sentiment_score} ({sentiment_label})</div></td>
+                                <td style="padding:6px 0;"><strong>Sentiment</strong><div style="color:{sentiment_color};margin-top:4px;">{"Data Unavailable" if sentiment_label == "Data Unavailable" else f"{sentiment_score} ({sentiment_label})"}</div></td>
                             </tr>
                             <tr>
                                 <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
                                 <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
                             </tr>
                             {build_fundamentals_html(fund_raw, fund_score)}
+                            {build_support_resistance_html(pivot_levels, swing_zones, round(latest['close'], 2))}
                             {build_52_week_range_html(range_52w)}
                             {build_risk_meter_html(risk_meter)}
                         </table>
@@ -2795,6 +2813,7 @@ def main(mode, use_llm, detailed_llm=False):
     run_history = load_run_history()
     prev_stock_history = run_history.get("stocks", {})
     new_stock_history = {}
+    track_record_state = run_history.get("track_record", {"open": {}, "closed": []})
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_stock = {
@@ -2822,6 +2841,15 @@ def main(mode, use_llm, detailed_llm=False):
                             "stop_loss": summary_entry.get("stop_loss"),
                             "last_run_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
                         }
+                        update_track_record(
+                            track_record_state,
+                            ticker,
+                            stock_name,
+                            summary_entry.get("signal") or "",
+                            summary_entry.get("current_price"),
+                            summary_entry.get("target"),
+                            summary_entry.get("stop_loss"),
+                        )
                     elif prior_entry:
                         # Keep the last known-good entry so a single failed
                         # run doesn't wipe out change-tracking history.
@@ -3125,13 +3153,21 @@ def main(mode, use_llm, detailed_llm=False):
                 </tr>
             """
     else:
-        commodity_row_html = """
+        # commodity_fetch_error was previously captured and logged but never
+        # surfaced in the report itself -- the reader just saw a generic
+        # "unavailable" line with no indication of why. Show the actual
+        # reason (str(exception), not a full traceback) so this reads the
+        # same as a real data-quality note rather than a silent gap.
+        error_detail = (
+            f" ({html.escape(str(commodity_fetch_error))})" if commodity_fetch_error else ""
+        )
+        commodity_row_html = f"""
             <tr>
               <td style="padding:0 28px 20px;" class="email-padding">
                 <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#fff7f7;border:1px solid #f5c2c7;">
                   <tr>
                     <td style="padding:14px;color:#721c24;font-size:13px;">
-                      <strong>Commodities Unavailable:</strong> Could not fetch Gold &amp; Silver prices at this time.
+                      <strong>Commodities Unavailable:</strong> Could not fetch Gold &amp; Silver prices at this time{error_detail}.
                     </td>
                   </tr>
                 </table>
@@ -3159,14 +3195,19 @@ def main(mode, use_llm, detailed_llm=False):
         rows, commodity_data=commodity_data, commodity_buy_signals=new_commodity_history
     )
     concentration_alert_html = build_concentration_alert_html(rows)
+    track_record_html = build_track_record_html(track_record_state)
 
-    footer_html = """
-            <tr>
-              <td style="padding:18px 28px 22px;border-top:1px solid #EDEAE2;" class="email-padding">
-                <p style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;line-height:1.6;color:#9AA0AC;">This briefing is generated from automated technical, fundamental and sentiment models and is provided for informational purposes only. It does not constitute investment advice or a recommendation to buy or sell any security. Verify all prices, levels and news against a live source before acting.</p>
-                <p style="margin:10px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;letter-spacing:0.04em;color:#B9BEC7;">&copy; Portfolio Research Desk</p>
-              </td>
-            </tr>
+    footer_html = (
+        build_compliance_block_html(
+            report_kind="equity",
+            run_note=(
+                "This briefing is generated from automated technical, fundamental and "
+                "sentiment models and is provided for informational purposes only. It does "
+                "not constitute investment advice or a recommendation to buy or sell any "
+                "security. Verify all prices, levels and news against a live source before acting."
+            ),
+        )
+        + """
           </table>
         </td>
       </tr>
@@ -3174,6 +3215,7 @@ def main(mode, use_llm, detailed_llm=False):
   </body>
 </html>
     """
+    )
 
     # PDF gets the full report: heatmap, quick summary, portfolio snapshot,
     # commodities, concentration alerts, and every stock's detailed card.
@@ -3182,6 +3224,7 @@ def main(mode, use_llm, detailed_llm=False):
         error_summary_html
         + quick_jump_html
         + ai_portfolio_story_html
+        + track_record_html
         + quick_summary_html
         + action_plan_html
         + summary_html
@@ -3200,11 +3243,15 @@ def main(mode, use_llm, detailed_llm=False):
     # inline message and lives only in the attached PDF -- keeps the email
     # short and avoids Gmail's ~102 KB body-clipping entirely rather than
     # just working around it.
-    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + quick_summary_html + action_plan_html + footer_html
+    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + track_record_html + quick_summary_html + action_plan_html + footer_html
 
     # Persist this run's state so the next run can diff signals/prices
     # against it (change badges, breach alerts, commodity streaks).
-    save_run_history({"stocks": new_stock_history, "commodities": new_commodity_history})
+    save_run_history({
+        "stocks": new_stock_history,
+        "commodities": new_commodity_history,
+        "track_record": track_record_state,
+    })
 
     pdf_bytes = build_pdf_attachment(report_html)
 

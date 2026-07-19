@@ -47,6 +47,7 @@ import smtplib
 from email.mime.text import MIMEText
 
 import main  # reuses LLM init, email config/credentials, and helpers
+from compliance import build_compliance_block_html
 
 # -----------------------------
 # Prompt
@@ -834,12 +835,7 @@ def build_email_html(analysis_html, today_str, sources, used_live_search):
               {sources_html}
             </td>
           </tr>
-          <tr>
-            <td style="padding:16px 28px 22px;border-top:1px solid #EDEAE2;" class="email-padding">
-              <p style="margin:0;font-family:{sans};font-size:11px;line-height:1.6;color:#9AA0AC;">{disclaimer}</p>
-              <p style="margin:10px 0 0;font-family:{sans};font-size:10px;letter-spacing:0.04em;color:#B9BEC7;">&copy; Portfolio Research Desk</p>
-            </td>
-          </tr>
+{build_compliance_block_html(report_kind="swing", run_note=disclaimer)}
         </table>
       </td>
     </tr>
