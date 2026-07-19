@@ -72,6 +72,18 @@ import swing_trade_advisor as swing  # reuses generate_analysis() + helpers, no 
 PER_HORIZON_CAP_PCT = float(os.getenv("OPTIONS_PER_HORIZON_CAP_PCT", "5"))
 AGGREGATE_CAP_PCT = float(os.getenv("OPTIONS_AGGREGATE_CAP_PCT", "15"))
 
+# Absolute lot ceiling per horizon, independent of the PER_HORIZON_CAP_PCT
+# math above -- issue #6. A strategy with a small per-lot max loss (tight
+# spread, far-OTM strikes) can pass the percentage-of-capital check with a
+# large lot count (e.g. floor(5% of 1L / Rs.229) = 21 lots) even though
+# that many lots is still impractical: NSE index-option strikes away from
+# the money often can't absorb 20+ lots without meaningful slippage, and
+# more lots means more margin, more exposure to a gap move, and a bigger
+# single order to actually get filled. PER_HORIZON_CAP_PCT stays as the
+# primary risk-based cap; this is a separate, independent ceiling on top
+# of it, not a replacement.
+MAX_LOTS_PER_HORIZON = int(os.getenv("OPTIONS_MAX_LOTS_PER_HORIZON", "5"))
+
 # Quality filters applied in code AFTER pricing (apply_verified_payoff), on
 # top of the risk-defined-only rule -- a capped-risk spread can still be a
 # bad trade if the reward on offer doesn't justify the capital locked up as
@@ -84,8 +96,33 @@ AGGREGATE_CAP_PCT = float(os.getenv("OPTIONS_AGGREGATE_CAP_PCT", "15"))
 #     be at least this % of the strike width -- e.g. a 300-point-wide Bear
 #     Call Spread collecting only a few rupees of credit per point of width
 #     is technically "risk-defined" but not worth the capital at risk.
+#   - MAX_PLAUSIBLE_REWARD_RISK_RATIO: the mirror-image problem. A genuine
+#     defined-risk vertical spread's max_profit and max_loss are two pieces
+#     of the SAME strike width (max_profit + max_loss == width * lot_size),
+#     so a ratio far above ~3-5:1 almost never comes from real, correctly
+#     priced legs -- it's a much stronger signal of a premium-extraction,
+#     strike-mapping, or buy/sell-direction bug than of a genuinely great
+#     trade. This does NOT reject the horizon (the payoff math may well be
+#     internally consistent given the premiums it was handed -- e.g. the
+#     numbers can sum exactly to width*lot_size and still be implausible),
+#     it downgrades the verdict to Caution and asks for a manual premium
+#     check rather than letting an unaudited 60:1 print as "Consider".
 MIN_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MIN_REWARD_RISK_RATIO", "0.5"))
 MIN_CREDIT_WIDTH_PCT = float(os.getenv("OPTIONS_MIN_CREDIT_WIDTH_PCT", "15"))
+MAX_PLAUSIBLE_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MAX_PLAUSIBLE_REWARD_RISK_RATIO", "5"))
+# Below this modeled POP, a reward:risk ratio above the ceiling above is
+# read as a genuine (if easily misread) long-shot/"lottery-like" payoff
+# rather than a data bug -- see the lottery-vs-bug split in
+# apply_verified_payoff, right after POP and EV are both computed.
+LOTTERY_POP_THRESHOLD_PCT = float(os.getenv("OPTIONS_LOTTERY_POP_THRESHOLD_PCT", "15"))
+# Final tiebreaker once a horizon has cleared every hard Skip/Caution gate
+# below: compute_trade_quality_score (0-100, built from EV, R:R, POP,
+# and code-scored confidence -- never the model's own self-rating) decides
+# Consider vs Neutral. This replaces what used to be a separate, narrower
+# "confidence == Low" -> Caution check with one explicit, documented
+# threshold, so every verdict traces to a single number a reader can look
+# up in the Trade Quality Score row instead of several scattered heuristics.
+CONSIDER_QUALITY_THRESHOLD = float(os.getenv("OPTIONS_CONSIDER_QUALITY_THRESHOLD", "75"))
 
 HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly"]
 
@@ -702,6 +739,9 @@ def fetch_live_market_data():
         "vix": None,
         "vix_change_pct": None,
         "vix_source": None,
+        "iv_rank": None,
+        "iv_percentile": None,
+        "iv_rank_days": 0,
         "option_chain_source": None,
         "fii_net_cr": None,
         "dii_net_cr": None,
@@ -713,13 +753,22 @@ def fetch_live_market_data():
 
     if yf is not None:
         try:
-            vix_hist = yf.Ticker("^INDIAVIX").history(period="5d")
+            vix_hist = yf.Ticker("^INDIAVIX").history(period="1y")
             if not vix_hist.empty:
                 data["vix"] = round(float(vix_hist["Close"].iloc[-1]), 2)
                 data["vix_source"] = "Yahoo Finance (^INDIAVIX)"
                 if len(vix_hist) >= 2:
                     prev = float(vix_hist["Close"].iloc[-2])
                     data["vix_change_pct"] = round((data["vix"] - prev) / prev * 100, 2)
+                # IV Rank / IV Percentile -- estimated from this same
+                # trailing-year VIX series already fetched above, rather
+                # than a second API call. See compute_iv_rank_percentile
+                # for why this is a VIX-based estimate, not a per-expiry
+                # historical-IV rank.
+                rank, pct, days_used = compute_iv_rank_percentile(vix_hist["Close"], data["vix"])
+                data["iv_rank"] = rank
+                data["iv_percentile"] = pct
+                data["iv_rank_days"] = days_used
         except Exception as e:
             notes.append(f"Yahoo Finance VIX fetch failed: {e}")
         try:
@@ -820,6 +869,15 @@ def format_live_data_block(data):
         + str(data.get("vix", "n/a"))
         + (f" ({data['vix_change_pct']:+.2f}% vs prior close)" if data.get("vix_change_pct") is not None else ""),
     ]
+    if data.get("iv_rank") is not None and data.get("iv_percentile") is not None:
+        lines.append(
+            f"- IV Rank: {data['iv_rank']:g} / IV Percentile: {data['iv_percentile']:g} "
+            f"(estimated from India VIX's own trailing {data.get('iv_rank_days', 0)}-trading-day range -- "
+            f"a market-wide proxy, not this specific expiry's historical IV. Higher values mean richer "
+            f"premium relative to the last year and favor premium-selling structures (Iron Condor/Butterfly, "
+            f"credit spreads); lower values favor debit structures or standing aside on theta-selling. Use "
+            f"qualitatively only -- do not restate this figure as if it were a per-strike IV.)"
+        )
     for horizon in HORIZON_ORDER:
         snap = data.get("horizons", {}).get(horizon)
         if not snap:
@@ -981,6 +1039,37 @@ def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE):
         return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
+
+
+def compute_iv_rank_percentile(vix_series, current_vix):
+    """IV Rank and IV Percentile, estimated from India VIX's own trailing
+    history -- the standard desk proxy for where implied vol sits when
+    real historical per-expiry/per-strike IV isn't available (this file
+    only has this run's live option-chain snapshot, not a stored year of
+    daily chains to rank the actual expiry's IV against). VIX is a
+    single NIFTY-wide 30-day figure rather than any one expiry's specific
+    IV, so this is explicitly an ESTIMATE -- labelled as such wherever
+    it's shown or passed to the model, the same way the VIX-proxy IV
+    already used as a POP fallback elsewhere in this file is labelled.
+
+      IV Rank = where today's VIX sits between the trailing-window low
+                and high, as a percentage (100 = today is the highest
+                close in the window, 0 = today is the lowest).
+      IV Percentile = the percentage of trailing-window trading days
+                whose closing VIX was BELOW today's -- more robust to a
+                single outlier spike/trough than Rank alone, since Rank
+                only looks at the two endpoints.
+
+    Returns (rank, percentile, days_used), all None/0 if there isn't
+    enough history (fewer than 20 trading days) to compute either."""
+    if vix_series is None or current_vix is None or len(vix_series) < 20:
+        return None, None, 0
+    lo, hi = float(vix_series.min()), float(vix_series.max())
+    days = len(vix_series)
+    rank = round((current_vix - lo) / (hi - lo) * 100, 1) if hi > lo else 50.0
+    below = int((vix_series < current_vix).sum())
+    percentile = round(below / days * 100, 1)
+    return rank, percentile, days
 
 
 def compute_expected_move(call_ltp, put_ltp, spot):
@@ -1678,6 +1767,39 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=
                 + (" -- backed by a real OI wall" if oi_backed else " -- within a reasonable multiple of expected move"),
             ))
 
+    # Short-strike-inside-expected-move check (issue #7): the block above
+    # catches strikes placed too FAR from spot without OI backing, but
+    # nothing was catching the opposite problem -- a short strike sitting
+    # INSIDE the horizon's own expected-move band, which is what
+    # constraint #2 actually asks short strikes to sit outside of. A
+    # strike inside the band collects richer premium but is
+    # proportionately more likely to be breached before expiry -- that
+    # can be a deliberate, legitimate choice (harvesting elevated
+    # premium), but it should surface as a flag for review rather than
+    # pass silently. This matters most for Monthly/Quarterly, where a
+    # strike a few hundred points from spot can look "wide" by strike
+    # count alone while still sitting well inside a four-figure expected
+    # move -- e.g. a Quarterly ±1115 expected move with short strikes at
+    # 24200/24500 against a ~24,650 spot.
+    if spot is not None and exp_move_pts and short_legs:
+        nearest_short = min(short_legs, key=lambda l: abs(l["strike"] - spot))
+        near_distance = abs(nearest_short["strike"] - spot)
+        near_multiple = near_distance / exp_move_pts
+        inside_band = near_distance < exp_move_pts
+        if inside_band:
+            checks.append((
+                False,
+                f"Nearest short strike {nearest_short['strike']:g} is only {near_distance:.0f} pts from "
+                f"spot ({near_multiple:.2f}x expected move) -- inside the expected-move band, so this "
+                f"trades richer premium for a higher probability of breach before expiry",
+            ))
+        else:
+            checks.append((
+                True,
+                f"Nearest short strike {nearest_short['strike']:g} is {near_distance:.0f} pts from spot "
+                f"({near_multiple:.2f}x expected move) -- outside the expected-move band",
+            ))
+
     if is_eod:
         label, lo_band, hi_band = "Medium", 65, 80
         tier_desc = "EOD Bhavcopy fallback used (no live premiums/IV)"
@@ -1709,6 +1831,14 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     underlying data was actually an EOD Bhavcopy close."""
     horizon_dict["bias_reason"] = _scrub_pcr_mischaracterization(
         _strip_cap_claims(horizon_dict.get("bias_reason")),
+        (horizon_snap or {}).get("pcr_oi"),
+    )
+    # Also cross-check the 'bias' badge field itself against PCR -- fixes
+    # cases like PCR 1.61 rendered as a "Balanced"/"Neutral" badge even
+    # when bias_reason's prose was fine (issue #5: the two fields were
+    # being validated inconsistently).
+    horizon_dict["bias"] = _scrub_bias_pcr_conflict(
+        horizon_dict.get("bias"),
         (horizon_snap or {}).get("pcr_oi"),
     )
     # OI trend (Call/Put Writing vs Buying vs Unwinding) -- computed from
@@ -1922,6 +2052,18 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
     horizon_dict["max_loss_pct_capital"] = round(max_loss / TOTAL_CAPITAL_INR * 100, 2)
     horizon_dict["max_profit_pct_capital"] = round(max_profit / TOTAL_CAPITAL_INR * 100, 2)
+    # Flip side of the MIN_REWARD_RISK_RATIO floor: a ratio far above what a
+    # real defined-risk vertical can produce needs a flag, but WHICH flag
+    # depends on POP, computed further down this function -- a high ratio
+    # with normal/unknown POP is a data-integrity smell (wrong premium,
+    # wrong strike/leg mapping, buy/sell flipped); the same high ratio with
+    # a genuinely low POP is instead a legitimate but easily-misread
+    # long-shot ("lottery-like") payoff profile. Only the raw over-ceiling
+    # boolean is recorded here; the actual warning text and verdict
+    # framing are decided once POP is known, below.
+    horizon_dict["_over_ratio_ceiling"] = (
+        max_loss > 0 and reward_risk_ratio > MAX_PLAUSIBLE_REWARD_RISK_RATIO
+    )
     # Reward:Risk = max_profit / max_loss, the same ratio already computed
     # above to enforce MIN_REWARD_RISK_RATIO -- surfaced here as its own
     # field rather than left buried in the rejection-only code path, since
@@ -2093,6 +2235,39 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         f"rare loss)"
         if expectancy["sharpe_like"] is not None else None
     )
+
+    # --- Resolve the deferred ratio-over-ceiling flag now that POP is known ---
+    # A reward:risk far above MAX_PLAUSIBLE_REWARD_RISK_RATIO means one of
+    # two very different things, and readers need to be told which:
+    #   - POP is low (< LOTTERY_POP_THRESHOLD_PCT): the structure is a
+    #     genuine long-shot -- most likely outcome is max loss, and the
+    #     "positive EV" comes entirely from a rare large payoff. Real, not
+    #     a bug, but easily misread as an ordinary high-confidence spread
+    #     if the report doesn't say so explicitly.
+    #   - POP is normal/high/unknown: a defined-risk vertical's max_profit
+    #     and max_loss are two pieces of the same strike width, so this
+    #     combination essentially never comes from correctly priced legs --
+    #     treated as a premium/strike/direction bug to verify, not a trade.
+    horizon_dict["_lottery_like"] = False
+    horizon_dict["_implausible_reward_risk"] = False
+    if horizon_dict.get("_over_ratio_ceiling"):
+        if pop is not None and pop < LOTTERY_POP_THRESHOLD_PCT:
+            horizon_dict["_lottery_like"] = True
+            lottery_note = (
+                f" ⚠ Lottery-like payoff profile -- POP is only ~{pop:.0f}%, so the modeled MOST LIKELY "
+                f"outcome is the max loss; the positive EV comes entirely from a rare large payoff, not "
+                f"from this being a favored/high-confidence setup."
+            )
+            horizon_dict["reward_risk_ratio"] += lottery_note
+            if horizon_dict.get("expected_value"):
+                horizon_dict["expected_value"] += lottery_note
+        else:
+            horizon_dict["_implausible_reward_risk"] = True
+            horizon_dict["reward_risk_ratio"] += (
+                f" ⚠ Above {MAX_PLAUSIBLE_REWARD_RISK_RATIO:g}:1 with no low-POP explanation -- implausible "
+                f"for a genuine defined-risk spread; verify premium extraction, strike/leg mapping, and "
+                f"buy/sell direction before trusting this."
+            )
 
     # --- Margin (approximate) and Return on Margin ---
     margin, rom = estimate_margin_and_rom(max_loss, max_profit, priced_legs, NIFTY_LOT_SIZE)
@@ -2514,7 +2689,8 @@ def classify_pcr(pcr):
 
 
 _PCR_EQUAL_CLAIM_RE = re.compile(
-    r"\bequal\b[^.!?]*\b(calls?|puts?)\b|\bbalanced\b[^.!?]*\b(calls?|puts?)\b",
+    r"\bequal\b[^.!?]*\b(calls?|puts?)\b|\bbalanced\b[^.!?]*\b(calls?|puts?)\b|"
+    r"\bbalanced\s+positions?\b|\bequal\s+positions?\b|\bbalanced\s+positioning\b",
     re.IGNORECASE,
 )
 
@@ -2540,6 +2716,77 @@ def _scrub_pcr_mischaracterization(bias_reason, pcr):
         else:
             fixed.append(s)
     return " ".join(fixed).strip()
+
+
+def _pcr_implied_direction(pcr):
+    """Coarse directional read from PCR alone, used only to sanity-check
+    the model's own 'bias' badge field (issue #5) -- not a substitute for
+    compute_horizon_recommendation's full logic, since price trend/OI
+    buildup/flow can legitimately make the real bias diverge from PCR
+    alone. Both the 1.2-1.5 band and the >1.5 band are put-writing-
+    dominant reads and count as 'bullish' here even though classify_pcr()
+    labels the >1.5 band as 'overbullish/contrarian caution' -- either
+    way it is not 'Neutral' or 'Balanced'."""
+    if pcr is None:
+        return None
+    if pcr < 0.7:
+        return "bearish"
+    if pcr <= 1.2:
+        return "neutral"
+    return "bullish"
+
+
+_NEUTRAL_BIAS_LABELS = ("neutral", "balanced", "range-bound", "range bound", "sideways")
+
+
+def _scrub_bias_pcr_conflict(bias, pcr):
+    """Fixes horizon_dict['bias'] itself (the badge text shown in the
+    report), not just bias_reason -- these are two separate fields the
+    model fills in, and only bias_reason was being checked against PCR
+    before this. A PCR of 1.61 is roughly 1.6x as much put OI as call OI;
+    labelling that horizon 'Balanced' or 'Neutral' in the badge is the
+    same factual error _scrub_pcr_mischaracterization already guards
+    against in the prose, just in the other field. Only overrides when
+    PCR is unambiguously outside the 0.7-1.2 neutral band AND the model's
+    own badge text is itself a neutral/balanced word -- a genuine
+    Bullish-vs-Bearish call from other live data is never touched here,
+    since PCR is only one input among several."""
+    if pcr is None or not bias:
+        return bias
+    direction = _pcr_implied_direction(pcr)
+    if direction not in ("bullish", "bearish"):
+        return bias
+    label = str(bias).strip().lower()
+    if any(label == n or label.startswith(n) for n in _NEUTRAL_BIAS_LABELS):
+        return "Bullish" if direction == "bullish" else "Bearish"
+    return bias
+
+
+_NO_STRATEGY_CLAIM_RE = re.compile(
+    r"\bno specific strateg(?:y|ies)\b|\bno strategy recommended\b|"
+    r"\bno trade recommended\b|\bwait for confirmation\b|"
+    r"\bconflicting\b[^.!?]*\b(?:pcr|vix|signals?|readings?)\b",
+    re.IGNORECASE,
+)
+
+
+def _model_declared_no_strategy(h):
+    """True if the model's own bias_reason or verification prose says it
+    isn't recommending a specific strategy this horizon (e.g. "No specific
+    strategy recommended due to conflicting PCR and VIX readings") --
+    checked BEFORE any of the payoff-based verdict rules in
+    compute_horizon_recommendation, so the top-of-report summary table can
+    never show "Consider" for a horizon whose own detail card says no
+    trade was recommended. Without this, a horizon where the model punted
+    in prose but still left verifiable (even if leftover/default) legs
+    behind would sail through the reward/EV/cap/confidence checks and get
+    marked Consider -- a direct contradiction between the summary and the
+    detail (Weekly Recommendation Contradiction)."""
+    for field in ("bias_reason", "verification"):
+        text = str(h.get(field) or "")
+        if _NO_STRATEGY_CLAIM_RE.search(text):
+            return True
+    return False
 
 
 _GAMMA_WORD_RE = re.compile(r"\bgamma\b", re.IGNORECASE)
@@ -2675,26 +2922,68 @@ def compute_market_regime(live_data, horizons):
 
 
 def compute_horizon_recommendation(h):
-    """Deterministic Consider/Skip/Caution verdict for one horizon, built
-    entirely from fields apply_verified_payoff already computed from real
-    premiums -- never from the model's own framing. Checked in this order
-    (first match wins), each one a real, code-verified failure mode rather
-    than a vibe:
+    """Deterministic verdict for one horizon, built entirely from fields
+    apply_verified_payoff / compute_trade_quality_score already computed
+    from real premiums -- never from the model's own framing (rule 0's
+    "no strategy" check is the one deliberate exception, since it exists
+    specifically to catch the model contradicting itself). This is an
+    explicit, ordered rule table -- every verdict traces to exactly one
+    named rule below rather than an unstated blend of factors, so a reader
+    can always see *why* a given horizon landed where it did:
 
+      0. No-strategy admission: the model's own bias_reason/verification
+         prose says it isn't recommending a specific strategy this horizon
+         (e.g. conflicting PCR/VIX readings) -> "No Trade". Checked FIRST,
+         ahead of every payoff-based rule below, because a "no strategy"
+         horizon can still carry leftover/default legs that verify cleanly
+         -- without this rule those legs would sail through rules 1-6 and
+         render as "Consider" directly beside detail text saying no trade
+         was recommended (the Weekly Recommendation Contradiction).
       1. Rejected outright (unparseable legs, undefined/naked risk, or
-         failed the reward:risk / credit-width quality gate)
-      2. Negative expected value at the modeled POP -- a defined-risk trade
-         can still be a net loser in expectation (see
-         compute_expectancy_metrics's docstring)
-      3. Exceeds the per-horizon capital cap (constraint #3 in the prompt
-         asks the MODEL to respect this, but nothing downstream actually
-         verified it against the real priced max_loss until now)
-      4. Confidence tier came back "Low" -- verifiable-checks score, not
-         the model's own self-rating
+         failed the reward:risk / credit-width quality gate) -> "Skip".
+      2. MaxLoss% > PER_HORIZON_CAP_PCT -> "Skip". A trade the account
+         genuinely cannot afford at this size, regardless of how good it
+         otherwise looks -- this is a sizing constraint, not a quality
+         judgment, which is exactly why it's checked before quality is
+         even consulted.
+      3. EV < 0 at the modeled POP -> "Skip". A defined-risk trade can
+         still be a net loser in expectation (see
+         compute_expectancy_metrics's docstring).
+      4. Reward:Risk ratio is far above what's plausible for a genuine
+         defined-risk spread (see MAX_PLAUSIBLE_REWARD_RISK_RATIO), split
+         by POP into two distinct "Caution" verdicts so the reason shown
+         always matches the detail card underneath:
+           - POP is also very low: a genuine long-shot payoff, labeled
+             "Lottery-Like Payoff" rather than treated as an error.
+           - POP is normal/high/unknown: a premium/strike/direction bug
+             is far more likely than a genuinely great trade, labeled
+             "Reward:Risk Implausible -- Verify Premiums".
+         These stay their own named Caution reasons rather than folding
+         into the quality-score rule below: both are data-trust flags a
+         reader needs called out explicitly, and a merely mediocre
+         quality score doesn't communicate "verify this" or "this is a
+         long shot" on its own.
+      5. Trade Quality Score >= CONSIDER_QUALITY_THRESHOLD -> "Consider".
+         The single number every other verified metric (EV, R:R, POP,
+         code-scored confidence) already rolls up into -- so a trade that
+         cleared rules 1-4 but scores below this bar isn't waved through
+         just because nothing outright failed.
+      6. Otherwise -> "Neutral". Cleared every hard gate above (not
+         rejected, not over-cap, not negative-EV, not a lottery/implausible
+         flag) but didn't clear the quality bar either -- e.g. exactly the
+         "Skip on cap, but 63/100 quality with positive EV isn't terrible"
+         case: a horizon can fail rule 2 and never even reach rule 6, but
+         one that clears the cap with a mediocre score now gets its own
+         distinct label instead of being folded into either "Consider" or
+         a Skip-adjacent Caution reason it doesn't really deserve.
 
     Returns (verdict, css_color, reason) where verdict is one of
-    "✅ Consider", "⚠ Caution", "❌ Skip", "Not Available"."""
-    green, amber, red, gray = "#2F5233", "#A6812F", "#8B2E2E", "#8A8F9C"
+    "✅ Consider", "◐ Neutral", "⚠ Caution", "❌ Skip", "⚪ No Trade",
+    "Not Available"."""
+    green, amber, red, gray, blue = "#2F5233", "#A6812F", "#8B2E2E", "#8A8F9C", "#3D6690"
+
+    if _model_declared_no_strategy(h):
+        return "⚪ No Trade", gray, "Conflicting Signals"
 
     if _horizon_rejected(h):
         ml = str(h.get("max_loss") or "")
@@ -2706,27 +2995,38 @@ def compute_horizon_recommendation(h):
             reason = "Unverified"
         return "❌ Skip", red, reason
 
-    ev_text = h.get("expected_value")
-    if ev_text and "negative" in str(ev_text).lower():
-        return "❌ Skip", red, "Negative EV"
-
     loss_pct = h.get("max_loss_pct_capital")
     if isinstance(loss_pct, (int, float)) and loss_pct > PER_HORIZON_CAP_PCT:
         return "❌ Skip", red, f"Exceeds {PER_HORIZON_CAP_PCT:.0f}% Per-Horizon Cap"
 
-    if str(h.get("confidence") or "").strip().lower() == "low":
-        return "⚠ Caution", amber, "Low Confidence"
+    ev_text = h.get("expected_value")
+    if ev_text and "negative" in str(ev_text).lower():
+        return "❌ Skip", red, "Negative EV"
 
-    return "✅ Consider", green, None
+    if h.get("_lottery_like"):
+        return "⚠ Caution", amber, "Lottery-Like Payoff"
+
+    if h.get("_implausible_reward_risk"):
+        return "⚠ Caution", amber, "Reward:Risk Implausible -- Verify Premiums"
+
+    score = h.get("_trade_quality_score")
+    if not isinstance(score, (int, float)):
+        return "Not Available", gray, "Quality Score Unavailable"
+
+    if score >= CONSIDER_QUALITY_THRESHOLD:
+        return "✅ Consider", green, None
+
+    return "◐ Neutral", blue, f"Trade Quality {score:.0f}/100 -- Below Consider Threshold"
 
 
 def render_recommendation_summary_table(horizons):
     """Top-of-report Horizon/Recommendation table so the reader gets a
     single fast-scan verdict before the detailed metrics below -- every
     verdict traces back to compute_horizon_recommendation, which only reads
-    already-verified fields, so this table can never show "Consider" for a
-    horizon the detailed card below marks rejected, negative-EV, or
-    over-cap."""
+    already-verified fields (plus the model's own no-strategy admission,
+    checked first), so this table can never show "Consider" for a horizon
+    the detailed card below marks rejected, negative-EV, over-cap, or
+    "no specific strategy recommended"."""
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 
     by_name = {}
@@ -2965,7 +3265,12 @@ def compute_suggested_sizing(horizons):
          compute_horizon_recommendation) is sized 0 outright. Otherwise,
          lots = floor(PER_HORIZON_CAP_PCT% of capital / that horizon's own
          verified per-lot max loss) -- if even 1 lot alone breaches the
-         per-horizon cap, it's skipped.
+         per-horizon cap, it's skipped. That figure is then hard-capped at
+         MAX_LOTS_PER_HORIZON regardless of how small max_loss is (issue
+         #6) -- a tiny per-lot max loss can make the %-of-capital math
+         alone suggest an impractically large lot count, ignoring
+         liquidity/slippage/execution/margin/gap risk, which don't shrink
+         just because max_loss per lot is small.
       2. Aggregate cap: if the combined worst-case loss at that sizing
          still exceeds AGGREGATE_CAP_PCT, lots are trimmed one at a time
          from the LOWEST Trade-Quality-Score horizon first (weakest trade
@@ -2986,7 +3291,7 @@ def compute_suggested_sizing(horizons):
             plan.append([name, None, "Not available this run"])
             continue
         verdict, _color, reason = compute_horizon_recommendation(h)
-        if verdict == "❌ Skip":
+        if verdict in ("❌ Skip", "⚪ No Trade", "Not Available"):
             plan.append([name, None, reason])
             continue
         max_loss_per_lot = h.get("_verified_max_loss_inr")
@@ -2997,7 +3302,20 @@ def compute_suggested_sizing(horizons):
         if lots < 1:
             plan.append([name, None, f"Even 1 lot exceeds the {PER_HORIZON_CAP_PCT:.0f}% per-horizon cap"])
             continue
-        note = None if verdict == "✅ Consider" else "Low Confidence -- consider reduced size or manual review"
+        note = None if verdict == "✅ Consider" else f"{reason} -- consider reduced size or manual review"
+        if lots > MAX_LOTS_PER_HORIZON:
+            # The %-of-capital cap alone allowed more lots than is
+            # practical to actually execute (liquidity/slippage/margin/
+            # gap risk don't scale down just because per-lot max loss is
+            # small) -- hard-cap it and say so, rather than silently
+            # suggesting a size a retail account likely can't fill cleanly.
+            lots = MAX_LOTS_PER_HORIZON
+            cap_note = (
+                f"Capped at {MAX_LOTS_PER_HORIZON} lots (liquidity/slippage/margin/gap-risk "
+                f"ceiling) -- the {PER_HORIZON_CAP_PCT:.0f}% capital cap alone would have allowed "
+                f"more; increase OPTIONS_MAX_LOTS_PER_HORIZON if you want to override this"
+            )
+            note = f"{note}. {cap_note}" if note else cap_note
         plan.append([name, lots, note])
 
     def total_risk():
@@ -3597,11 +3915,16 @@ def render_market_data_inputs_html(live_data, sources, sans):
     Nifty, and Event Calendar -- each attributed to where it really came
     from, replacing the old generic "Sources Consulted" link-dump. Spot,
     VIX, and Option Chain/Bhavcopy are deterministic (always known one way
-    or another, from the direct NSE/Yahoo fetch); the other four are
-    search-only categories and show only sources that were actually found
-    and matched to that category -- anything uncategorized (including
-    unrelated stock-recommendation links surfaced by the shared search
-    pipeline) is dropped rather than shown under a catch-all."""
+    or another, from the direct NSE/Yahoo fetch) and always shown, even
+    when unavailable, since those are core inputs the reader should always
+    see the status of. The other four are search-only categories and are
+    shown only when a source was actually found and matched to that
+    category (issue #8) -- a category with nothing found that run (e.g.
+    FII/DII when both the direct NSE fetch and the LLM's own search came
+    up empty) is dropped from the table entirely rather than shown as a
+    "not found" row, so the manifest only lists what actually informed
+    the report.
+    """
     live_data = live_data or {}
 
     def _row(label, value_html):
@@ -3632,6 +3955,18 @@ def render_market_data_inputs_html(live_data, sources, sans):
         _row("India VIX", f'{vix_val} &nbsp;&middot;&nbsp; <span style="color:#8A8F9C;">{vix_src}</span>'),
     ]
 
+    iv_rank = live_data.get("iv_rank")
+    iv_pct = live_data.get("iv_percentile")
+    iv_days = live_data.get("iv_rank_days") or 0
+    if iv_rank is not None and iv_pct is not None:
+        iv_cell = (
+            f'{iv_rank:g} <span style="color:#8A8F9C;">Rank</span> &nbsp;&middot;&nbsp; '
+            f'{iv_pct:g} <span style="color:#8A8F9C;">Percentile</span><br>'
+            f'<span style="color:#8A8F9C;font-size:11px;">Estimated from India VIX vs its trailing '
+            f'{iv_days}-day range (not per-expiry historical IV)</span>'
+        )
+        rows.append(_row("IV Rank / Percentile", iv_cell))
+
     by_cat = {}
     for s in (sources or []):
         cat = _categorize_source(s)
@@ -3648,7 +3983,7 @@ def render_market_data_inputs_html(live_data, sources, sans):
                 links.append(html.escape(title))
         if links:
             return "<br>".join(links)
-        return '<span style="color:#8A8F9C;">not found in this run&#8217;s search</span>'
+        return None  # nothing found -- caller skips the row entirely
 
     def _flow_cell(val, label):
         if val is None:
@@ -3673,15 +4008,22 @@ def render_market_data_inputs_html(live_data, sources, sans):
     else:
         # Direct NSE fetch failed this run -- fall back to whatever the
         # LLM's own live search turned up, same as the other search-only
-        # categories below.
-        rows.append(_row("FII/DII Activity", _links_cell(by_cat.get("FII/DII Activity", []))))
+        # categories below. If that also came up empty, drop the row
+        # entirely (issue #8) rather than show a "not found" placeholder --
+        # a cleaner manifest of what data actually informed the report,
+        # instead of padding it out with rows that say nothing was there.
+        fallback_cell = _links_cell(by_cat.get("FII/DII Activity", []))
+        if fallback_cell is not None:
+            rows.append(_row("FII/DII Activity", fallback_cell))
 
     for label, cat_key in (
         ("Nifty Futures", "Nifty Futures"),
         ("GIFT Nifty", "GIFT Nifty / Pre-Market"),
         ("Event Calendar", "Event Calendar"),
     ):
-        rows.append(_row(label, _links_cell(by_cat.get(cat_key, []))))
+        cell = _links_cell(by_cat.get(cat_key, []))
+        if cell is not None:
+            rows.append(_row(label, cell))
 
     return f"""
 <div style="margin-top:16px;">
