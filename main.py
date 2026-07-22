@@ -847,9 +847,28 @@ def build_ai_portfolio_story_html(portfolio_summary, stock_count, used_live_sear
 
 
 def fetch_data(symbol):
+    # NOTE: period was previously "300d" (a custom, non-native yfinance
+    # period string). That only yields ~205-215 actual trading rows once
+    # weekends/holidays are excluded from the 300 calendar days -- short of
+    # what several downstream calculations assume:
+    #   - ema200 (calculate_indicators) is a 200-period EMA; with only
+    #     ~205-215 rows it's barely past its warm-up window (2-3x the span,
+    #     i.e. 400-600 rows, is the usual bar for a converged EMA) despite
+    #     being the single largest factor in calculate_score (20 of ~135
+    #     points, plus it gates two of the trend-alignment bonuses).
+    #   - calculate_52_week_range() does df.tail(252) and labels the result
+    #     "52W High/Low" -- with fewer than 252 rows available it silently
+    #     returns everything it has, so that figure was really a ~9-10
+    #     month high/low mislabeled as a 52-week one.
+    # "2y" is a native yfinance period (no custom-format parsing involved)
+    # and yields ~490-500 trading rows -- comfortably covers a true 252-day
+    # 52-week range, gives ema200 real convergence room, and also satisfies
+    # swing_trade_advisor.py's weekly-technicals check (needs 55+ weekly
+    # bars, i.e. ~385+ trading days) instead of that check falling back to
+    # "insufficient history" on almost every run.
     df = yf.download(
         symbol,
-        period="300d",
+        period="2y",
         interval="1d",
         auto_adjust=True,
         progress=False,
