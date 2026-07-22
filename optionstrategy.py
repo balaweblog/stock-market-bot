@@ -660,7 +660,7 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         for horizon, dt in horizon_dts.items():
             snap = _extract_bhavcopy_snapshot(bhav_rows, symbol, dt)
             snap["source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')})"
-            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
+            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"])
             data["horizons"][horizon] = snap
 
         notes.append(
@@ -757,7 +757,7 @@ def fetch_live_market_data():
         rows = records.get("data", [])
         for horizon, expiry in horizon_expiries.items():
             snap = _extract_expiry_snapshot(rows, expiry)
-            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"])
+            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"])
             data["horizons"][horizon] = snap
 
         data["status"] = "ok"
@@ -906,20 +906,6 @@ def compute_iv_rank_percentile(vix_series, current_vix):
     below = int((vix_series < current_vix).sum())
     percentile = round(below / days * 100, 1)
     return rank, percentile, days
-
-
-def compute_expected_move(call_ltp, put_ltp, spot):
-    strikes = sorted(set(call_ltp or {}) & set(put_ltp or {}))
-    if not strikes or spot is None:
-        return None
-    atm = min(strikes, key=lambda s: abs(s - spot))
-    straddle = call_ltp.get(atm, 0) + put_ltp.get(atm, 0)
-    return {
-        "atm_strike": atm,
-        "straddle_premium": round(straddle, 2),
-        "expected_move_pts": round(straddle, 2),
-        "expected_move_pct": round(straddle / spot * 100, 2) if spot else None,
-    }
 
 
 def _pop_diagnostics(spot, t_years, iv, breakevens):
@@ -1618,23 +1604,12 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     poor_reward_risk = max_loss > 0 and reward_risk_ratio < MIN_REWARD_RISK_RATIO
     poor_credit_width = credit_width_pct is not None and credit_width_pct < MIN_CREDIT_WIDTH_PCT
 
-    if poor_reward_risk or poor_credit_width:
-        reasons = []
-        if poor_reward_risk:
-            reasons.append(
-                f"Reward:Risk is only {reward_risk_ratio:.2f} (₹{max_profit:,.0f} max profit vs "
-                f"₹{max_loss:,.0f} max loss per lot) -- below the {MIN_REWARD_RISK_RATIO:g} minimum."
-            )
-        if poor_credit_width:
-            reasons.append(
-                f"Net credit is only {credit_width_pct:.1f}% of the {width:g}-point spread width -- "
-                f"below the {MIN_CREDIT_WIDTH_PCT:g}% minimum for a credit spread to be worth the capped risk."
-            )
-        reason_text = " ".join(reasons)
-        horizon_dict["max_loss"] = (
-            f"POOR REWARD/RISK -- reject this trade (₹{max_loss:,.0f} at risk for only "
-            f"₹{max_profit:,.0f} potential, per lot)"
+    if poor_reward_risk:
+        reason_text = (
+            f"Reward:Risk is only {reward_risk_ratio:.2f} (₹{max_profit:,.0f} max profit vs "
+            f"₹{max_loss:,.0f} max loss per lot) -- below the {MIN_REWARD_RISK_RATIO:g} minimum."
         )
+        horizon_dict["max_loss"] = f"POOR REWARD/RISK -- reject this trade"
         horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
         horizon_dict["max_loss_pct_capital"] = "n/a"
         horizon_dict["max_profit_pct_capital"] = "n/a"
@@ -1649,10 +1624,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["expected_value"] = None
         horizon_dict["kelly_pct"] = None
         horizon_dict["expectancy_ratio"] = None
-        horizon_dict["reward_risk_ratio"] = (
-            f"{reward_risk_ratio:.2f} -- below the {MIN_REWARD_RISK_RATIO:g} minimum (rejected)"
-            if max_loss > 0 else None
-        )
+        horizon_dict["reward_risk_ratio"] = f"{reward_risk_ratio:.2f} -- below minimum (rejected)"
         horizon_dict["margin_required"] = "n/a"
         horizon_dict["return_on_margin"] = "n/a"
         horizon_dict["capital_efficiency"] = "n/a"
@@ -1666,6 +1638,12 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["_trade_quality_score"] = None
         horizon_dict["trade_quality_score"] = "n/a"
         return horizon_dict
+
+    if poor_credit_width:
+        rich_credit_flag += (
+            f" ⚠ Low Premium Environment: Net credit is only {credit_width_pct:.1f}% of the {width:g}-point "
+            f"spread width -- below your {MIN_CREDIT_WIDTH_PCT:g}% target."
+        )
 
     horizon_dict["max_loss"] = f"₹{max_loss:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
     horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"

@@ -46,6 +46,8 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 
+import pandas as pd
+
 import main  # reuses LLM init, email config/credentials, and helpers
 from compliance import build_compliance_block_html
 
@@ -589,6 +591,268 @@ def _attach_live_prices(stocks):
     return stocks
 
 
+# -----------------------------
+# Independent verification layer
+#
+# Everything above this point either comes straight from the LLM's JSON or
+# is a live quote used to *display* a price. Nothing so far actually checks
+# whether the LLM's claims are true. The functions below re-derive the
+# things that can be re-derived from real data (arithmetic, price history)
+# and flag -- never silently fix or hide -- anything that doesn't hold up.
+# This cannot make the recommendation itself "correct" (that depends on
+# unknowable future price action), it can only stop unverified or
+# self-contradictory claims from being presented with unearned confidence.
+# -----------------------------
+
+def _parse_first_number(value):
+    """Extracts the first numeric value found in a string like '8%', '5-10%',
+    '1 : 2.5', or a bare float/int. Returns None if nothing numeric is found."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    # No sign-matching: these fields (%, ratios, scores) are never
+    # legitimately negative, and a leading '-' is far more likely to be a
+    # range separator (e.g. '5-10%') than a minus sign -- matching it as a
+    # sign would silently misread '5-10%' as the two numbers 5 and -10.
+    match = re.search(r"\d*\.?\d+", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_max_number(value):
+    """Like _parse_first_number, but for ranges like '5-10%' returns the
+    upper bound -- used for concentration-risk checks where the worst case
+    (not the first number encountered) is what matters."""
+    if value is None:
+        return None
+    numbers = re.findall(r"\d*\.?\d+", str(value))
+    if not numbers:
+        return None
+    try:
+        return max(float(n) for n in numbers)
+    except ValueError:
+        return None
+
+
+def _verify_risk_reward(stock):
+    """
+    Recomputes risk_reward_ratio from stop_loss_pct/target1_pct instead of
+    trusting the LLM's self-reported arithmetic -- the prompt asks the model
+    to verify this itself, but LLMs are unreliable at exact arithmetic even
+    when explicitly instructed to check it, so it needs a real check on the
+    Python side. Sets stock['risk_reward_ratio_verified'] to the recomputed
+    '1 : X' string regardless of outcome, and returns a list of warning
+    strings (empty if the model's reported ratio matches).
+    """
+    notes = []
+    stop = _parse_first_number(stock.get("stop_loss_pct"))
+    target = _parse_first_number(stock.get("target1_pct"))
+    stated_ratio = stock.get("risk_reward_ratio")
+
+    if stop is None or target is None or stop == 0:
+        notes.append("Could not verify risk:reward -- stop-loss or target1 missing/unparseable.")
+        stock["risk_reward_ratio_verified"] = None
+        return notes
+
+    true_ratio = round(target / stop, 1)
+    stock["risk_reward_ratio_verified"] = f"1 : {true_ratio}"
+
+    stated_match = re.search(r":\s*([-+]?\d*\.?\d+)", str(stated_ratio) if stated_ratio else "")
+    stated_val = float(stated_match.group(1)) if stated_match else None
+
+    if stated_val is None:
+        notes.append(
+            f"Reported risk:reward '{stated_ratio}' could not be parsed -- "
+            f"recomputed value is 1 : {true_ratio}."
+        )
+    elif abs(stated_val - true_ratio) > 0.15:
+        notes.append(
+            f"Risk:reward mismatch -- model reported 1 : {stated_val}, but "
+            f"target1 ({target}%) / stop-loss ({stop}%) actually gives 1 : {true_ratio}."
+        )
+    if true_ratio < 2.0:
+        notes.append(f"Risk:reward of 1 : {true_ratio} is below the 1:2.5 minimum the prompt requires.")
+    return notes
+
+
+def _fetch_weekly_technicals(ticker):
+    """
+    Independently computes weekly SMA20/SMA50, 14-period weekly RSI, and
+    MACD(12,26,9) from real OHLC history (via the same main.fetch_data path
+    already used for the live price), so the email can confirm -- rather
+    than just trust -- the LLM's implicit claim that the stock satisfies
+    the prompt's technical filters (price above 20W/50W SMA, RSI below 70
+    and rising, bullish MACD).
+
+    Returns a dict of computed values, {'insufficient_history': True, ...}
+    if there isn't enough price history for a reliable 50-week SMA (~350+
+    trading days), or None if the fetch/resample fails outright -- callers
+    should treat both of those as "unverifiable", not "fails the check".
+    """
+    try:
+        df = main.fetch_data(ticker)
+        if df is None or len(df) < 30 or "close" not in df.columns:
+            return None
+
+        if not isinstance(df.index, pd.DatetimeIndex):
+            date_col = next((c for c in df.columns if c.lower() == "date"), None)
+            if date_col is None:
+                return None
+            df = df.set_index(pd.to_datetime(df[date_col]))
+
+        close = df["close"].dropna()
+        if len(close) < 30:
+            return None
+
+        weekly_close = close.resample("W").last().dropna()
+        if len(weekly_close) < 55:
+            result = {"insufficient_history": True, "weeks_available": len(weekly_close)}
+            if len(weekly_close) >= 20:
+                result["sma20w"] = round(float(weekly_close.rolling(20).mean().iloc[-1]), 2)
+            return result
+
+        sma20w = weekly_close.rolling(20).mean()
+        sma50w = weekly_close.rolling(50).mean()
+
+        delta = weekly_close.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+
+        ema12 = weekly_close.ewm(span=12, adjust=False).mean()
+        ema26 = weekly_close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+
+        rsi_now = rsi.iloc[-1]
+        rsi_prev = rsi.iloc[-3] if len(rsi) > 3 else None
+
+        return {
+            "insufficient_history": False,
+            "latest_close": round(float(weekly_close.iloc[-1]), 2),
+            "sma20w": round(float(sma20w.iloc[-1]), 2),
+            "sma50w": round(float(sma50w.iloc[-1]), 2),
+            "rsi14w": round(float(rsi_now), 1) if pd.notna(rsi_now) else None,
+            "rsi14w_prev": round(float(rsi_prev), 1) if rsi_prev is not None and pd.notna(rsi_prev) else None,
+            "macd": round(float(macd_line.iloc[-1]), 3),
+            "macd_signal": round(float(signal_line.iloc[-1]), 3),
+        }
+    except Exception as e:
+        main.log.warning(f"Could not compute weekly technicals for '{ticker}': {e}")
+        return None
+
+
+def _verify_technicals(stock):
+    """
+    Compares the prompt's mandatory technical filters (price above 20W/50W
+    SMA, RSI below 70 and rising, bullish MACD) against indicators computed
+    from real price history, instead of trusting the LLM's implicit claim
+    that the stock satisfies them. Returns a list of warning strings (empty
+    if everything checks out or there wasn't enough data to check at all).
+    """
+    ticker = (stock.get("ticker") or "").strip()
+    if not ticker:
+        return ["No ticker provided -- technicals could not be verified."]
+
+    tech = _fetch_weekly_technicals(ticker)
+    if tech is None:
+        return ["Technicals could not be independently verified (price history fetch failed)."]
+    if tech.get("insufficient_history"):
+        return [
+            f"Only {tech.get('weeks_available')} weeks of price history available -- "
+            "not enough to verify the 50-week SMA; technical claims are unverified."
+        ]
+
+    notes = []
+    price = tech["latest_close"]
+    if price < tech["sma20w"]:
+        notes.append(f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.")
+    if price < tech["sma50w"]:
+        notes.append(f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.")
+
+    if tech["rsi14w"] is not None:
+        if tech["rsi14w"] >= 70:
+            notes.append(f"Weekly RSI is {tech['rsi14w']} (>=70, overbought) -- contradicts the 'RSI below 70' requirement.")
+        if tech.get("rsi14w_prev") is not None and tech["rsi14w"] < tech["rsi14w_prev"]:
+            notes.append(f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.")
+
+    if tech["macd"] < tech["macd_signal"]:
+        notes.append("MACD line is currently below its signal line -- no bullish crossover in effect right now.")
+
+    return notes
+
+
+def _verify_sanity_bounds(stock):
+    """
+    Flags LLM outputs that are structurally valid JSON but numerically
+    implausible for a 3-5 month swing trade. These aren't things live data
+    can confirm or deny -- just guardrails against an obviously runaway or
+    malformed number slipping through unnoticed.
+    """
+    notes = []
+
+    conf = _parse_first_number(stock.get("confidence_score"))
+    if conf is None:
+        notes.append("Confidence score missing or unparseable.")
+    elif not (0 <= conf <= 10):
+        notes.append(f"Confidence score {conf} is outside the expected 0-10 range.")
+
+    alloc = _parse_max_number(stock.get("allocation_pct"))
+    if alloc is not None and alloc > 15:
+        notes.append(f"Allocation up to {alloc}% in a single stock is a large concentration for one position -- double-check position sizing.")
+
+    upside = _parse_first_number(stock.get("upside_target_pct"))
+    if upside is not None and upside > 60:
+        notes.append(f"Upside target of {upside}% in a 3-5 month window is unusually aggressive -- treat as a stretch case, not a base case.")
+
+    risk_level = (stock.get("risk_level") or "").strip().lower()
+    if risk_level not in ("medium", "high"):
+        notes.append(f"Risk level '{stock.get('risk_level')}' is not one of the expected 'Medium'/'High' values.")
+
+    return notes
+
+
+def _verify_stock_claims(stocks):
+    """
+    Runs every independent check above against each stock the LLM returned
+    and attaches the results as stock['_verification_notes'] (a list of
+    strings), so the email shows exactly which claims are data-confirmed
+    and which are unverified or contradicted -- instead of presenting
+    everything with equal, unearned confidence.
+
+    This does NOT reject or filter stocks: a contradiction here is
+    information for the reader, not proof the trade idea is wrong (e.g. the
+    LLM's own live search may be more current than today's yfinance pull).
+    Mutates each stock dict in place and also returns the list.
+    """
+    for stock in stocks:
+        notes = []
+        notes += _verify_risk_reward(stock)
+        notes += _verify_technicals(stock)
+        notes += _verify_sanity_bounds(stock)
+        if not stock.get("current_price_display"):
+            notes.append("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.")
+        stock["_verification_notes"] = notes
+    return stocks
+
+
+def _verification_display(stock):
+    """Renders stock['_verification_notes'] as HTML for the email table --
+    a clean green check if nothing was flagged, or an itemized warning list
+    if something was."""
+    notes = stock.get("_verification_notes") or []
+    if not notes:
+        return '<span style="color:#2F5233;font-weight:700;">Verified -- no contradictions found</span>'
+    items = "".join(f'<div style="margin-top:3px;color:#8B2E2E;">- {html.escape(n)}</div>' for n in notes)
+    return f'<span style="color:#8B2E2E;font-weight:700;">{len(notes)} item(s) to check:</span>{items}'
+
+
 def _confidence_display(score):
     """Turns a 0-10 confidence_score into '⭐⭐⭐⭐⭐ (8.8/10)' -- 5 stars max,
     filled proportionally (score/2, rounded), score shown to 1 decimal."""
@@ -677,6 +941,7 @@ def render_stock_table_html(stocks):
         row("Target 2 (T2) %", "target2_pct"),
         row("Recent Top Buyers (FII/DII)", "top_buyers"),
         row("Broker Recommendations", "broker_recommendations"),
+        raw_row("Data Verification", _verification_display),
     ])
 
     rationale_items = "".join(
@@ -924,6 +1189,7 @@ def run():
     stocks = _parse_analysis_json(analysis)
     if stocks:
         stocks = _attach_live_prices(stocks)
+        stocks = _verify_stock_claims(stocks)
         analysis_html = render_stock_table_html(stocks)
     else:
         # Model didn't return parseable JSON despite instructions -- don't
