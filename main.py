@@ -1111,6 +1111,119 @@ def get_conviction_rating(score):
     }
 
 
+def _signal_direction(score, high, low):
+    """
+    Buckets a 0-100-ish score into 'bullish' / 'neutral' / 'bearish'.
+    high/low should match whatever thresholds that score's own display
+    already uses elsewhere (get_signal's 80/50 for tech_score,
+    build_fundamentals_html's 70/40 for fund_score) so this reads the
+    same signal the reader already sees, rather than inventing a new
+    scale.
+    """
+    if score is None:
+        return None
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        return None
+    if score >= high:
+        return "bullish"
+    if score < low:
+        return "bearish"
+    return "neutral"
+
+
+def compute_signal_confirmation(tech_score, fund_score, sentiment_score, sentiment_label):
+    """
+    Cross-checks the technical score against the fundamentals score --
+    and, as a softer secondary check, against news sentiment -- so a
+    stock with strong technicals but red-flag fundamentals (or vice
+    versa) doesn't reach the reader looking like an unqualified
+    high-conviction pick just because calculate_combined_score blended
+    the disagreement away into one number.
+
+    This is deliberately independent of calculate_combined_score's own
+    weighting: the point is to catch disagreement BEFORE blending can
+    hide it, not to re-derive the blend.
+
+    Returns a dict:
+      status: "confirmed" / "mixed" / "conflicted" / "unknown"
+      cap_conviction: True if the conviction rating should be capped
+        (technicals and fundamentals actively point opposite ways)
+      label: short display label
+      detail: one-sentence explanation for display
+    """
+    tech_dir = _signal_direction(tech_score, 80, 50)   # matches get_signal's own thresholds
+    fund_dir = _signal_direction(fund_score, 70, 40)   # matches build_fundamentals_html's own thresholds
+
+    sent_dir = None
+    if sentiment_label != "Data Unavailable" and sentiment_score is not None:
+        sent_dir = _signal_direction(sentiment_score, 60, 40)
+
+    hard_conflict = (
+        tech_dir is not None and fund_dir is not None and
+        ((tech_dir == "bullish" and fund_dir == "bearish") or (tech_dir == "bearish" and fund_dir == "bullish"))
+    )
+    if hard_conflict:
+        return {
+            "status": "conflicted",
+            "cap_conviction": True,
+            "label": "⚠ Conflicting Signals",
+            "detail": (
+                f"Technicals read {tech_dir} (score {tech_score}) but fundamentals read "
+                f"{fund_dir} (score {fund_score}/100) -- treat as unresolved rather than "
+                f"a confirmed setup until one side is confirmed by the next data update."
+            ),
+        }
+
+    soft_conflict = (
+        tech_dir is not None and sent_dir is not None and
+        ((tech_dir == "bullish" and sent_dir == "bearish") or (tech_dir == "bearish" and sent_dir == "bullish"))
+    )
+    if soft_conflict:
+        return {
+            "status": "mixed",
+            "cap_conviction": False,
+            "label": "◐ Mixed Confirmation",
+            "detail": (
+                f"Technicals read {tech_dir} but recent news sentiment reads "
+                f"{sentiment_label.lower()} -- a secondary disagreement, not a hard conflict "
+                f"with fundamentals."
+            ),
+        }
+
+    if tech_dir is None or fund_dir is None:
+        return {"status": "unknown", "cap_conviction": False, "label": None, "detail": None}
+
+    return {
+        "status": "confirmed",
+        "cap_conviction": False,
+        "label": "✅ Confirmed",
+        "detail": f"Technicals and fundamentals both read {tech_dir}.",
+    }
+
+
+def build_signal_confirmation_html(confirmation):
+    if not confirmation or not confirmation.get("label"):
+        return ""
+    status = confirmation["status"]
+    if status == "conflicted":
+        color, bg, border = "#8B2E2E", "#fff7f7", "#f5c2c7"
+    elif status == "mixed":
+        color, bg, border = "#A6812F", "#fdf3d9", "#f0dca0"
+    else:
+        color, bg, border = "#047857", "#dcfce7", "#86efac"
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding:6px 0;">
+                                    <div style="padding:8px 10px;border-radius:6px;background:{bg};border:1px solid {border};">
+                                        <strong style="color:{color};">Signal Confirmation: {html.escape(confirmation['label'])}</strong>
+                                        <div style="color:#475569;margin-top:3px;font-size:12px;">{html.escape(confirmation['detail'])}</div>
+                                    </div>
+                                </td>
+                            </tr>"""
+
+
 def _safe_float(value):
     try:
         numeric_value = float(value)
@@ -1711,7 +1824,20 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         risk_data["recommended_entry"] = recommended_entry
         risk_data["recommended_entry_label"] = recommended_entry.replace("_", " ").title()
         risk_data["recommended_buy_level"] = risk_data["buy_levels"][recommended_entry]
-        conviction_rating = get_conviction_rating(total_score)
+
+        signal_confirmation = compute_signal_confirmation(tech_score, fund_score, sentiment_score, sentiment_label)
+        if signal_confirmation["cap_conviction"]:
+            # Technicals and fundamentals actively disagree -- don't let the
+            # blended total_score alone produce a "High"/"Elite" conviction
+            # rating that reads as an unqualified confirmed setup. Cap the
+            # displayed rating at the "Mixed" tier (score 59 sits inside
+            # get_conviction_rating's 45-59 "Mixed" bucket) without touching
+            # total_score itself, since that's still used for sorting/signal.
+            conviction_rating = get_conviction_rating(min(total_score, 59))
+        else:
+            conviction_rating = get_conviction_rating(total_score)
+        conviction_rating["capped"] = signal_confirmation["cap_conviction"]
+        conviction_rating["confirmation"] = signal_confirmation
 
         # "Swing setup" tag: near a 20-day breakout with a confirmed strong
         # trend (ADX >= 25) mirrors the recurring high-conviction setups
@@ -1858,6 +1984,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                 <td style="padding:6px 0;"><strong>Technical Score</strong><div style="color:#0f172a;margin-top:4px;">{tech_score}</div></td>
                                 <td style="padding:6px 0;"><strong>Sentiment</strong><div style="color:{sentiment_color};margin-top:4px;">{"Data Unavailable" if sentiment_label == "Data Unavailable" else f"{sentiment_score} ({sentiment_label})"}</div></td>
                             </tr>
+                            {build_signal_confirmation_html(signal_confirmation)}
                             <tr>
                                 <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
                                 <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
@@ -1931,6 +2058,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
             "swing_setup": swing_setup,
             "day_change_pct": prev_close_change_pct,
             "trend": market_context.get("trend"),
+            "signal_confirmation_status": signal_confirmation["status"],
         }
 
         print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']} | Risk: {risk_meter['label']}")
