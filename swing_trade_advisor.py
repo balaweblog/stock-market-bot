@@ -266,52 +266,20 @@ def generate_analysis(prompt):
     main.log.info(f"Swing trade advisor using LLM backend: {backend}")
 
     if backend == "groq":
-        # groq/compound is Groq's free, tool-using system: same API key/client
-        # as the plain llama model, but it can autonomously trigger a live web
-        # search (via Tavily under the hood) when the query needs current
-        # info -- which is exactly what this "use latest data" prompt needs.
-        # It's slower and uses more of the free-tier quota than a plain chat
-        # completion (it may make several web searches per request under the
-        # hood), but for a once-a-run email that's a good trade.
-        #
-        # groq/compound orchestrates via meta-llama/llama-4-scout, whose free
-        # tier is capped at 30,000 tokens/minute org-wide. A 429 here is
-        # usually just that minute's shared quota being briefly exhausted --
-        # not a real outage -- so retry a couple of times with the wait time
-        # Groq's own error message reports before giving up on it.
         result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3)
         if result is not None:
             return result
 
-        # groq/compound is unavailable/overloaded. Community reports (Groq's
-        # own forum) show the free tier throwing bare "Request too large"
-        # 413s on `compound` even for tiny prompts -- this isn't reliably
-        # about payload size, it's compound's heavier tool-orchestration
-        # overhead hitting the free tier's ceiling. groq/compound-mini uses
-        # a lighter underlying model with less orchestration overhead, so
-        # it's worth one more attempt on the same free-tier key before
-        # spending a separate service's (Gemini's) quota.
         main.log.info("groq/compound unavailable -- trying groq/compound-mini...")
         result = _try_groq_compound_model(prompt, "groq/compound-mini", max_attempts=2)
         if result is not None:
             return result
 
-        # Both compound variants are still rate-limited/unavailable -- and
-        # per observed logs, that's not a transient blip: groq/compound's
-        # own internal search/planning loop can burn most of its shared
-        # 30,000 TPM budget on a single logical request, so retrying within
-        # the compound family doesn't reliably help. Try Tavily directly
-        # (the same search backend compound uses, but on its own separate
-        # free quota) paired with a plain, non-orchestrating Groq call --
-        # genuine live grounding without compound's overhead.
         today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
         result = _try_tavily_plus_groq(prompt, today_str)
         if result is not None:
             return result
 
-        # Tavily/plain-Groq wasn't available either. Try Gemini + Google
-        # Search grounding next, since that's a genuinely separate free-tier
-        # quota from both Groq's and Tavily's.
         if main.gemini_client is None and not (os.getenv("GOOGLE_API_KEY") and main.genai is not None):
             main.log.info(
                 "Gemini live-search fallback skipped: GOOGLE_API_KEY is not "
@@ -323,8 +291,6 @@ def generate_analysis(prompt):
             if grounded is not None:
                 return grounded
 
-        # Last resort (still "live-ish"): plain (non-search) Groq model, so
-        # the run still produces *something* rather than giving up entirely.
         try:
             response = main.groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
@@ -351,9 +317,6 @@ def generate_analysis(prompt):
             return grounded
         try:
             response = main.gemini_client.models.generate_content(
-                # See note in _try_gemini_grounded below: pinned dated model
-                # IDs can get gated/retired without warning, so use Google's
-                # auto-updated alias instead.
                 model="gemini-flash-latest",
                 contents=prompt,
             )
@@ -361,17 +324,6 @@ def generate_analysis(prompt):
         except Exception as e:
             main.log.error(f"Gemini swing-trade generation failed: {e}")
 
-    # Absolute last resort: the local Qwen2.5-1.5B model. Previously this
-    # branch only ran when `backend == "local"` -- i.e. only when neither
-    # GROQ_API_KEY nor GOOGLE_API_KEY was set at all. If Groq *was*
-    # configured (the common case) but every Groq/Gemini path above failed
-    # (rate limits, exhausted daily quota, no GOOGLE_API_KEY), the function
-    # fell straight through to `return None, [], False` without ever trying
-    # the local model -- even though it may already be loaded in memory.
-    # force_local=True here re-enters init_llm_generator() and skips
-    # straight to the local-model section regardless of which backend was
-    # originally selected, since we already know Groq/Gemini can't serve
-    # this request right now.
     local_backend = main.init_llm_generator(force_local=True)
     if local_backend == "local" and main.llm_pipeline is not None:
         text = _generate_local(prompt)
@@ -382,8 +334,6 @@ def generate_analysis(prompt):
 
 
 def _generate_local(prompt):
-    """Runs the prompt through the local Qwen2.5-1.5B pipeline. Returns the
-    generated text, or None if the local model isn't available or fails."""
     if main.llm_pipeline is None:
         return None
     try:
@@ -407,57 +357,29 @@ def _generate_local(prompt):
         main.log.error(f"Local swing-trade generation failed: {e}")
         return None
 
-    return None, [], False
-
 
 def _is_request_too_large(exc):
-    """True for Groq's 413 'Request Entity Too Large' -- a payload-size
-    failure, not a rate limit, so unlike a 429 it can't be fixed by waiting
-    and retrying the same request."""
     msg = str(exc)
     return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
 
 
 def _is_daily_quota_exceeded(exc):
-    """True for a Groq 429 that's specifically a 'tokens per day' (TPD)
-    limit, as opposed to the much shorter 'tokens per minute' (TPM) limit.
-    TPM resets within seconds and is worth retrying; TPD is an org-wide
-    daily budget that only resets after (per Groq's own error message)
-    potentially over an hour -- retrying it with a short backoff is
-    guaranteed to fail again and just wastes the run's time budget.
-    """
     msg = str(exc)
     return "tokens per day" in msg or "TPD" in msg
 
 
 def _parse_groq_retry_seconds(exc):
-    """Groq's 429 body includes a 'Please try again in 7.342s' hint -- pull
-    that out so retries wait the right amount instead of guessing."""
     match = re.search(r"try again in ([\d.]+)s", str(exc))
     if match:
         try:
-            return float(match.group(1)) + 0.5  # small buffer
+            return float(match.group(1)) + 0.5
         except ValueError:
             return None
     return None
 
 
 def _try_gemini_grounded(prompt):
-    """
-    Genuine live-search fallback: Gemini's free tier supports real Google
-    Search grounding (separate free-tier quota from Groq entirely), so this
-    is a real second live-data path, not just another training-data model.
-    Returns (text, sources, True) on success, or None if Gemini isn't
-    configured or the call fails -- callers should fall through to their
-    next option in that case.
-    """
     if main.gemini_client is None:
-        # main.init_llm_generator() only builds gemini_client when Gemini is
-        # chosen as the *primary* backend -- if GROQ_API_KEY was set, Groq
-        # wins that selection and the function returns before ever touching
-        # GOOGLE_API_KEY, so gemini_client stays None even when a valid
-        # GOOGLE_API_KEY exists. Build a client here on demand instead of
-        # silently giving up, so this fallback path actually gets used.
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key or main.genai is None:
             return None
@@ -470,9 +392,6 @@ def _try_gemini_grounded(prompt):
         from google.genai import types
         grounding_tool = types.Tool(google_search=types.GoogleSearch())
         response = main.gemini_client.models.generate_content(
-            # See note by the other generate_content calls: use Google's
-            # auto-updated alias instead of a pinned dated model ID that can
-            # get gated/retired for some accounts without warning.
             model="gemini-flash-latest",
             contents=prompt,
             config=types.GenerateContentConfig(tools=[grounding_tool]),
@@ -487,8 +406,6 @@ def _try_gemini_grounded(prompt):
                         sources.append((web.title or web.uri, web.uri))
         except Exception as e:
             main.log.warning(f"Could not extract Gemini grounding sources: {e}")
-        # Only report this as "live" if grounding actually fired -- Gemini
-        # may decide a query doesn't need a search and skip it.
         used_live = bool(sources)
         return response.text.strip(), sources, used_live
     except Exception as e:
@@ -497,12 +414,6 @@ def _try_gemini_grounded(prompt):
 
 
 def _extract_groq_sources(response):
-    """
-    Pulls (title, url) pairs out of groq/compound's executed_tools field so
-    the email can show what was actually searched -- lets the reader spot-
-    check the model's claims instead of taking them on faith. Defensive
-    about attribute-vs-dict access since SDK response objects vary.
-    """
     def _get(obj, key):
         if obj is None:
             return None
@@ -526,16 +437,10 @@ def _extract_groq_sources(response):
 
 
 def _parse_analysis_json(text):
-    """Parses the compact JSON the LLM now returns (see build_prompt's
-    OUTPUT FORMAT). Models sometimes still wrap it in ```json fences or add
-    stray text around it despite instructions -- handle both. Returns a
-    list of stock dicts, or None if nothing usable could be parsed."""
     cleaned = _strip_code_fences(text)
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        # Fallback: grab the first {...} span in case the model added any
-        # commentary before/after the JSON despite instructions not to.
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
             return None
@@ -550,14 +455,6 @@ def _parse_analysis_json(text):
 
 
 def _fetch_current_price(ticker):
-    """
-    Fetches the latest live close price for a ticker via the same
-    yfinance path main.py uses for its own daily report (main.fetch_data),
-    so the Swing Trade Research Note shows a real, current quote rather
-    than a price the LLM may have guessed or pulled from stale training
-    data. Returns (price_float, currency_symbol) or (None, None) on any
-    failure -- callers should treat that as "unavailable", not an error.
-    """
     ticker = (ticker or "").strip()
     if not ticker:
         return None, None
@@ -575,13 +472,6 @@ def _fetch_current_price(ticker):
 
 
 def _attach_live_prices(stocks):
-    """
-    Mutates each stock dict in place, adding a 'current_price_display'
-    string (e.g. '₹2,845.30' or '$212.40') built from a live yfinance
-    quote keyed off the 'ticker' field the LLM was asked to supply. Falls
-    back to '—' (rendered as such in the table) if the ticker is missing
-    or the live fetch fails, rather than showing an unverified figure.
-    """
     for stock in stocks:
         price, currency_symbol = _fetch_current_price(stock.get("ticker"))
         if price is not None:
@@ -591,30 +481,11 @@ def _attach_live_prices(stocks):
     return stocks
 
 
-# -----------------------------
-# Independent verification layer
-#
-# Everything above this point either comes straight from the LLM's JSON or
-# is a live quote used to *display* a price. Nothing so far actually checks
-# whether the LLM's claims are true. The functions below re-derive the
-# things that can be re-derived from real data (arithmetic, price history)
-# and flag -- never silently fix or hide -- anything that doesn't hold up.
-# This cannot make the recommendation itself "correct" (that depends on
-# unknowable future price action), it can only stop unverified or
-# self-contradictory claims from being presented with unearned confidence.
-# -----------------------------
-
 def _parse_first_number(value):
-    """Extracts the first numeric value found in a string like '8%', '5-10%',
-    '1 : 2.5', or a bare float/int. Returns None if nothing numeric is found."""
     if value is None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
-    # No sign-matching: these fields (%, ratios, scores) are never
-    # legitimately negative, and a leading '-' is far more likely to be a
-    # range separator (e.g. '5-10%') than a minus sign -- matching it as a
-    # sign would silently misread '5-10%' as the two numbers 5 and -10.
     match = re.search(r"\d*\.?\d+", str(value))
     if not match:
         return None
@@ -625,9 +496,6 @@ def _parse_first_number(value):
 
 
 def _parse_max_number(value):
-    """Like _parse_first_number, but for ranges like '5-10%' returns the
-    upper bound -- used for concentration-risk checks where the worst case
-    (not the first number encountered) is what matters."""
     if value is None:
         return None
     numbers = re.findall(r"\d*\.?\d+", str(value))
@@ -640,15 +508,6 @@ def _parse_max_number(value):
 
 
 def _verify_risk_reward(stock):
-    """
-    Recomputes risk_reward_ratio from stop_loss_pct/target1_pct instead of
-    trusting the LLM's self-reported arithmetic -- the prompt asks the model
-    to verify this itself, but LLMs are unreliable at exact arithmetic even
-    when explicitly instructed to check it, so it needs a real check on the
-    Python side. Sets stock['risk_reward_ratio_verified'] to the recomputed
-    '1 : X' string regardless of outcome, and returns a list of warning
-    strings (empty if the model's reported ratio matches).
-    """
     notes = []
     stop = _parse_first_number(stock.get("stop_loss_pct"))
     target = _parse_first_number(stock.get("target1_pct"))
@@ -681,19 +540,6 @@ def _verify_risk_reward(stock):
 
 
 def _fetch_weekly_technicals(ticker):
-    """
-    Independently computes weekly SMA20/SMA50, 14-period weekly RSI, and
-    MACD(12,26,9) from real OHLC history (via the same main.fetch_data path
-    already used for the live price), so the email can confirm -- rather
-    than just trust -- the LLM's implicit claim that the stock satisfies
-    the prompt's technical filters (price above 20W/50W SMA, RSI below 70
-    and rising, bullish MACD).
-
-    Returns a dict of computed values, {'insufficient_history': True, ...}
-    if there isn't enough price history for a reliable 50-week SMA (~350+
-    trading days), or None if the fetch/resample fails outright -- callers
-    should treat both of those as "unverifiable", not "fails the check".
-    """
     try:
         df = main.fetch_data(ticker)
         if df is None or len(df) < 30 or "close" not in df.columns:
@@ -749,13 +595,6 @@ def _fetch_weekly_technicals(ticker):
 
 
 def _verify_technicals(stock):
-    """
-    Compares the prompt's mandatory technical filters (price above 20W/50W
-    SMA, RSI below 70 and rising, bullish MACD) against indicators computed
-    from real price history, instead of trusting the LLM's implicit claim
-    that the stock satisfies them. Returns a list of warning strings (empty
-    if everything checks out or there wasn't enough data to check at all).
-    """
     ticker = (stock.get("ticker") or "").strip()
     if not ticker:
         return ["No ticker provided -- technicals could not be verified."]
@@ -789,12 +628,6 @@ def _verify_technicals(stock):
 
 
 def _verify_sanity_bounds(stock):
-    """
-    Flags LLM outputs that are structurally valid JSON but numerically
-    implausible for a 3-5 month swing trade. These aren't things live data
-    can confirm or deny -- just guardrails against an obviously runaway or
-    malformed number slipping through unnoticed.
-    """
     notes = []
 
     conf = _parse_first_number(stock.get("confidence_score"))
@@ -819,18 +652,6 @@ def _verify_sanity_bounds(stock):
 
 
 def _verify_stock_claims(stocks):
-    """
-    Runs every independent check above against each stock the LLM returned
-    and attaches the results as stock['_verification_notes'] (a list of
-    strings), so the email shows exactly which claims are data-confirmed
-    and which are unverified or contradicted -- instead of presenting
-    everything with equal, unearned confidence.
-
-    This does NOT reject or filter stocks: a contradiction here is
-    information for the reader, not proof the trade idea is wrong (e.g. the
-    LLM's own live search may be more current than today's yfinance pull).
-    Mutates each stock dict in place and also returns the list.
-    """
     for stock in stocks:
         notes = []
         notes += _verify_risk_reward(stock)
@@ -843,9 +664,6 @@ def _verify_stock_claims(stocks):
 
 
 def _verification_display(stock):
-    """Renders stock['_verification_notes'] as HTML for the email table --
-    a clean green check if nothing was flagged, or an itemized warning list
-    if something was."""
     notes = stock.get("_verification_notes") or []
     if not notes:
         return '<span style="color:#2F5233;font-weight:700;">Verified -- no contradictions found</span>'
@@ -854,8 +672,6 @@ def _verification_display(stock):
 
 
 def _confidence_display(score):
-    """Turns a 0-10 confidence_score into '⭐⭐⭐⭐⭐ (8.8/10)' -- 5 stars max,
-    filled proportionally (score/2, rounded), score shown to 1 decimal."""
     try:
         s = float(str(score).strip().rstrip("%"))
     except (TypeError, ValueError):
@@ -867,8 +683,6 @@ def _confidence_display(score):
 
 
 def _risk_level_badge(level):
-    """Colored pill for 'Medium'/'High' (falls back to a plain dash for
-    anything else so an unexpected LLM value never renders broken HTML)."""
     text = (level or "").strip()
     low = text.lower()
     if "high" in low:
@@ -884,12 +698,6 @@ def _risk_level_badge(level):
 
 
 def render_stock_table_html(stocks):
-    """Builds the styled HTML table locally from parsed stock data, instead
-    of asking the LLM to reproduce the ~7KB inline-styled template in every
-    request. This is what previously made the groq/compound prompt large
-    enough to trip Groq's per-request token budget (413 Request Too Large)
-    -- the template itself, not the actual analysis content, was the bulk
-    of the payload."""
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     a = stocks[0] if len(stocks) > 0 else {}
     b = stocks[1] if len(stocks) > 1 else {}
@@ -911,9 +719,6 @@ def render_stock_table_html(stocks):
         )
 
     def raw_row(label, cell_html_fn):
-        """Like row(), but cell_html_fn(stock) returns ready-made HTML for
-        each cell instead of plain text -- used for the confidence stars
-        and the risk-level badge, which aren't safe to run through esc()."""
         cells = "".join(
             f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
             f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html_fn(stock) or "—"}</td>'
@@ -963,10 +768,6 @@ def render_stock_table_html(stocks):
 
 
 def _trade_execution_plan_html(stock, sans):
-    """Per-stock Action/Rule execution playbook. The rules themselves are a
-    fixed, generic scaling plan (not something the LLM is asked to invent),
-    with that stock's own T1/T2 substituted in wherever the rule refers to
-    a specific target."""
     name = html.escape(str(stock.get("name") or "").strip() or "This stock")
     t1 = str(stock.get("target1_pct") or "").strip() or "Target 1"
     t2 = str(stock.get("target2_pct") or "").strip() or "Target 2"
@@ -1001,8 +802,6 @@ def _trade_execution_plan_html(stock, sans):
 
 
 def _strip_code_fences(text):
-    """Models occasionally wrap the requested HTML in ```html ... ``` even
-    when told not to -- strip that off so it renders as HTML, not literal text."""
     cleaned = text.strip()
     if cleaned.startswith("```"):
         lines = cleaned.split("\n")
@@ -1014,10 +813,6 @@ def _strip_code_fences(text):
     return cleaned
 
 
-# -----------------------------
-# Email (reuses main.py's credentials/config, custom subject + wrapper
-# since this isn't the daily stock report)
-# -----------------------------
 def _build_sources_html(sources):
     if not sources:
         return ""
@@ -1170,13 +965,6 @@ def run():
         sys.exit(1)
 
     if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        # Only groq/compound actually hits the live web. Every other path
-        # (Groq's plain llama fallback, Gemini, or the local model) is pure
-        # training-data reasoning with no real-time prices/news -- exactly
-        # the stale output this run is meant to avoid. Refuse to email it
-        # rather than silently sending non-verified figures. Set
-        # REQUIRE_LIVE_DATA=false to explicitly allow a stale-data fallback
-        # email instead of aborting.
         main.log.error(
             "Live web search was not used for this run (Groq's live-search "
             "model was unavailable or the backend fell back to Gemini/local), "
@@ -1192,9 +980,6 @@ def run():
         stocks = _verify_stock_claims(stocks)
         analysis_html = render_stock_table_html(stocks)
     else:
-        # Model didn't return parseable JSON despite instructions -- don't
-        # silently drop the content. Show it as plain text so the run still
-        # produces something reviewable instead of a blank/broken email.
         main.log.error(
             "Could not parse JSON from LLM output; falling back to raw text display."
         )
@@ -1217,31 +1002,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
-# -----------------------------
-# Real-time grounding status
-# -----------------------------
-# groq/compound / groq/compound-mini: autonomous live web search
-# (Tavily-backed under the hood) via the same GROQ_API_KEY as main.py's own
-# calls. executed_tools[].search_results gives back the actual URLs used --
-# surfaced in the email under "Sources checked". This is the first path
-# tried since main.init_llm_generator() picks Groq first when configured.
-# In practice, compound's internal search/planning loop can burn through
-# most of its shared 30,000 TPM budget on a single request on the free
-# tier, so treat both compound variants as opportunistic, not reliable.
-#
-# Tavily direct + plain Groq synthesis (_try_tavily_plus_groq): fetches
-# real search results via Tavily's own API directly (TAVILY_API_KEY, free
-# tier, 1,000 searches/month, no card -- entirely separate from Groq's and
-# Gemini's quotas), then hands them to a plain (non-orchestrating) Groq
-# model call. This is genuinely live-grounded but doesn't carry compound's
-# expensive internal tool-orchestration overhead, so it's the more reliable
-# of the two Groq-adjacent paths on the free tier.
-#
-# Gemini grounded (_try_gemini_grounded): Google Search grounding via
-# GOOGLE_API_KEY, a separate free-tier quota from both Groq and Tavily.
-#
-# Plain Groq / local fallback: non-grounded chat completions with no live
-# internet access -- pure training-data reasoning. Only reached if every
-# live-search path above fails, and even then REQUIRE_LIVE_DATA=true (the
-# default) aborts the run rather than emailing that unverified output.
