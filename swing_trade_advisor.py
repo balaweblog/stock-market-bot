@@ -508,13 +508,18 @@ def _parse_max_number(value):
 
 
 def _verify_risk_reward(stock):
+    """
+    Returns a list of (note_text, severity) tuples. severity is "hard" when
+    the independently recomputed number actually contradicts the model's
+    claim, "soft" when the claim simply couldn't be checked either way.
+    """
     notes = []
     stop = _parse_first_number(stock.get("stop_loss_pct"))
     target = _parse_first_number(stock.get("target1_pct"))
     stated_ratio = stock.get("risk_reward_ratio")
 
     if stop is None or target is None or stop == 0:
-        notes.append("Could not verify risk:reward -- stop-loss or target1 missing/unparseable.")
+        notes.append(("Could not verify risk:reward -- stop-loss or target1 missing/unparseable.", "soft"))
         stock["risk_reward_ratio_verified"] = None
         return notes
 
@@ -525,17 +530,17 @@ def _verify_risk_reward(stock):
     stated_val = float(stated_match.group(1)) if stated_match else None
 
     if stated_val is None:
-        notes.append(
+        notes.append((
             f"Reported risk:reward '{stated_ratio}' could not be parsed -- "
-            f"recomputed value is 1 : {true_ratio}."
-        )
+            f"recomputed value is 1 : {true_ratio}.", "soft"
+        ))
     elif abs(stated_val - true_ratio) > 0.15:
-        notes.append(
+        notes.append((
             f"Risk:reward mismatch -- model reported 1 : {stated_val}, but "
-            f"target1 ({target}%) / stop-loss ({stop}%) actually gives 1 : {true_ratio}."
-        )
+            f"target1 ({target}%) / stop-loss ({stop}%) actually gives 1 : {true_ratio}.", "hard"
+        ))
     if true_ratio < 2.0:
-        notes.append(f"Risk:reward of 1 : {true_ratio} is below the 1:2.5 minimum the prompt requires.")
+        notes.append((f"Risk:reward of 1 : {true_ratio} is below the 1:2.5 minimum the prompt requires.", "hard"))
     return notes
 
 
@@ -595,58 +600,155 @@ def _fetch_weekly_technicals(ticker):
 
 
 def _verify_technicals(stock):
+    """Returns a list of (note_text, severity) tuples -- see _verify_risk_reward."""
     ticker = (stock.get("ticker") or "").strip()
     if not ticker:
-        return ["No ticker provided -- technicals could not be verified."]
+        return [("No ticker provided -- technicals could not be verified.", "soft")]
 
     tech = _fetch_weekly_technicals(ticker)
     if tech is None:
-        return ["Technicals could not be independently verified (price history fetch failed)."]
+        return [("Technicals could not be independently verified (price history fetch failed).", "soft")]
     if tech.get("insufficient_history"):
-        return [
+        return [(
             f"Only {tech.get('weeks_available')} weeks of price history available -- "
-            "not enough to verify the 50-week SMA; technical claims are unverified."
-        ]
+            "not enough to verify the 50-week SMA; technical claims are unverified.", "soft"
+        )]
 
     notes = []
     price = tech["latest_close"]
     if price < tech["sma20w"]:
-        notes.append(f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.")
+        notes.append((f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.", "hard"))
     if price < tech["sma50w"]:
-        notes.append(f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.")
+        notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.", "hard"))
 
     if tech["rsi14w"] is not None:
         if tech["rsi14w"] >= 70:
-            notes.append(f"Weekly RSI is {tech['rsi14w']} (>=70, overbought) -- contradicts the 'RSI below 70' requirement.")
+            notes.append((f"Weekly RSI is {tech['rsi14w']} (>=70, overbought) -- contradicts the 'RSI below 70' requirement.", "hard"))
         if tech.get("rsi14w_prev") is not None and tech["rsi14w"] < tech["rsi14w_prev"]:
-            notes.append(f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.")
+            notes.append((f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.", "soft"))
 
     if tech["macd"] < tech["macd_signal"]:
-        notes.append("MACD line is currently below its signal line -- no bullish crossover in effect right now.")
+        notes.append(("MACD line is currently below its signal line -- no bullish crossover in effect right now.", "hard"))
+
+    return notes
+
+
+def _fetch_fundamentals(ticker):
+    """
+    Fetches point-in-time fundamentals (debt/equity, ROE) plus a quarterly
+    revenue/net-income series directly via yfinance -- independent of
+    whatever the LLM claimed about the company's financials. Returns a
+    dict (fields may be None if unavailable) or None if the fetch fails
+    entirely / yfinance isn't installed.
+    """
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return None
+    try:
+        import yfinance as yf
+    except ImportError:
+        main.log.warning("yfinance not installed -- fundamentals verification skipped.")
+        return None
+    try:
+        yt = yf.Ticker(ticker)
+        info = yt.info or {}
+        result = {
+            "debt_to_equity": info.get("debtToEquity"),
+            "roe": info.get("returnOnEquity"),
+            "revenue_growth_yoy": None,
+            "profit_growth_yoy": None,
+        }
+        try:
+            qf = yt.quarterly_financials  # rows = line items, cols = quarter-end dates, most-recent first
+            if qf is not None and not qf.empty and qf.shape[1] >= 5:
+                revenue_row = next((r for r in qf.index if "total revenue" in r.lower()), None)
+                income_row = next((r for r in qf.index if r.lower() == "net income"), None)
+                if revenue_row is not None:
+                    latest, year_ago = qf.loc[revenue_row].iloc[0], qf.loc[revenue_row].iloc[4]
+                    if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                        result["revenue_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+                if income_row is not None:
+                    latest, year_ago = qf.loc[income_row].iloc[0], qf.loc[income_row].iloc[4]
+                    if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                        result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+        except Exception as e:
+            main.log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
+        return result
+    except Exception as e:
+        main.log.warning(f"Could not fetch fundamentals for '{ticker}': {e}")
+        return None
+
+
+def _verify_fundamentals(stock):
+    """
+    Independently checks the prompt's mandatory fundamentals filters
+    (low debt-to-equity, high/improving ROE, >=20% YoY revenue and
+    profit growth) against real data instead of trusting the model's
+    fundamental narrative. Returns a list of (note_text, severity) tuples.
+    """
+    ticker = (stock.get("ticker") or "").strip()
+    if not ticker:
+        return [("No ticker provided -- fundamentals could not be verified.", "soft")]
+
+    data = _fetch_fundamentals(ticker)
+    if data is None:
+        return [("Fundamentals could not be independently verified (data fetch failed).", "soft")]
+
+    notes = []
+
+    dte = data.get("debt_to_equity")
+    if dte is not None:
+        if dte > 100:
+            notes.append((f"Debt-to-equity is {dte:.0f}% -- elevated, contradicts the 'low debt-to-equity' requirement.", "hard"))
+    else:
+        notes.append(("Debt-to-equity not available from data provider -- unverified.", "soft"))
+
+    roe = data.get("roe")
+    if roe is not None:
+        roe_pct = roe * 100 if abs(roe) <= 1 else roe
+        if roe_pct < 10:
+            notes.append((f"ROE is {roe_pct:.1f}% -- weak, contradicts the 'high/improving ROCE/ROE' requirement.", "hard"))
+    else:
+        notes.append(("ROE not available from data provider -- unverified.", "soft"))
+
+    rev_g = data.get("revenue_growth_yoy")
+    if rev_g is not None:
+        if rev_g < 20:
+            notes.append((f"Revenue growth YoY is {rev_g}% -- below the 20% threshold the prompt requires.", "hard"))
+    else:
+        notes.append(("Revenue YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
+
+    profit_g = data.get("profit_growth_yoy")
+    if profit_g is not None:
+        if profit_g < 20:
+            notes.append((f"Net profit growth YoY is {profit_g}% -- below the 20% threshold the prompt requires.", "hard"))
+    else:
+        notes.append(("Net profit YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
     return notes
 
 
 def _verify_sanity_bounds(stock):
+    """Returns a list of (note_text, severity) tuples -- see _verify_risk_reward."""
     notes = []
 
     conf = _parse_first_number(stock.get("confidence_score"))
     if conf is None:
-        notes.append("Confidence score missing or unparseable.")
+        notes.append(("Confidence score missing or unparseable.", "soft"))
     elif not (0 <= conf <= 10):
-        notes.append(f"Confidence score {conf} is outside the expected 0-10 range.")
+        notes.append((f"Confidence score {conf} is outside the expected 0-10 range.", "soft"))
 
     alloc = _parse_max_number(stock.get("allocation_pct"))
     if alloc is not None and alloc > 15:
-        notes.append(f"Allocation up to {alloc}% in a single stock is a large concentration for one position -- double-check position sizing.")
+        notes.append((f"Allocation up to {alloc}% in a single stock is a large concentration for one position -- double-check position sizing.", "soft"))
 
     upside = _parse_first_number(stock.get("upside_target_pct"))
     if upside is not None and upside > 60:
-        notes.append(f"Upside target of {upside}% in a 3-5 month window is unusually aggressive -- treat as a stretch case, not a base case.")
+        notes.append((f"Upside target of {upside}% in a 3-5 month window is unusually aggressive -- treat as a stretch case, not a base case.", "soft"))
 
     risk_level = (stock.get("risk_level") or "").strip().lower()
     if risk_level not in ("medium", "high"):
-        notes.append(f"Risk level '{stock.get('risk_level')}' is not one of the expected 'Medium'/'High' values.")
+        notes.append((f"Risk level '{stock.get('risk_level')}' is not one of the expected 'Medium'/'High' values.", "soft"))
 
     return notes
 
@@ -656,30 +758,82 @@ def _verify_stock_claims(stocks):
         notes = []
         notes += _verify_risk_reward(stock)
         notes += _verify_technicals(stock)
+        notes += _verify_fundamentals(stock)
         notes += _verify_sanity_bounds(stock)
         if not stock.get("current_price_display"):
-            notes.append("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.")
+            notes.append(("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.", "soft"))
         stock["_verification_notes"] = notes
+        _adjust_confidence(stock, notes)
     return stocks
+
+
+def _adjust_confidence(stock, notes):
+    """
+    Derives an adjusted confidence score from the model's self-reported
+    one, penalizing it for what verification actually found: "hard"
+    contradictions (price below a required SMA, RSI failing the
+    threshold, risk:reward under the stated minimum, weak fundamentals)
+    cost more than "soft" ones (a claim that simply couldn't be checked
+    either way). This stops a high self-reported score from being shown
+    at face value when the independent checks disagree with it -- the
+    email displays the adjusted number as the headline figure, with the
+    model's original score and the reason for the gap shown alongside it.
+    """
+    original = _parse_first_number(stock.get("confidence_score"))
+    stock["confidence_score_original"] = original
+    if original is None:
+        stock["confidence_score_adjusted"] = None
+        return
+
+    hard_count = sum(1 for _, sev in notes if sev == "hard")
+    soft_count = sum(1 for _, sev in notes if sev == "soft")
+    penalty = hard_count * 0.8 + soft_count * 0.2
+    stock["confidence_score_adjusted"] = max(0.0, round(original - penalty, 1))
+    stock["_confidence_penalty_detail"] = f"{hard_count} contradiction(s), {soft_count} unverifiable item(s)"
 
 
 def _verification_display(stock):
     notes = stock.get("_verification_notes") or []
     if not notes:
         return '<span style="color:#2F5233;font-weight:700;">Verified -- no contradictions found</span>'
-    items = "".join(f'<div style="margin-top:3px;color:#8B2E2E;">- {html.escape(n)}</div>' for n in notes)
-    return f'<span style="color:#8B2E2E;font-weight:700;">{len(notes)} item(s) to check:</span>{items}'
+    hard = [n for n, sev in notes if sev == "hard"]
+    soft = [n for n, sev in notes if sev == "soft"]
+    header_bits = []
+    if hard:
+        header_bits.append(f"{len(hard)} contradiction(s)")
+    if soft:
+        header_bits.append(f"{len(soft)} unverifiable")
+    header = f'<span style="color:#8B2E2E;font-weight:700;">{", ".join(header_bits)}:</span>'
+    items = "".join(
+        f'<div style="margin-top:3px;color:{"#8B2E2E" if sev == "hard" else "#A6812F"};">- {html.escape(n)}</div>'
+        for n, sev in notes
+    )
+    return header + items
 
 
-def _confidence_display(score):
-    try:
-        s = float(str(score).strip().rstrip("%"))
-    except (TypeError, ValueError):
-        return None
+def _stars(s):
     s = max(0.0, min(10.0, s))
     filled = max(0, min(5, round(s / 2)))
-    stars = "⭐" * filled + "☆" * (5 - filled)
-    return f"{stars} ({s:.1f}/10)"
+    return "⭐" * filled + "☆" * (5 - filled)
+
+
+def _confidence_display(stock):
+    original = stock.get("confidence_score_original")
+    if original is None:
+        # Fallback for callers that haven't run verification (shouldn't happen
+        # in the normal render_stock_table_html flow, but keeps this safe).
+        original = _parse_first_number(stock.get("confidence_score"))
+        if original is None:
+            return None
+    adjusted = stock.get("confidence_score_adjusted")
+    if adjusted is None or adjusted == original:
+        return f"{_stars(original)} ({original:.1f}/10)"
+    detail = stock.get("_confidence_penalty_detail", "")
+    return (
+        f'{_stars(adjusted)} <strong>({adjusted:.1f}/10 adjusted)</strong>'
+        f'<div style="margin-top:2px;font-size:11px;color:#8A8F9C;">'
+        f'Model self-reported {original:.1f}/10 &middot; lowered for {html.escape(detail)}</div>'
+    )
 
 
 def _risk_level_badge(level):
@@ -732,7 +886,7 @@ def render_stock_table_html(stocks):
     rows = "".join([
         row("Name of the Stock", "name", bold=True),
         row("Current Market Price", "current_price_display", value_color="#14213D", bold=True),
-        raw_row("Confidence Score", lambda s: _confidence_display(s.get("confidence_score"))),
+        raw_row("Confidence Score", _confidence_display),
         raw_row("Risk Level", lambda s: _risk_level_badge(s.get("risk_level"))),
         row("Key Catalysts", "key_catalysts"),
         row("Risk : Reward", "risk_reward_ratio", value_color="#14213D", bold=True),
