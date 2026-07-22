@@ -1026,13 +1026,26 @@ def estimate_margin_and_rom(max_loss_inr, max_profit_inr, priced_legs, lot_size)
     return round(margin, 0), rom_pct
 
 
-_LEG_RE = re.compile(r"\b(Buy|Sell)\s+(\d+(?:\.\d+)?)\s*(CE|PE)\b", re.IGNORECASE)
-
+_LEG_RE = re.compile(r"\b(Buy|Sell)\s+(\d+(?:\.\d+)?)\s*(CE|PE|Call|Put)\b", re.IGNORECASE)
 
 def parse_legs(legs_text):
+    """Extracts (action, strike, type) triples from the model's free-text
+    'legs' field, normalizing Call -> CE and Put -> PE."""
     out = []
     for action, strike, opt_type in _LEG_RE.findall(legs_text or ""):
-        out.append({"action": action.capitalize(), "strike": float(strike), "type": opt_type.upper()})
+        opt_upper = opt_type.upper()
+        if opt_upper in ("CALL", "CE"):
+            normalized_type = "CE"
+        elif opt_upper in ("PUT", "PE"):
+            normalized_type = "PE"
+        else:
+            normalized_type = opt_upper
+
+        out.append({
+            "action": action.capitalize(),
+            "strike": float(strike),
+            "type": normalized_type
+        })
     return out
 
 
