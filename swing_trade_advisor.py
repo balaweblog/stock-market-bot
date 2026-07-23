@@ -318,6 +318,13 @@ def _try_groq_compound_model(prompt, model_name, max_attempts=3):
 def generate_analysis(prompt):
     backend = main.init_llm_generator()
     main.log.info(f"Swing trade advisor using LLM backend: {backend}")
+    # None of the non-search fallbacks below (plain Groq call, plain Gemini
+    # call, local model) can ever set used_live_search=True, so when
+    # REQUIRE_LIVE_DATA=true their output is discarded by run() regardless of
+    # whether they succeed. Skipping them in that case avoids spending
+    # further Groq token quota and, for the local model, several minutes of
+    # CPU inference on a result that can never be used.
+    require_live = os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true"
 
     if backend == "groq":
         result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3)
@@ -345,38 +352,51 @@ def generate_analysis(prompt):
             if grounded is not None:
                 return grounded
 
-        try:
-            response = main.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=1500,
-            )
-            return response.choices[0].message.content.strip(), [], False
-        except Exception as e2:
-            main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
-            if _is_daily_quota_exceeded(e2):
-                main.log.error(
-                    "Groq's daily token quota is exhausted for this org -- "
-                    "this is shared with main.py's per-stock reasoning calls "
-                    "(same GROQ_API_KEY, same default model). If main.py ran "
-                    "earlier today against many stocks, it may have used "
-                    "most of the 100k/day budget before this script ran. "
-                    "Falling back to the local model instead of retrying Groq."
+        if not require_live:
+            try:
+                response = main.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.4,
+                    max_tokens=1500,
                 )
+                return response.choices[0].message.content.strip(), [], False
+            except Exception as e2:
+                main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
+                if _is_daily_quota_exceeded(e2):
+                    main.log.error(
+                        "Groq's daily token quota is exhausted for this org -- "
+                        "this is shared with main.py's per-stock reasoning calls "
+                        "(same GROQ_API_KEY, same default model). If main.py ran "
+                        "earlier today against many stocks, it may have used "
+                        "most of the 100k/day budget before this script ran. "
+                        "Falling back to the local model instead of retrying Groq."
+                    )
 
     elif backend == "gemini" or main.gemini_client is not None:
         grounded = _try_gemini_grounded(prompt)
         if grounded is not None:
             return grounded
-        try:
-            response = main.gemini_client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt,
-            )
-            return response.text.strip(), [], False
-        except Exception as e:
-            main.log.error(f"Gemini swing-trade generation failed: {e}")
+        if not require_live:
+            try:
+                response = main.gemini_client.models.generate_content(
+                    model="gemini-flash-latest",
+                    contents=prompt,
+                )
+                return response.text.strip(), [], False
+            except Exception as e:
+                main.log.error(f"Gemini swing-trade generation failed: {e}")
+
+    if require_live:
+        main.log.info(
+            "Every live-search path failed this run, and REQUIRE_LIVE_DATA=true "
+            "means a non-search fallback's output would be discarded anyway -- "
+            "skipping the no-search Groq/Gemini call and the local model "
+            "entirely rather than spending remaining quota/CPU time on a "
+            "result that can't be used. Set REQUIRE_LIVE_DATA=false to allow "
+            "a clearly-labeled stale-data run instead."
+        )
+        return None, [], False
 
     local_backend = main.init_llm_generator(force_local=True)
     if local_backend == "local" and main.llm_pipeline is not None:
