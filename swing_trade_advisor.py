@@ -81,6 +81,11 @@ Stock Selection Strategy (choose one per stock):
 - Technical Swing Trade: a stock in a confirmed strong secular uptrend (above 50-WMA and 200-WMA) that has pulled back to a key support level (20-WMA, 38.2%/50% Fibonacci retracement, or horizontal support) with a clear reversal candlestick pattern.
 - Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play.
 
+Search Strategy -- this determines whether you find real candidates at all:
+- Do NOT rely mainly on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles. These recycle the same handful of already-popular names, which is exactly why they tend to already be overbought (failing the RSI<70 filter) or already priced in.
+- Instead, run systematic, screener-style searches, e.g.: "NSE stocks near 52-week high {today_str}", "Nifty 200 stocks above 50 week moving average", "NSE stocks net profit growth above 20% YoY Q4 FY26", "BSE midcap breakout volume {today_str}", "NSE weekly RSI below 70 rising stocks", plus separate searches per sector (IT, pharma, banking/NBFC, capital goods, auto & auto ancillaries, chemicals, defence, consumer) for standout recent quarterly results or technical setups.
+- Actually evaluate a meaningfully broad set of distinct candidates -- aim to individually check at least 15-20 different stocks across at least 4-5 different sectors against the mandatory parameters below before concluding that few or none qualify. Checking only one or two stocks (or re-checking the same stock you already checked) is not a broad enough search to justify a "nothing qualifies" conclusion.
+
 Mandatory analysis parameters:
 - Fundamentals: low debt-to-equity (or strong asset quality for financials), high/improving ROCE/ROE, and check for promoter/institutional buying last quarter.
 - Latest quarter: net profit and revenue growth both above 20% YoY, with margin expansion.
@@ -139,11 +144,15 @@ def build_retry_prompt(rejected):
         "Do not propose these same stocks again, and do not describe technicals "
         "(SMA position, RSI direction, MACD crossover) or growth figures in your "
         "rationale unless you are confident they are genuinely true right now -- "
-        "your rationale will be checked against real data again. Find different "
-        "candidates that actually satisfy every mandatory filter as of real current "
-        "data. If, after genuinely searching, no real stock satisfies all mandatory "
-        "filters right now, return fewer than two stocks (even an empty \"stocks\": "
-        "[] array) rather than forcing a pick that doesn't qualify."
+        "your rationale will be checked against real data again. Widen your net: "
+        "run NEW searches you have not already run (different sectors, different "
+        "screener-style queries per the Search Strategy above) rather than "
+        "re-examining the same small set of stocks with a different rationale. "
+        "Find different candidates that actually satisfy every mandatory filter "
+        "as of real current data. If, after genuinely searching broadly across "
+        "multiple sectors, no real stock satisfies all mandatory filters right "
+        "now, return fewer than two stocks (even an empty \"stocks\": [] array) "
+        "rather than forcing a pick that doesn't qualify."
     )
 
 
@@ -1215,6 +1224,10 @@ def run():
     all_rejected = []
     qualifying = []
     analysis = None
+    # Tickers rejected in an earlier attempt this run. The retry prompt asks
+    # the model not to propose these again, but it isn't reliable about
+    # honoring that -- so this is enforced here rather than trusted.
+    seen_rejected_tickers = set()
 
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         analysis, sources, used_live_search = generate_analysis(prompt)
@@ -1248,10 +1261,30 @@ def run():
             )
             break
 
+        if seen_rejected_tickers:
+            repeats = [
+                s for s in stocks
+                if (s.get("ticker") or "").strip().upper() in seen_rejected_tickers
+            ]
+            if repeats:
+                main.log.info(
+                    f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: ignoring "
+                    f"{len(repeats)} candidate(s) already rejected in an earlier "
+                    "attempt this run despite the retry prompt asking for different "
+                    "ones: " + ", ".join(s.get("name") or s.get("ticker") or "?" for s in repeats)
+                )
+                stocks = [
+                    s for s in stocks
+                    if (s.get("ticker") or "").strip().upper() not in seen_rejected_tickers
+                ]
+
         stocks = _attach_live_prices(stocks)
         stocks = _verify_stock_claims(stocks)
         qualifying, rejected = _split_qualifying(stocks)
         all_rejected.extend(rejected)
+        seen_rejected_tickers.update(
+            (s.get("ticker") or "").strip().upper() for s in rejected if s.get("ticker")
+        )
 
         if qualifying or not REQUIRE_QUALIFYING_STOCK:
             analysis_html = render_stock_table_html(qualifying or stocks)
