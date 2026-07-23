@@ -129,7 +129,7 @@ def build_retry_prompt(rejected):
     reject_lines = "\n".join(
         f"- {s.get('name')} ({s.get('ticker')}): " + "; ".join(_hard_contradictions(s))
         for s in rejected
-    ) or "- (no candidates were parseable)"
+    ) or "- (the previous attempt returned zero candidates)"
     return (
         f"{build_prompt()}\n\n"
         "IMPORTANT: a previous attempt at this exact request proposed stocks that "
@@ -494,7 +494,10 @@ def _parse_analysis_json(text):
         except json.JSONDecodeError:
             return None
     stocks = data.get("stocks") if isinstance(data, dict) else None
-    if not stocks or not isinstance(stocks, list):
+    # An empty list is a deliberate, valid "no qualifying candidate" response
+    # (the retry prompt explicitly asks for it) -- only a missing/non-list
+    # "stocks" field is an actual parse failure.
+    if not isinstance(stocks, list):
         return None
     return stocks
 
@@ -1238,7 +1241,7 @@ def run():
             sys.exit(1)
 
         stocks = _parse_analysis_json(analysis)
-        if not stocks:
+        if stocks is None:
             main.log.error(
                 "Could not parse JSON from LLM output; falling back to raw text display."
             )
