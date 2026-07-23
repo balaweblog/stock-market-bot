@@ -88,7 +88,7 @@ Mandatory analysis parameters:
 - Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
 - Risk/reward: minimum 1:2.5 based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss until it does rather than reporting a mismatched ratio.
 
-Provide TWO stocks: the highest-conviction one from any strategy above, and a second from a different strategy if a genuinely qualifying one exists.
+Provide a ranked LIST of every stock you can genuinely find, via real current search, that satisfies every mandatory filter above -- up to 10 stocks, highest-conviction first, favoring diversity across the four strategies where multiple genuinely qualify. Do NOT pad the list to hit a target count or to always show two: only include a stock if it truly satisfies every mandatory parameter with real, verifiable current data. It is normal and expected for very few stocks (even zero) to qualify on a given day -- return exactly as many as genuinely qualify, no more.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
 
@@ -113,7 +113,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "broker_recommendations": "e.g. 'Buy' with target X from a named brokerage, if known",
       "rationale": "Two to three sentences covering fundamental + technical + sentiment rationale and the key risk to watch"
     }},
-    {{ ... second stock, same fields ... }}
+    {{ ... repeat for each additional genuinely qualifying stock, same fields, up to 10 total ... }}
   ]
 }}
 """
@@ -920,45 +920,34 @@ def _risk_level_badge(level):
     )
 
 
-def render_stock_table_html(stocks):
-    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-    a = stocks[0] if len(stocks) > 0 else {}
-    b = stocks[1] if len(stocks) > 1 else {}
-
+def _render_one_stock_card(stock, idx, sans):
     def esc(v):
         v = "" if v is None else str(v).strip()
         return html.escape(v) if v else "—"
 
     def row(label, key, value_color="#14213D", bold=False):
         weight = "font-weight:700;" if bold else ""
-        cells = "".join(
-            f'<td style="padding:6px 10px;font-size:12px;{weight}font-family:{sans};'
-            f'color:{value_color};border-top:1px solid #EDEAE2;">{esc(stock.get(key))}</td>'
-            for stock in (a, b)
-        )
         return (
             f'<tr><td style="padding:6px 10px;font-size:12px;font-family:{sans};'
-            f'color:#4A5063;border-top:1px solid #EDEAE2;">{label}</td>{cells}</tr>'
+            f'color:#4A5063;border-top:1px solid #EDEAE2;width:38%;">{label}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;{weight}font-family:{sans};'
+            f'color:{value_color};border-top:1px solid #EDEAE2;">{esc(stock.get(key))}</td></tr>'
         )
 
     def raw_row(label, cell_html_fn):
-        cells = "".join(
-            f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
-            f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html_fn(stock) or "—"}</td>'
-            for stock in (a, b)
-        )
         return (
             f'<tr><td style="padding:6px 10px;font-size:12px;font-family:{sans};'
-            f'color:#4A5063;border-top:1px solid #EDEAE2;">{label}</td>{cells}</tr>'
+            f'color:#4A5063;border-top:1px solid #EDEAE2;width:38%;">{label}</td>'
+            f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
+            f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html_fn(stock) or "—"}</td></tr>'
         )
 
     rows = "".join([
-        row("Name of the Stock", "name", bold=True),
-        row("Current Market Price", "current_price_display", value_color="#14213D", bold=True),
+        row("Current Market Price", "current_price_display", bold=True),
         raw_row("Confidence Score", _confidence_display),
         raw_row("Risk Level", lambda s: _risk_level_badge(s.get("risk_level"))),
         row("Key Catalysts", "key_catalysts"),
-        row("Risk : Reward", "risk_reward_ratio", value_color="#14213D", bold=True),
+        row("Risk : Reward", "risk_reward_ratio", bold=True),
         row("Allocation (% of capital)", "allocation_pct"),
         row("Entry Date (Targeted)", "entry_date"),
         row("Exit Date (Expected)", "exit_date"),
@@ -972,22 +961,28 @@ def render_stock_table_html(stocks):
         raw_row("Data Verification", _verification_display),
     ])
 
-    rationale_items = "".join(
-        f'<div style="margin-top:8px;"><strong style="color:#14213D;">{esc(stock.get("name"))}:</strong> {esc(stock.get("rationale"))}</div>'
-        for stock in (a, b) if stock
-    )
+    name = esc(stock.get("name"))
+    ticker = esc(stock.get("ticker"))
+    rationale = esc(stock.get("rationale"))
 
-    execution_plans = "".join(
-        _trade_execution_plan_html(stock, sans) for stock in (a, b) if stock
-    )
-
-    return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
-<tr style="background:#14213D;"><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Parameter</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock A</td><td style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Stock B</td></tr>
+    return f"""<div style="margin-top:{0 if idx == 0 else 22}px;">
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
+<tr style="background:#14213D;"><td colspan="2" style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">{idx + 1}. {name} <span style="color:#B08D57;">({ticker})</span></td></tr>
 {rows}
 </table>
-<div style="margin-top:14px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong>{rationale_items}</div>
-{execution_plans}
-"""
+<div style="margin-top:10px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong> {rationale}</div>
+{_trade_execution_plan_html(stock, sans)}
+</div>"""
+
+
+def render_stock_table_html(stocks):
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    if not stocks:
+        return _no_qualifying_stock_html([])
+    return "".join(
+        _render_one_stock_card(stock, idx, sans) for idx, stock in enumerate(stocks)
+    )
+
 
 
 def _no_qualifying_stock_html(rejected):
