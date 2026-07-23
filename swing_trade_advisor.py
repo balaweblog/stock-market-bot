@@ -52,6 +52,23 @@ import main  # reuses LLM init, email config/credentials, and helpers
 from compliance import build_compliance_block_html
 
 # -----------------------------
+# Qualifying-stock gate
+# -----------------------------
+# The model's own JSON output is not trusted at face value: _verify_stock_claims
+# independently checks every mandatory filter from the prompt (uptrend, RSI/MACD,
+# growth thresholds, risk:reward minimum, debt/ROE) against real data. A stock
+# with any "hard" contradiction -- i.e. one where the independent check actively
+# disagrees with the model's claim, not just "couldn't be verified" -- fails its
+# own strategy's entry criteria and must not be recommended. REQUIRE_QUALIFYING_STOCK
+# (default true) enforces that; set to "false" to restore the old behavior of
+# reporting every candidate regardless of contradictions.
+REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower() == "true"
+# How many times to re-prompt the model (with the specific rejection reasons fed
+# back in) before giving up and reporting "no qualifying trade found" instead of
+# emailing a pick that fails its own criteria.
+MAX_GENERATION_ATTEMPTS = int(os.getenv("MAX_GENERATION_ATTEMPTS", "3"))
+
+# -----------------------------
 # Prompt
 # -----------------------------
 def build_prompt():
@@ -100,6 +117,34 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
   ]
 }}
 """
+
+
+def build_retry_prompt(rejected):
+    """
+    Re-issues the original prompt but tells the model exactly which candidates
+    were independently verified and rejected last attempt, and why -- so a
+    retry doesn't just propose the same failing stocks again with a more
+    confident-sounding rationale.
+    """
+    reject_lines = "\n".join(
+        f"- {s.get('name')} ({s.get('ticker')}): " + "; ".join(_hard_contradictions(s))
+        for s in rejected
+    ) or "- (no candidates were parseable)"
+    return (
+        f"{build_prompt()}\n\n"
+        "IMPORTANT: a previous attempt at this exact request proposed stocks that "
+        "FAILED independent verification against real market data on the mandatory "
+        "filters above:\n"
+        f"{reject_lines}\n\n"
+        "Do not propose these same stocks again, and do not describe technicals "
+        "(SMA position, RSI direction, MACD crossover) or growth figures in your "
+        "rationale unless you are confident they are genuinely true right now -- "
+        "your rationale will be checked against real data again. Find different "
+        "candidates that actually satisfy every mandatory filter as of real current "
+        "data. If, after genuinely searching, no real stock satisfies all mandatory "
+        "filters right now, return fewer than two stocks (even an empty \"stocks\": "
+        "[] array) rather than forcing a pick that doesn't qualify."
+    )
 
 
 # -----------------------------
@@ -792,6 +837,27 @@ def _adjust_confidence(stock, notes):
     stock["_confidence_penalty_detail"] = f"{hard_count} contradiction(s), {soft_count} unverifiable item(s)"
 
 
+def _hard_contradictions(stock):
+    """Text of every 'hard' verification note -- i.e. an independent check that
+    actively disagrees with the model's claim, as opposed to a 'soft' note where
+    something simply couldn't be verified either way."""
+    return [n for n, sev in (stock.get("_verification_notes") or []) if sev == "hard"]
+
+
+def _split_qualifying(stocks):
+    """
+    Splits verified stocks into (qualifying, rejected). A stock qualifies only if
+    it has zero 'hard' contradictions -- i.e. nothing in its own strategy's
+    mandatory filters (uptrend, RSI/MACD, growth thresholds, risk:reward minimum,
+    debt/ROE) was independently found to be false. 'Soft' notes (couldn't be
+    verified) are still disclosed in the report but don't block a recommendation.
+    """
+    qualifying, rejected = [], []
+    for s in stocks:
+        (rejected if _hard_contradictions(s) else qualifying).append(s)
+    return qualifying, rejected
+
+
 def _verification_display(stock):
     notes = stock.get("_verification_notes") or []
     if not notes:
@@ -919,6 +985,41 @@ def render_stock_table_html(stocks):
 <div style="margin-top:14px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong>{rationale_items}</div>
 {execution_plans}
 """
+
+
+def _no_qualifying_stock_html(rejected):
+    """
+    Rendered instead of a recommendation table when every candidate this run
+    failed independent verification against its own strategy's mandatory
+    filters (even after retries). Being honest that nothing qualified today is
+    the correct output here -- forcing a pick that fails its own criteria is
+    the bug this replaces.
+    """
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    out = (
+        f'<div style="font-family:{sans};font-size:13px;color:#14213D;line-height:1.65;'
+        f'padding:14px 16px;background:#F4F2ED;border-radius:4px;border:1px solid #E7E4DC;">'
+        "<strong>No qualifying trade found for this run.</strong> Every candidate considered "
+        "failed at least one of the strategy's mandatory filters (uptrend, rising RSI below 70, "
+        "bullish MACD crossover, &ge;20% YoY revenue/profit growth, or &ge;1:2.5 risk:reward) once "
+        "checked against independently-verified data, even after retrying with feedback. No pick is "
+        "being reported rather than recommending one that fails its own entry criteria."
+        "</div>"
+    )
+    if rejected:
+        items = "".join(
+            f'<div style="margin-top:8px;font-family:{sans};font-size:12px;color:#4A5063;">'
+            f'<strong style="color:#14213D;">{html.escape(str(s.get("name") or s.get("ticker") or "Unnamed"))}</strong>'
+            f' &mdash; rejected: {html.escape("; ".join(_hard_contradictions(s)) or "unspecified")}'
+            "</div>"
+            for s in rejected[-6:]
+        )
+        out += (
+            f'<div style="margin-top:14px;padding-top:10px;border-top:1px solid #EDEAE2;'
+            f'font-family:{sans};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;'
+            f'letter-spacing:0.05em;">Candidates considered and rejected this run</div>{items}'
+        )
+    return out
 
 
 def _trade_execution_plan_html(stock, sans):
@@ -1110,39 +1211,69 @@ def run():
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     prompt = build_prompt()
 
-    analysis, sources, used_live_search = generate_analysis(prompt)
-    if not analysis:
-        main.log.error(
-            "No LLM backend produced output (no GROQ_API_KEY/GOOGLE_API_KEY set "
-            "and local model unavailable/failed). Aborting without sending an email."
-        )
-        sys.exit(1)
+    analysis_html = None
+    sources = []
+    used_live_search = False
+    all_rejected = []
+    qualifying = []
+    analysis = None
 
-    if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        main.log.error(
-            "Live web search was not used for this run (Groq's live-search "
-            "model was unavailable or the backend fell back to Gemini/local), "
-            "so the output would only reflect stale training-data prices/news. "
-            "Aborting without sending an email. Set REQUIRE_LIVE_DATA=false to "
-            "override and allow a clearly-labeled stale-data email instead."
-        )
-        sys.exit(1)
+    for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
+        analysis, sources, used_live_search = generate_analysis(prompt)
+        if not analysis:
+            main.log.error(
+                "No LLM backend produced output (no GROQ_API_KEY/GOOGLE_API_KEY set "
+                "and local model unavailable/failed). Aborting without sending an email."
+            )
+            sys.exit(1)
 
-    stocks = _parse_analysis_json(analysis)
-    if stocks:
+        if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
+            main.log.error(
+                "Live web search was not used for this run (Groq's live-search "
+                "model was unavailable or the backend fell back to Gemini/local), "
+                "so the output would only reflect stale training-data prices/news. "
+                "Aborting without sending an email. Set REQUIRE_LIVE_DATA=false to "
+                "override and allow a clearly-labeled stale-data email instead."
+            )
+            sys.exit(1)
+
+        stocks = _parse_analysis_json(analysis)
+        if not stocks:
+            main.log.error(
+                "Could not parse JSON from LLM output; falling back to raw text display."
+            )
+            sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+            analysis_html = (
+                f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
+                f"Note: the model's response could not be parsed as structured data; showing raw output below.</div>"
+                f'<pre style="white-space:pre-wrap;font-family:{sans};font-size:12px;color:#14213D;">{html.escape(_strip_code_fences(analysis))}</pre>'
+            )
+            break
+
         stocks = _attach_live_prices(stocks)
         stocks = _verify_stock_claims(stocks)
-        analysis_html = render_stock_table_html(stocks)
-    else:
-        main.log.error(
-            "Could not parse JSON from LLM output; falling back to raw text display."
-        )
-        sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-        analysis_html = (
-            f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
-            f"Note: the model's response could not be parsed as structured data; showing raw output below.</div>"
-            f'<pre style="white-space:pre-wrap;font-family:{sans};font-size:12px;color:#14213D;">{html.escape(_strip_code_fences(analysis))}</pre>'
-        )
+        qualifying, rejected = _split_qualifying(stocks)
+        all_rejected.extend(rejected)
+
+        if qualifying or not REQUIRE_QUALIFYING_STOCK:
+            analysis_html = render_stock_table_html(qualifying or stocks)
+            break
+
+        if attempt < MAX_GENERATION_ATTEMPTS:
+            main.log.info(
+                f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: no candidate passed "
+                f"independent verification of the mandatory filters ({len(rejected)} "
+                "rejected) -- retrying with the specific rejection reasons fed back in."
+            )
+            prompt = build_retry_prompt(rejected)
+        else:
+            main.log.warning(
+                f"All {MAX_GENERATION_ATTEMPTS} attempts failed to produce a stock that "
+                "passes its own strategy's mandatory filters against real data. "
+                "Reporting 'no qualifying trade' instead of a contradicted pick."
+            )
+            analysis_html = _no_qualifying_stock_html(all_rejected)
+
     email_html = build_email_html(analysis_html, today_str, sources, used_live_search)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
