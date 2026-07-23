@@ -448,6 +448,49 @@ def describe_max_pain(horizon_snap, spot):
     )
 
 
+def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None):
+    """
+    ATM straddle-implied expected move for one expiry: the sum of the
+    at-the-money call and put premiums (the market's own breakeven-to-
+    breakeven range), NOT a VIX-derived estimate -- this is what
+    select_best_strikes() uses to keep short strikes outside a realistic
+    move, and what the report's "Expected Move (ATM Straddle)" row shows.
+
+    call_ltp / put_ltp: {strike: last_traded_price} maps for one expiry.
+    vix / expiry are accepted (and passed through by both call sites) for
+    forward compatibility -- e.g. an IV-based fallback when no ATM premium
+    is available -- but aren't required for the straddle-premium method.
+
+    Returns None (never raises) if there's no strike with both a call AND
+    a put premium to form a straddle from -- callers already handle a None
+    expected_move by falling back to "n/a" / skipping deterministic strike
+    selection for that horizon.
+    """
+    if not call_ltp or not put_ltp or not spot:
+        return None
+
+    common_strikes = set(call_ltp.keys()) & set(put_ltp.keys())
+    if not common_strikes:
+        return None
+
+    atm_strike = min(common_strikes, key=lambda k: abs(k - spot))
+    call_premium = call_ltp.get(atm_strike)
+    put_premium = put_ltp.get(atm_strike)
+    if not call_premium or not put_premium:
+        return None
+
+    expected_move_pts = call_premium + put_premium
+    expected_move_pct = round((expected_move_pts / spot) * 100, 2) if spot else None
+
+    return {
+        "atm_strike": atm_strike,
+        "atm_call_premium": call_premium,
+        "atm_put_premium": put_premium,
+        "expected_move_pts": round(expected_move_pts, 2),
+        "expected_move_pct": expected_move_pct,
+    }
+
+
 def compute_oi_trend(horizon_snap):
     def _classify(oi_chg_map, price_chg_map, oi_map):
         if not oi_chg_map:
