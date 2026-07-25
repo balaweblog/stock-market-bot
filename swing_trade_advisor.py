@@ -896,7 +896,7 @@ def _verify_technicals(stock):
 
     tech = _fetch_weekly_technicals(ticker)
     if tech is None:
-        return [("Technicals could not be independently verified (price history fetch failed).", "soft")]
+        return [("Technicals could not be independently verified (price history fetch failed).", "nodata")]
     if tech.get("insufficient_history"):
         notes = [(
             f"Only {tech.get('weeks_available')} weeks of price history available -- "
@@ -1026,7 +1026,7 @@ def _verify_fundamentals(stock):
 
     data = _fetch_fundamentals(ticker)
     if data is None:
-        return [("Fundamentals could not be independently verified (data fetch failed).", "soft")]
+        return [("Fundamentals could not be independently verified (data fetch failed).", "nodata")]
 
     notes = []
 
@@ -1076,6 +1076,14 @@ def _prefilter_by_fundamentals(candidates):
     dicts (unchanged, for building the Stage 2 prompt); rejected candidates
     carry a "_verification_notes" key so they can be reported in the "no
     qualifying trade" summary same as final-stage rejections.
+
+    A candidate is also rejected here if fundamentals data couldn't be
+    fetched at all (severity "nodata", e.g. yfinance has no such ticker) --
+    this stage exists specifically to confirm >=20% YoY growth, and "no data
+    to confirm it with" is functionally the same failure as "confirmed and
+    it's below threshold". It's also usually a sign the ticker itself is
+    wrong/hallucinated rather than a transient data-provider hiccup, so
+    catching it here avoids spending a Stage 2 LLM call on it.
     """
     qualified, rejected = [], []
     for c in candidates:
@@ -1086,8 +1094,8 @@ def _prefilter_by_fundamentals(candidates):
             rejected.append(record)
             continue
         notes = _verify_fundamentals({"ticker": ticker})
-        hard = [n for n, sev in notes if sev == "hard"]
-        if hard:
+        blocking = [n for n, sev in notes if sev in ("hard", "nodata")]
+        if blocking:
             record = dict(c)
             record["_verification_notes"] = notes
             rejected.append(record)
@@ -1123,13 +1131,40 @@ def _verify_sanity_bounds(stock):
 
 def _verify_stock_claims(stocks):
     for stock in stocks:
-        notes = []
-        notes += _verify_risk_reward(stock)
-        notes += _verify_technicals(stock)
-        notes += _verify_fundamentals(stock)
-        notes += _verify_sanity_bounds(stock)
-        if not stock.get("current_price_display"):
-            notes.append(("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.", "soft"))
+        rr_notes = _verify_risk_reward(stock)
+        tech_notes = _verify_technicals(stock)
+        fund_notes = _verify_fundamentals(stock)
+        sanity_notes = _verify_sanity_bounds(stock)
+
+        price_missing = not stock.get("current_price_display")
+        tech_no_data = any(sev == "nodata" for _, sev in tech_notes)
+        fund_no_data = any(sev == "nodata" for _, sev in fund_notes)
+
+        notes = rr_notes + tech_notes + fund_notes + sanity_notes
+        if price_missing:
+            notes.append(("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.", "nodata"))
+
+        # If EVERY independent real-data source failed for this ticker --
+        # price, technicals, AND fundamentals -- that's a much stronger
+        # signal than three isolated "couldn't verify" notes: it usually
+        # means the ticker itself is wrong, delisted, or hallucinated by
+        # the model, not that three unrelated data sources all happened to
+        # have an outage at once. "Zero verified data" is not the same
+        # thing as "zero contradictions", so escalate this specific
+        # combination to a hard contradiction -- _split_qualifying then
+        # excludes it instead of letting a totally unverifiable pick
+        # through with a star rating on a technicality. (Ordinarily this
+        # is already caught one stage earlier by _prefilter_by_fundamentals;
+        # this is a second layer for the case where fundamentals data
+        # happened to be fetchable but price/technicals weren't.)
+        if price_missing and tech_no_data and fund_no_data:
+            notes.append((
+                f"No real data source (live price, price history, or fundamentals) could be "
+                f"found for ticker '{stock.get('ticker') or '?'}' -- this usually means the "
+                "ticker is wrong, delisted, or hallucinated rather than a temporary data "
+                "outage. Treating as disqualifying rather than merely unverifiable.", "hard"
+            ))
+
         stock["_verification_notes"] = notes
         _adjust_confidence(stock, notes)
     return stocks
@@ -1154,7 +1189,7 @@ def _adjust_confidence(stock, notes):
         return
 
     hard_count = sum(1 for _, sev in notes if sev == "hard")
-    soft_count = sum(1 for _, sev in notes if sev == "soft")
+    soft_count = sum(1 for _, sev in notes if sev != "hard")  # "soft" and "nodata" both count as unverifiable here
     penalty = hard_count * 0.8 + soft_count * 0.2
     stock["confidence_score_adjusted"] = max(0.0, round(original - penalty, 1))
     stock["_confidence_penalty_detail"] = f"{hard_count} contradiction(s), {soft_count} unverifiable item(s)"
@@ -1186,7 +1221,7 @@ def _verification_display(stock):
     if not notes:
         return '<span style="color:#2F5233;font-weight:700;">Verified -- no contradictions found</span>'
     hard = [n for n, sev in notes if sev == "hard"]
-    soft = [n for n, sev in notes if sev == "soft"]
+    soft = [n for n, sev in notes if sev != "hard"]
     header_bits = []
     if hard:
         header_bits.append(f"{len(hard)} contradiction(s)")
