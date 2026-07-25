@@ -340,7 +340,7 @@ Only include a stock if it truly satisfies every mandatory technical/sentiment/r
 # LLM call (larger token budget than main.py's per-stock reasoning calls,
 # since this is one long-form response rather than a short per-stock blurb)
 # -----------------------------
-def _tavily_search(query, max_results=4):
+def _tavily_search(query, max_results=4, include_domains=None):
     """
     Runs one query against Tavily's search API directly (the same backend
     groq/compound uses internally) and returns a list of
@@ -353,15 +353,24 @@ def _tavily_search(query, max_results=4):
     if not api_key:
         return []
     try:
+        payload = {
+            "api_key": api_key,
+            "query": query,
+            # "advanced" costs more of the monthly search quota than "basic"
+            # (2 credits vs 1) but is materially more relevance-ranked --
+            # worth it here since this only runs a handful of queries per
+            # invocation and "basic" was observed returning off-topic hits
+            # (e.g. an unrelated motorcycle brand for a query containing
+            # "Indian") for these short, finance-generic queries.
+            "search_depth": "advanced",
+            "max_results": max_results,
+            "include_answer": False,
+        }
+        if include_domains:
+            payload["include_domains"] = include_domains
         resp = requests.post(
             "https://api.tavily.com/search",
-            json={
-                "api_key": api_key,
-                "query": query,
-                "search_depth": "basic",
-                "max_results": max_results,
-                "include_answer": False,
-            },
+            json=payload,
             timeout=20,
         )
         resp.raise_for_status()
@@ -382,6 +391,18 @@ def _tavily_search(query, max_results=4):
         return []
 
 
+# Reputable Indian financial/news sources to scope Tavily searches to.
+# Without this, short generic queries (e.g. containing just "Indian" or
+# "stock market") can drift to off-topic results outside this domain
+# entirely -- restricting to known finance sources fixes that at the
+# search layer instead of trying to filter noise out afterwards.
+_TAVILY_FINANCE_DOMAINS = [
+    "moneycontrol.com", "nseindia.com", "bseindia.com", "screener.in",
+    "economictimes.indiatimes.com", "livemint.com", "business-standard.com",
+    "trendlyne.com", "tradingview.com",
+]
+
+
 def _gather_tavily_context(today_str):
     """
     Runs a small, fixed set of targeted queries covering the areas the
@@ -399,7 +420,7 @@ def _gather_tavily_context(today_str):
     sources = []
     blocks = []
     for q in queries:
-        for r in _tavily_search(q):
+        for r in _tavily_search(q, include_domains=_TAVILY_FINANCE_DOMAINS):
             if not r["url"]:
                 continue
             if (r["title"], r["url"]) not in sources:
@@ -1152,6 +1173,25 @@ def _verify_fundamentals(stock):
     data = _fetch_fundamentals(ticker)
     if data is None:
         return [("Fundamentals could not be independently verified (data fetch failed).", "nodata")]
+
+    # yfinance can resolve a ticker symbol (so _fetch_fundamentals doesn't
+    # raise / return None) while returning literally no financial data for
+    # it -- this is the common signature of a delisted, renamed, or
+    # hallucinated ticker, not a working symbol with some fields missing.
+    # Treat that case the same as a total fetch failure ("nodata") rather
+    # than four separate "soft" notes -- otherwise _verify_stock_claims'
+    # "price + technicals + fundamentals all unfetchable => reject" rule
+    # never fires, because it specifically looks for a "nodata" fundamentals
+    # note and four individually-soft notes don't produce one.
+    if all(data.get(k) is None for k in (
+        "debt_to_equity", "roe", "revenue_growth_yoy", "profit_growth_yoy"
+    )):
+        return [(
+            "No fundamentals data at all came back for this ticker (debt/equity, "
+            "ROE, and both growth figures are all empty) -- this is the usual "
+            "signature of a wrong, delisted, or hallucinated symbol rather than "
+            "a data provider missing one or two fields.", "nodata"
+        )]
 
     notes = []
 
