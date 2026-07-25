@@ -65,35 +65,180 @@ from compliance import build_compliance_block_html
 REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower() == "true"
 # How many times to re-prompt the model (with the specific rejection reasons fed
 # back in) before giving up and reporting "no qualifying trade found" instead of
-# emailing a pick that fails its own criteria.
+# emailing a pick that fails its own criteria. Each attempt now runs a full
+# two-stage pipeline (fundamentals screen, then technicals -- see below), so
+# this is 2 LLM calls per attempt, not 1. 3 is a reasonable default for a
+# WEEKLY run (see SCHEDULE note below) -- it wouldn't be for a daily one.
 MAX_GENERATION_ATTEMPTS = int(os.getenv("MAX_GENERATION_ATTEMPTS", "3"))
 
 # -----------------------------
-# Prompt
+# Sector rotation across attempts
 # -----------------------------
-def build_prompt():
-    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
-    return f"""Core Objective: Using the most current market data as of {today_str}, identify a high-conviction swing trade suitable for a 3-5 month hold, based on a rigorous blend of fundamental, technical, and sentiment analysis. Only recommend a stock you have genuine conviction in; weigh relevant global cues, Indian market news, and risks. Do not fabricate a price, financial figure, or news item -- if you cannot find or verify a real current number for a required field, say so explicitly in "rationale" rather than inventing one.
+# Each retry attempt searches a fresh slice of sectors it hasn't already
+# covered this run, instead of re-running a broad search over the same
+# ground and hoping for different names. SECTORS_PER_ATTEMPT controls how
+# many sectors go into one Stage-1 fundamentals-screen call.
+SECTORS = [
+    "IT & Technology", "Pharma & Healthcare", "Banking & NBFC",
+    "Capital Goods & Infrastructure", "Auto & Auto Ancillaries",
+    "Chemicals & Fertilizers", "Defence", "Consumer & FMCG",
+    "Metals & Mining", "Realty & Construction", "Energy & Power",
+    "Textiles & Apparel", "Cement", "Telecom",
+]
+SECTORS_PER_ATTEMPT = int(os.getenv("SECTORS_PER_ATTEMPT", "6"))
 
-Stock Selection Strategy (choose one per stock):
+
+def _sectors_for_attempt(attempt_idx):
+    """Returns a rotating slice of SECTORS for this attempt (0-indexed) so
+    successive attempts within one run cover new ground instead of
+    re-searching the same sectors."""
+    n = len(SECTORS)
+    k = min(SECTORS_PER_ATTEMPT, n)
+    start = (attempt_idx * k) % n
+    return [SECTORS[(start + i) % n] for i in range(k)]
+
+
+# -----------------------------
+# Schedule
+# -----------------------------
+# This script is intended to run WEEKLY, on Monday mornings IST (not daily).
+# Suggested cron for the workflow yaml (03:00 UTC Monday = 08:30 IST Monday,
+# comfortably before the 09:15 IST market open):
+#   cron: '0 3 * * 1'
+# _run_context() below detects Monday and adjusts prompt language (news/
+# catalyst lookback window) accordingly -- see its docstring.
+def _run_context():
+    """
+    Returns (today_str, is_monday, lookback_note).
+    Since this runs weekly rather than daily, a plain "as of today" search
+    misses most of the week's actual news flow (results, orders, upgrades,
+    FII/DII activity) -- those all happened on days this script wasn't run.
+    On a Monday run, lookback_note tells the model to treat the past week
+    (last 5-7 trading sessions), not just the last 24 hours, as the relevant
+    catalyst window, and to note that "current" price is effectively last
+    Friday's close since markets are shut over the weekend.
+    """
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    today_str = now_ist.strftime("%d %B %Y")
+    is_monday = now_ist.weekday() == 0
+    if is_monday:
+        lookback_note = (
+            "and note that this is a WEEKLY scan run on Monday morning -- markets "
+            "were closed over the weekend, so the most recent close is effectively "
+            "last Friday's. Because a full week has passed since the previous scan, "
+            "treat the ENTIRE PAST WEEK (the last 5-7 trading sessions), not just "
+            "the last 24 hours, as the relevant window for news, results, broker "
+            "upgrades/downgrades, and FII/DII activity -- do not limit searches to "
+            "\"today\" only."
+        )
+    else:
+        lookback_note = (
+            "using the most recent available trading data and news as of right now."
+        )
+    return today_str, is_monday, lookback_note
+
+
+# -----------------------------
+# Prompts -- two-stage pipeline
+# -----------------------------
+# Stage 1 screens purely on fundamentals (a narrower, cheaper-to-verify
+# universe), and every candidate it returns is independently re-checked
+# against real data (_prefilter_by_fundamentals) BEFORE Stage 2 spends any
+# model effort on technicals/entry-exit/sentiment for it. This avoids asking
+# one model call to juggle fundamentals + technicals + sentiment + arithmetic
+# all at once, which is a lot to get right simultaneously from search
+# snippets alone.
+STRATEGY_TYPES_BLOCK = """Stock Selection Strategy (choose one per stock in Stage 2):
 - Momentum Breakout: a large-cap or quality mid-cap breaking out of a multi-month consolidation (Cup and Handle, Multi-Year Base, Symmetrical Triangle on a weekly chart) on significantly above-average volume, signaling a new sustained intermediate-term uptrend.
 - Event-Driven: positioned to gain from a major near-term catalyst (regulatory approval, large contract win, demerger/spinoff, M&A arbitrage) with a clearly quantifiable price impact inside the 3-5 month window.
 - Technical Swing Trade: a stock in a confirmed strong secular uptrend (above 50-WMA and 200-WMA) that has pulled back to a key support level (20-WMA, 38.2%/50% Fibonacci retracement, or horizontal support) with a clear reversal candlestick pattern.
-- Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play.
+- Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play."""
 
-Search Strategy -- this determines whether you find real candidates at all:
-- Do NOT rely mainly on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles. These recycle the same handful of already-popular names, which is exactly why they tend to already be overbought (failing the RSI<70 filter) or already priced in.
-- Instead, run systematic, screener-style searches, e.g.: "NSE stocks near 52-week high {today_str}", "Nifty 200 stocks above 50 week moving average", "NSE stocks net profit growth above 20% YoY Q4 FY26", "BSE midcap breakout volume {today_str}", "NSE weekly RSI below 70 rising stocks", plus separate searches per sector (IT, pharma, banking/NBFC, capital goods, auto & auto ancillaries, chemicals, defence, consumer) for standout recent quarterly results or technical setups.
-- Actually evaluate a meaningfully broad set of distinct candidates -- aim to individually check at least 15-20 different stocks across at least 4-5 different sectors against the mandatory parameters below before concluding that few or none qualify. Checking only one or two stocks (or re-checking the same stock you already checked) is not a broad enough search to justify a "nothing qualifies" conclusion.
 
-Mandatory analysis parameters:
-- Fundamentals: low debt-to-equity (or strong asset quality for financials), high/improving ROCE/ROE, and check for promoter/institutional buying last quarter.
-- Latest quarter: net profit and revenue growth both above 20% YoY, with margin expansion.
-- Technicals (3-5M view): price above 20-week and 50-week SMA; weekly RSI trending up but below 70; bullish MACD crossover.
+def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_note):
+    """
+    STAGE 1: fundamentals-only screen, scoped to a rotating slice of sectors
+    (see SECTORS / _sectors_for_attempt) so each attempt this run searches
+    genuinely new ground instead of re-covering the same sectors. Deliberately
+    does NOT ask for technicals/entry-exit/risk-reward yet -- that's Stage 2,
+    run only against whichever candidates survive independent fundamentals
+    verification.
+    """
+    sector_list = ", ".join(sectors)
+    exclude_block = (
+        "Do NOT propose any of these tickers again -- already checked and "
+        "rejected earlier this run: " + ", ".join(sorted(t for t in exclude_tickers if t)) + "."
+        if exclude_tickers else ""
+    )
+    return f"""STAGE 1 OF 2 -- FUNDAMENTALS SCREEN ONLY. Using the most current data as of {today_str}, {lookback_note}
+
+Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
+
+Search ONLY within these sectors this pass: {sector_list}. (Other sectors are covered in separate passes this run -- stay focused here so you search a handful of names deeply rather than many names thinly.)
+
+Search Strategy:
+- Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular names.
+- Run systematic, screener-style searches per sector, e.g.: "<sector> NSE BSE India net profit growth above 20% YoY Q1 FY27", "<sector> India quarterly results revenue growth 20 percent {today_str}", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups.
+- Aim to individually check at least 6-10 distinct real companies across the sectors above before concluding few or none qualify.
+{exclude_block}
+
+Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
+- Latest quarter: net profit AND revenue growth both above 20% YoY, with margin expansion.
+- Low debt-to-equity (or strong asset quality for financials).
+- High/improving ROCE/ROE, and check for promoter/institutional buying last quarter if known.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, nothing else (no markdown, no code fences, no commentary before or after):
+
+{{
+  "candidates": [
+    {{
+      "name": "Stock name",
+      "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS') -- must be a real symbol you are confident is correct",
+      "sector": "One of the sectors listed above",
+      "revenue_growth_yoy_pct": "e.g. 24.5",
+      "profit_growth_yoy_pct": "e.g. 31.2",
+      "why": "One sentence on the growth driver"
+    }}
+  ]
+}}
+List every genuine candidate you find meeting the bar in these sectors -- up to 15. It is normal for very few (even zero) to qualify in a given sector slice -- return "candidates": [] rather than padding the list.
+"""
+
+
+def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note):
+    """
+    STAGE 2: technicals, sentiment, and trade-plan construction, run ONLY
+    against the Stage-1 candidates that already passed independent
+    fundamentals verification (_prefilter_by_fundamentals). The model isn't
+    asked to re-justify growth here -- just to check the technical/sentiment/
+    risk filters and build a trade plan for whichever names genuinely pass.
+    """
+    listing = "\n".join(
+        f"- {c.get('name')} ({c.get('ticker')}) -- sector: {c.get('sector', '?')}, "
+        f"independently-confirmed growth: revenue {c.get('revenue_growth_yoy_pct', '?')}% / "
+        f"profit {c.get('profit_growth_yoy_pct', '?')}% YoY"
+        for c in candidates
+    )
+    exclude_block = (
+        "Do NOT propose any of these tickers -- already checked and rejected "
+        "earlier this run: " + ", ".join(sorted(t for t in exclude_tickers if t)) + "."
+        if exclude_tickers else ""
+    )
+    return f"""STAGE 2 OF 2 -- TECHNICALS, SENTIMENT, AND TRADE PLAN. Using the most current market data as of {today_str}, {lookback_note}
+
+The stocks below have ALREADY passed independent fundamentals verification (>=20% YoY revenue and profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no MACD crossover) -- do not force a pick that doesn't qualify.
+
+Fundamentally-qualified shortlist to evaluate (do not propose any stock outside this list):
+{listing}
+{exclude_block}
+
+{STRATEGY_TYPES_BLOCK}
+
+Mandatory technical / sentiment / risk filters:
+- Technicals (3-5M view): price above 20-week AND 50-week SMA; weekly RSI trending up but below 70; bullish MACD crossover.
 - Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
-- Risk/reward: minimum 1:2.5 based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss until it does rather than reporting a mismatched ratio.
-
-Provide a ranked LIST of every stock you can genuinely find, via real current search, that satisfies every mandatory filter above -- up to 10 stocks, highest-conviction first, favoring diversity across the four strategies where multiple genuinely qualify. Do NOT pad the list to hit a target count or to always show two: only include a stock if it truly satisfies every mandatory parameter with real, verifiable current data. It is normal and expected for very few stocks (even zero) to qualify on a given day -- return exactly as many as genuinely qualify, no more.
+- Risk/reward: minimum 1:2.5 based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
+- Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
 
@@ -101,14 +246,14 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
   "stocks": [
     {{
       "name": "Stock name",
-      "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS' for NSE-listed, 'AAPL' for US-listed) -- must be a real symbol you are confident is correct, since it is used to fetch a live quote; a wrong or invented ticker will silently break that lookup",
+      "ticker": "Exact ticker from the shortlist above",
       "allocation_pct": "e.g. 5-10%",
       "entry_date": "Targeted entry date",
       "exit_date": "Expected exit date, 3-5 months from entry",
       "strategy_type": "Strategy name used",
       "confidence_score": "Conviction out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
       "risk_level": "One word: 'Medium' or 'High'",
-      "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, AI Chip Launch, Fed Meeting'",
+      "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, Order Win, Sector Upgrade'",
       "risk_reward_ratio": "e.g. '1 : 2.5' -- must arithmetically match stop_loss_pct and target1_pct below",
       "upside_target_pct": "Favourable % for 3-5 months",
       "stop_loss_pct": "Risk % (Stop-Loss)",
@@ -116,44 +261,12 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "target2_pct": "Expected Profit % (T2), optional",
       "top_buyers": "Recent FII/DII activity, if known",
       "broker_recommendations": "e.g. 'Buy' with target X from a named brokerage, if known",
-      "rationale": "Two to three sentences covering fundamental + technical + sentiment rationale and the key risk to watch"
-    }},
-    {{ ... repeat for each additional genuinely qualifying stock, same fields, up to 10 total ... }}
+      "rationale": "Two to three sentences covering technical + sentiment rationale (fundamentals already confirmed) and the key risk to watch"
+    }}
   ]
 }}
+Only include a stock if it truly satisfies every mandatory technical/sentiment/risk filter with real, verifiable current data. Return "stocks": [] if none from the shortlist genuinely pass right now -- do not force a pick.
 """
-
-
-def build_retry_prompt(rejected):
-    """
-    Re-issues the original prompt but tells the model exactly which candidates
-    were independently verified and rejected last attempt, and why -- so a
-    retry doesn't just propose the same failing stocks again with a more
-    confident-sounding rationale.
-    """
-    reject_lines = "\n".join(
-        f"- {s.get('name')} ({s.get('ticker')}): " + "; ".join(_hard_contradictions(s))
-        for s in rejected
-    ) or "- (the previous attempt returned zero candidates)"
-    return (
-        f"{build_prompt()}\n\n"
-        "IMPORTANT: a previous attempt at this exact request proposed stocks that "
-        "FAILED independent verification against real market data on the mandatory "
-        "filters above:\n"
-        f"{reject_lines}\n\n"
-        "Do not propose these same stocks again, and do not describe technicals "
-        "(SMA position, RSI direction, MACD crossover) or growth figures in your "
-        "rationale unless you are confident they are genuinely true right now -- "
-        "your rationale will be checked against real data again. Widen your net: "
-        "run NEW searches you have not already run (different sectors, different "
-        "screener-style queries per the Search Strategy above) rather than "
-        "re-examining the same small set of stocks with a different rationale. "
-        "Find different candidates that actually satisfy every mandatory filter "
-        "as of real current data. If, after genuinely searching broadly across "
-        "multiple sectors, no real stock satisfies all mandatory filters right "
-        "now, return fewer than two stocks (even an empty \"stocks\": [] array) "
-        "rather than forcing a pick that doesn't qualify."
-    )
 
 
 # -----------------------------
@@ -531,6 +644,26 @@ def _parse_analysis_json(text):
     return stocks
 
 
+def _parse_candidates_json(text):
+    """Same parsing approach as _parse_analysis_json, but for Stage 1's
+    {"candidates": [...]} schema instead of Stage 2's {"stocks": [...]}."""
+    cleaned = _strip_code_fences(text)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(candidates, list):
+        return None
+    return candidates
+
+
 def _fetch_current_price(ticker):
     ticker = (ticker or "").strip()
     if not ticker:
@@ -803,6 +936,37 @@ def _verify_fundamentals(stock):
         notes.append(("Net profit YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
     return notes
+
+
+def _prefilter_by_fundamentals(candidates):
+    """
+    Independently re-checks each Stage-1 candidate's fundamentals against
+    real data (via the same _verify_fundamentals used on final picks) --
+    the model's self-reported growth numbers are not trusted at face value
+    here either. Only candidates with zero 'hard' contradictions move on to
+    the Stage-2 technicals call; this is what makes the two-stage split
+    actually save effort (no technicals prompt is ever built for a stock
+    whose growth claim doesn't hold up).
+
+    Returns (qualified, rejected) -- qualified is the original candidate
+    dicts (unchanged, for building the Stage 2 prompt); rejected candidates
+    carry a "_verification_notes" key so they can be reported in the "no
+    qualifying trade" summary same as final-stage rejections.
+    """
+    qualified, rejected = [], []
+    for c in candidates:
+        ticker = (c.get("ticker") or "").strip()
+        if not ticker:
+            continue
+        notes = _verify_fundamentals({"ticker": ticker})
+        hard = [n for n, sev in notes if sev == "hard"]
+        if hard:
+            record = dict(c)
+            record["_verification_notes"] = notes
+            rejected.append(record)
+        else:
+            qualified.append(c)
+    return qualified, rejected
 
 
 def _verify_sanity_bounds(stock):
@@ -1204,7 +1368,8 @@ def send_swing_trade_email(html_body):
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"Swing Trade Research Note — {main.get_date_with_suffix(now_ist)} · {time_str}"
+    note_label = "Weekly Swing Trade Research Note" if now_ist.weekday() == 0 else "Swing Trade Research Note"
+    subject = f"{note_label} — {main.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
@@ -1234,75 +1399,132 @@ def send_swing_trade_email(html_body):
     return False
 
 
+def _require_live_or_abort(used_live, stage_label):
+    if not used_live and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
+        main.log.error(
+            f"Live web search was not used for {stage_label} this run (Groq's "
+            "live-search model was unavailable or the backend fell back to "
+            "Gemini/local), so the output would only reflect stale training-data "
+            "prices/news. Aborting without sending an email. Set "
+            "REQUIRE_LIVE_DATA=false to override and allow a clearly-labeled "
+            "stale-data email instead."
+        )
+        sys.exit(1)
+
+
 def run():
-    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
-    prompt = build_prompt()
+    today_str, is_monday, lookback_note = _run_context()
+    if is_monday:
+        main.log.info("Monday run detected -- widening news/catalyst lookback to the past week.")
 
     analysis_html = None
     sources = []
     used_live_search = False
     all_rejected = []
-    qualifying = []
-    analysis = None
-    # Tickers rejected in an earlier attempt this run. The retry prompt asks
-    # the model not to propose these again, but it isn't reliable about
-    # honoring that -- so this is enforced here rather than trusted.
-    seen_rejected_tickers = set()
+
+    # Every ticker rejected so far this run (at either the fundamentals or
+    # technicals stage) -- excluded from later attempts' prompts AND
+    # enforced here directly, since prompt instructions alone aren't
+    # reliably honored by the model.
+    seen_tickers = set()
 
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
-        analysis, sources, used_live_search = generate_analysis(prompt)
-        if not analysis:
+        sectors = _sectors_for_attempt(attempt - 1)
+        main.log.info(
+            f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS} -- Stage 1 (fundamentals "
+            f"screen) in sectors: {', '.join(sectors)}"
+        )
+
+        growth_prompt = build_growth_screen_prompt(sectors, seen_tickers, today_str, lookback_note)
+        growth_analysis, growth_sources, growth_live = generate_analysis(growth_prompt)
+
+        if not growth_analysis:
             main.log.error(
-                "No LLM backend produced output (no GROQ_API_KEY/GOOGLE_API_KEY set "
-                "and local model unavailable/failed). Aborting without sending an email."
+                "No LLM backend produced Stage 1 output (no GROQ_API_KEY/"
+                "GOOGLE_API_KEY set and local model unavailable/failed). "
+                "Aborting without sending an email."
             )
             sys.exit(1)
+        _require_live_or_abort(growth_live, "Stage 1 (fundamentals screen)")
 
-        if not used_live_search and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
+        for s in growth_sources:
+            if s not in sources:
+                sources.append(s)
+        used_live_search = used_live_search or growth_live
+
+        candidates = _parse_candidates_json(growth_analysis)
+        if candidates is None:
+            main.log.warning(
+                f"Attempt {attempt}: Stage 1 output could not be parsed as "
+                "candidate JSON -- treating as zero candidates for this attempt."
+            )
+            candidates = []
+
+        candidates = [
+            c for c in candidates
+            if (c.get("ticker") or "").strip().upper() not in seen_tickers
+        ]
+        if not candidates:
+            main.log.info(f"Attempt {attempt}: no new candidates found in {', '.join(sectors)}.")
+            continue
+
+        fundamentally_qualified, rejected_fund = _prefilter_by_fundamentals(candidates)
+        all_rejected.extend(rejected_fund)
+        seen_tickers.update(
+            (c.get("ticker") or "").strip().upper() for c in rejected_fund if c.get("ticker")
+        )
+
+        if not fundamentally_qualified:
+            main.log.info(
+                f"Attempt {attempt}: {len(rejected_fund)} candidate(s) from "
+                f"{', '.join(sectors)} failed independent fundamentals "
+                "verification -- none reached Stage 2."
+            )
+            continue
+
+        main.log.info(
+            f"Attempt {attempt} -- Stage 2 (technicals) for "
+            f"{len(fundamentally_qualified)} fundamentally-qualified candidate(s): "
+            + ", ".join(c.get("name") or c.get("ticker") or "?" for c in fundamentally_qualified)
+        )
+
+        tech_prompt = build_technical_prompt(fundamentally_qualified, seen_tickers, today_str, lookback_note)
+        tech_analysis, tech_sources, tech_live = generate_analysis(tech_prompt)
+
+        if not tech_analysis:
             main.log.error(
-                "Live web search was not used for this run (Groq's live-search "
-                "model was unavailable or the backend fell back to Gemini/local), "
-                "so the output would only reflect stale training-data prices/news. "
-                "Aborting without sending an email. Set REQUIRE_LIVE_DATA=false to "
-                "override and allow a clearly-labeled stale-data email instead."
+                "No LLM backend produced Stage 2 output. Aborting without sending an email."
             )
             sys.exit(1)
+        _require_live_or_abort(tech_live, "Stage 2 (technicals)")
 
-        stocks = _parse_analysis_json(analysis)
+        for s in tech_sources:
+            if s not in sources:
+                sources.append(s)
+        used_live_search = used_live_search or tech_live
+
+        stocks = _parse_analysis_json(tech_analysis)
         if stocks is None:
-            main.log.error(
-                "Could not parse JSON from LLM output; falling back to raw text display."
+            main.log.warning(
+                f"Attempt {attempt}: Stage 2 output could not be parsed as stock "
+                "JSON -- treating as zero candidates for this attempt."
             )
-            sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-            analysis_html = (
-                f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
-                f"Note: the model's response could not be parsed as structured data; showing raw output below.</div>"
-                f'<pre style="white-space:pre-wrap;font-family:{sans};font-size:12px;color:#14213D;">{html.escape(_strip_code_fences(analysis))}</pre>'
-            )
-            break
+            stocks = []
 
-        if seen_rejected_tickers:
-            repeats = [
-                s for s in stocks
-                if (s.get("ticker") or "").strip().upper() in seen_rejected_tickers
-            ]
-            if repeats:
-                main.log.info(
-                    f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: ignoring "
-                    f"{len(repeats)} candidate(s) already rejected in an earlier "
-                    "attempt this run despite the retry prompt asking for different "
-                    "ones: " + ", ".join(s.get("name") or s.get("ticker") or "?" for s in repeats)
-                )
-                stocks = [
-                    s for s in stocks
-                    if (s.get("ticker") or "").strip().upper() not in seen_rejected_tickers
-                ]
+        # Guard against the model drifting outside the fundamentals-vetted
+        # shortlist it was explicitly given.
+        allowed = {(c.get("ticker") or "").strip().upper() for c in fundamentally_qualified}
+        stocks = [s for s in stocks if (s.get("ticker") or "").strip().upper() in allowed]
+
+        if not stocks:
+            main.log.info(f"Attempt {attempt}: no candidate passed Stage 2 technicals.")
+            continue
 
         stocks = _attach_live_prices(stocks)
         stocks = _verify_stock_claims(stocks)
         qualifying, rejected = _split_qualifying(stocks)
         all_rejected.extend(rejected)
-        seen_rejected_tickers.update(
+        seen_tickers.update(
             (s.get("ticker") or "").strip().upper() for s in rejected if s.get("ticker")
         )
 
@@ -1310,20 +1532,18 @@ def run():
             analysis_html = render_stock_table_html(qualifying or stocks)
             break
 
-        if attempt < MAX_GENERATION_ATTEMPTS:
-            main.log.info(
-                f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: no candidate passed "
-                f"independent verification of the mandatory filters ({len(rejected)} "
-                "rejected) -- retrying with the specific rejection reasons fed back in."
-            )
-            prompt = build_retry_prompt(rejected)
-        else:
-            main.log.warning(
-                f"All {MAX_GENERATION_ATTEMPTS} attempts failed to produce a stock that "
-                "passes its own strategy's mandatory filters against real data. "
-                "Reporting 'no qualifying trade' instead of a contradicted pick."
-            )
-            analysis_html = _no_qualifying_stock_html(all_rejected)
+        main.log.info(
+            f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: {len(rejected)} "
+            "candidate(s) failed independent verification at Stage 2."
+        )
+
+    if analysis_html is None:
+        main.log.warning(
+            f"All {MAX_GENERATION_ATTEMPTS} attempt(s) failed to produce a stock "
+            "that passes its own strategy's mandatory filters against real data. "
+            "Reporting 'no qualifying trade' instead of a contradicted pick."
+        )
+        analysis_html = _no_qualifying_stock_html(all_rejected)
 
     email_html = build_email_html(analysis_html, today_str, sources, used_live_search)
 
