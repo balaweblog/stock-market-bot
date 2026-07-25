@@ -3,8 +3,7 @@ mutual_fund_advisor.py
 
 Standalone companion to main.py / swing_trade_advisor.py. Runs a
 "last-30-days" mutual fund portfolio review -- market/macro context,
-fund-wise news, sector performance, risk analysis, a portfolio health
-check, and a recommended-actions table -- against whichever free LLM
+fund-wise news, and sector performance -- against whichever free LLM
 backend main.py already knows how to set up, then emails the result to
 the same recipients configured for the other reports (EMAIL_TO / EMAIL_CC
 in config.py / the workflow yaml's env vars).
@@ -19,9 +18,8 @@ compound-mini -> Tavily+Groq -> Gemini grounding -> Mistral web search ->
 non-live fallback, gated by REQUIRE_LIVE_DATA).
 
 WHY A MULTI-STAGE PIPELINE (not one giant prompt):
-The uploaded prompt this script automates asks for ~10 sections covering
-7 funds, 17 macro topics, 13 sectors, a risk matrix, health-check scores,
-a recommendations table, and a monthly conclusion -- all "last 30 days
+The uploaded prompt this script automates asks for several sections
+covering 7 funds, 17 macro topics, and 13 sectors -- all "last 30 days
 only, cite dates, no fabrication." Asking one model call to search,
 verify, and structure all of that at once reliably truncates or
 hallucinates. Instead:
@@ -33,10 +31,9 @@ hallucinates. Instead:
              MF_SECTORS_PER_BATCH sectors per live-search call.
   Stage 4 -- Synthesis: a single NON-live call that reasons over the
              already-gathered, already-cited output of Stages 1-3 to
-             produce the risk matrix, health-check scores, actions
-             table, events-to-watch, long-term-SIP verdicts and the
-             monthly conclusion. This stage doesn't fetch new facts, so
-             it isn't gated by REQUIRE_LIVE_DATA.
+             produce the top-developments list for the executive
+             summary. This stage doesn't fetch new facts, so it isn't
+             gated by REQUIRE_LIVE_DATA.
 
 CAVEAT: this is not a substitute for a SEBI-registered adviser or your
 own factsheet review. Web search results can be stale, incomplete, or
@@ -295,45 +292,9 @@ The investor's portfolio is exactly these {len(portfolio)} funds: {fund_list}.
 Using ONLY the material above, produce a synthesis for a long-term (5-20 year) SIP investor. Respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
 
 {{
-  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"],
-  "risk_analysis": [
-    {{"risk": "Market risk", "rating": "Low | Medium | High", "note": "1 sentence, grounded in the material above"}},
-    {{"risk": "Valuation risk", "rating": "Low | Medium | High", "note": "..."}},
-    {{"risk": "Currency risk", "rating": "Low | Medium | High", "note": "..."}},
-    {{"risk": "Global risk", "rating": "Low | Medium | High", "note": "..."}},
-    {{"risk": "Political risk", "rating": "Low | Medium | High", "note": "..."}},
-    {{"risk": "Geopolitical risk", "rating": "Low | Medium | High", "note": "..."}},
-    {{"risk": "Sector concentration risk", "rating": "Low | Medium | High", "note": "..."}}
-  ],
-  "portfolio_health": {{
-    "diversification": "Integer 0-10", "fund_quality": "Integer 0-10",
-    "risk_management": "Integer 0-10", "asset_allocation": "Integer 0-10",
-    "growth_potential": "Integer 0-10", "long_term_suitability": "Integer 0-10",
-    "international_exposure": "Integer 0-10",
-    "overall_score_100": "Integer 0-100, your own weighted judgment (not just a sum)"
-  }},
-  "recommended_actions": [
-    {{"fund": "Fund name", "impact": "Short phrase on last-30-day impact", "recommendation": "One of the fund's recommendation values", "urgency": "Immediate | Within 30 Days | Continue SIP | No Action", "reason": "1 sentence"}}
-  ],
-  "events_to_watch": [
-    {{"event": "e.g. RBI MPC meeting", "expected_window": "e.g. 'early next month'", "relevance": "1 sentence on why it matters to this portfolio"}}
-  ],
-  "long_term_perspective": [
-    {{"fund": "Fund name", "action": "Keep | Increase SIP | Monitor | Replace", "reason": "1-2 sentences; if Replace, explain why in detail"}}
-  ],
-  "conclusion": {{
-    "top_positives": ["Up to 10 short bullet strings"],
-    "top_negatives": ["Up to 10 short bullet strings"],
-    "biggest_opportunity": "1-2 sentences",
-    "biggest_risk": "1-2 sentences",
-    "best_performing_fund": "Fund name, or 'Insufficient data' if not determinable",
-    "weakest_performing_fund": "Fund name, or 'Insufficient data' if not determinable",
-    "outlook_3_months": "2-3 sentences",
-    "overall_outlook": "Bullish | Neutral | Bearish",
-    "top_5_actions": ["Up to 5 short, concrete action strings for the investor to consider this month"]
-  }}
+  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"]
 }}
-One recommended_actions and one long_term_perspective entry per fund in the portfolio (all {len(portfolio)} of them). As of {today_str}.
+As of {today_str}.
 """
 
 
@@ -477,12 +438,6 @@ def run_synthesis_stage(market_data, funds_data, sectors_data, today_str):
         main.log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
         data = {}
     data.setdefault("top_developments", [])
-    data.setdefault("risk_analysis", [])
-    data.setdefault("portfolio_health", {})
-    data.setdefault("recommended_actions", [])
-    data.setdefault("events_to_watch", [])
-    data.setdefault("long_term_perspective", [])
-    data.setdefault("conclusion", {})
     return data
 
 
@@ -656,187 +611,12 @@ def render_sector_table(sectors_data):
     """
 
 
-def render_risk_table(synthesis_data):
-    def risk_color(r):
-        r = (r or "").strip().lower()
-        return {"low": "#1E7A46", "medium": "#C8792A", "high": "#B0473F"}.get(r, "#4A5063")
-
-    risks = synthesis_data.get("risk_analysis") or []
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(r.get("risk",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:{risk_color(r.get("rating"))};border-top:1px solid #EDEAE2;">{_esc(r.get("rating",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(r.get("note",""))}</td></tr>'
-        for r in risks
-    )
-    if not rows:
-        rows = f'<tr><td colspan="3" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No risk data could be generated this run.</td></tr>'
-    return _section_title("5. Risk Analysis") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Risk</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Rating</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Note</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
-def render_health_check(synthesis_data):
-    health = synthesis_data.get("portfolio_health") or {}
-    labels = [
-        ("diversification", "Diversification"), ("fund_quality", "Fund Quality"),
-        ("risk_management", "Risk Management"), ("asset_allocation", "Asset Allocation"),
-        ("growth_potential", "Growth Potential"), ("long_term_suitability", "Long-Term Suitability"),
-        ("international_exposure", "International Exposure"),
-    ]
-
-    def bar(key, label):
-        try:
-            val = max(0, min(10, int(health.get(key, 0))))
-        except (TypeError, ValueError):
-            val = 0
-        pct = val * 10
-        return f"""
-        <tr>
-          <td style="padding:5px 10px 5px 0;font-family:{SANS};font-size:12px;color:#4A5063;width:150px;">{label}</td>
-          <td style="padding:5px 0;">
-            <div style="background:#EDEAE2;border-radius:6px;height:8px;width:100%;">
-              <div style="background:#B08D57;border-radius:6px;height:8px;width:{pct}%;"></div>
-            </div>
-          </td>
-          <td style="padding:5px 0 5px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;width:45px;">{val}/10</td>
-        </tr>
-        """
-
-    bars = "".join(bar(k, lbl) for k, lbl in labels)
-    overall = health.get("overall_score_100", "n/a")
-    return _section_title("6. Portfolio Health Check") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation">{bars}</table>
-    <div style="margin-top:10px;padding:10px 14px;background:#14213D;border-radius:6px;display:inline-block;">
-      <span style="font-family:{SANS};font-size:12px;color:#B7BEC9;">Overall Portfolio Score</span>
-      <span style="font-family:{SERIF};font-size:20px;color:#ffffff;margin-left:8px;">{_esc(overall)}/100</span>
-    </div>
-    """
-
-
-def render_actions_table(synthesis_data):
-    actions = synthesis_data.get("recommended_actions") or []
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(a.get("fund",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(a.get("impact",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:{_reco_color(a.get("recommendation"))};border-top:1px solid #EDEAE2;">{_esc(a.get("recommendation",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:{_reco_color(a.get("urgency"))};border-top:1px solid #EDEAE2;">{_esc(a.get("urgency",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(a.get("reason",""))}</td></tr>'
-        for a in actions
-    )
-    if not rows:
-        rows = f'<tr><td colspan="5" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No recommended-actions data could be generated this run.</td></tr>'
-    return _section_title("7. Recommended Actions") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Fund</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">30-Day Impact</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Recommendation</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Urgency</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Reason</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
-def render_events(synthesis_data):
-    events = synthesis_data.get("events_to_watch") or []
-    items = "".join(
-        f'<li style="margin:0 0 6px;"><strong>{_esc(e.get("event",""))}</strong> ({_esc(e.get("expected_window",""))}) — {_esc(e.get("relevance",""))}</li>'
-        for e in events
-    )
-    if not items:
-        items = f'<li style="color:#8A8F9C;">No upcoming-events data could be generated this run.</li>'
-    return _section_title("8. Important Events to Watch") + f"""
-    <ul style="margin:0;padding-left:18px;font-family:{SANS};font-size:12.5px;line-height:1.6;color:#1B2233;">{items}</ul>
-    """
-
-
-def render_long_term(synthesis_data):
-    perspective = synthesis_data.get("long_term_perspective") or []
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(p.get("fund",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:{_reco_color(p.get("action"))};border-top:1px solid #EDEAE2;">{_esc(p.get("action",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(p.get("reason",""))}</td></tr>'
-        for p in perspective
-    )
-    if not rows:
-        rows = f'<tr><td colspan="3" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No long-term-perspective data could be generated this run.</td></tr>'
-    return _section_title("9. Long-Term Investor Perspective (20+ Year SIP)") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Fund</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Verdict</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Reason</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
-def render_conclusion(synthesis_data):
-    c = synthesis_data.get("conclusion") or {}
-    outlook = c.get("overall_outlook", "Neutral")
-    emoji = {"bullish": "\U0001F7E2", "neutral": "\U0001F7E1", "bearish": "\U0001F534"}.get(
-        (outlook or "").strip().lower(), "\U0001F7E1"
-    )
-
-    def bullets(key):
-        vals = c.get(key) or []
-        return "".join(f'<li style="margin:0 0 4px;">{_esc(v)}</li>' for v in vals) or (
-            f'<li style="color:#8A8F9C;">n/a</li>'
-        )
-
-    actions = c.get("top_5_actions") or []
-    actions_html = "".join(f'<li style="margin:0 0 6px;">{_esc(a)}</li>' for a in actions) or (
-        f'<li style="color:#8A8F9C;">n/a</li>'
-    )
-
-    return _section_title("10. Monthly Conclusion") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-      <tr>
-        <td style="width:50%;vertical-align:top;padding-right:10px;">
-          <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#1E7A46;text-transform:uppercase;margin-bottom:4px;">Top Positives</div>
-          <ol style="margin:0;padding-left:16px;font-family:{SANS};font-size:12px;line-height:1.5;color:#1B2233;">{bullets("top_positives")}</ol>
-        </td>
-        <td style="width:50%;vertical-align:top;padding-left:10px;">
-          <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#B0473F;text-transform:uppercase;margin-bottom:4px;">Top Negatives</div>
-          <ol style="margin:0;padding-left:16px;font-family:{SANS};font-size:12px;line-height:1.5;color:#1B2233;">{bullets("top_negatives")}</ol>
-        </td>
-      </tr>
-    </table>
-    <p style="margin:10px 0 0;font-family:{SANS};font-size:12.5px;color:#4A5063;"><strong>Biggest opportunity:</strong> {_esc(c.get("biggest_opportunity","-"))}</p>
-    <p style="margin:4px 0 0;font-family:{SANS};font-size:12.5px;color:#4A5063;"><strong>Biggest risk:</strong> {_esc(c.get("biggest_risk","-"))}</p>
-    <p style="margin:4px 0 0;font-family:{SANS};font-size:12.5px;color:#4A5063;"><strong>Best-performing fund this month:</strong> {_esc(c.get("best_performing_fund","-"))}</p>
-    <p style="margin:4px 0 0;font-family:{SANS};font-size:12.5px;color:#4A5063;"><strong>Weakest-performing fund this month:</strong> {_esc(c.get("weakest_performing_fund","-"))}</p>
-    <p style="margin:4px 0 0;font-family:{SANS};font-size:12.5px;color:#4A5063;"><strong>3-month portfolio outlook:</strong> {_esc(c.get("outlook_3_months","-"))}</p>
-    <div style="margin:12px 0;font-family:{SANS};font-size:13px;font-weight:700;color:#14213D;">
-      Overall Portfolio Outlook: {emoji} {_esc(outlook)}
-    </div>
-    <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;margin-bottom:4px;">Top 5 Actions This Month</div>
-    <ol style="margin:0;padding-left:18px;font-family:{SANS};font-size:12.5px;line-height:1.6;color:#1B2233;">{actions_html}</ol>
-    """
-
-
 def build_email_html(market_data, funds_data, sectors_data, synthesis_data, sources, used_live_search, today_str):
     sections = (
         render_executive_summary(market_data, synthesis_data)
         + render_fund_cards(funds_data)
         + render_market_news(market_data)
         + render_sector_table(sectors_data)
-        + render_risk_table(synthesis_data)
-        + render_health_check(synthesis_data)
-        + render_actions_table(synthesis_data)
-        + render_events(synthesis_data)
-        + render_long_term(synthesis_data)
-        + render_conclusion(synthesis_data)
     )
     sources_html = _build_sources_html(sources)
 
