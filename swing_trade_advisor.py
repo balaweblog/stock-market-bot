@@ -437,16 +437,22 @@ def _try_tavily_plus_groq(prompt, today_str, max_tokens=1500):
         return None
 
     # Groq's daily token quota (TPD) is tracked per model, not per account --
-    # e.g. llama-3.3-70b-versatile has a 100K TPD cap while openai/gpt-oss-120b
-    # has 200K TPD, entirely separate budgets under the same GROQ_API_KEY. A
-    # model that's run dry today doesn't mean the account is out of quota, so
-    # try a short list of models in order rather than hard-coding just one.
-    # Override with SYNTHESIS_MODELS="model-a,model-b" (comma-separated) if
-    # you want different models/order without editing code.
+    # e.g. llama-3.3-70b-versatile has a 100K TPD cap while llama-3.1-8b-instant
+    # has its own separate budget under the same GROQ_API_KEY. A model that's
+    # run dry today doesn't mean the account is out of quota, so try a short
+    # list of models in order rather than hard-coding just one. Override with
+    # SYNTHESIS_MODELS="model-a,model-b" (comma-separated) if you want
+    # different models/order without editing code.
+    #
+    # NOTE: openai/gpt-oss-120b is deliberately not in the default list --
+    # GPT-OSS models on Groq ship with a built-in "browser" tool baked into
+    # their template that can fire on its own (tool_use_failed) even when no
+    # tools are passed in this call, so it isn't reliable here. Add it back
+    # via SYNTHESIS_MODELS if you want to try it anyway.
     synthesis_models = [
         m.strip() for m in os.getenv(
             "SYNTHESIS_MODELS",
-            "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile,llama-3.1-8b-instant,qwen/qwen3-32b",
         ).split(",") if m.strip()
     ]
     for model_name in synthesis_models:
@@ -461,11 +467,13 @@ def _try_tavily_plus_groq(prompt, today_str, max_tokens=1500):
             return text, sources, True  # True: grounded in real Tavily results
         except Exception as e:
             main.log.error(f"Groq synthesis over Tavily context failed with {model_name}: {e}")
-            if not _is_daily_quota_exceeded(e) and not _is_request_too_large(e):
-                # Not a quota/size issue (e.g. auth or model-not-found) --
-                # trying another model won't fix that, so stop here instead
-                # of burning requests on models that will fail the same way.
+            if _is_auth_error(e):
+                # Same key, so every other model would fail identically --
+                # no point burning more requests trying them.
                 break
+            # Otherwise (quota, request-too-large, or a model-specific quirk
+            # like GPT-OSS's tool-call issue) keep trying the next model --
+            # none of those reasons generalize to a different model.
     return None
 
 
@@ -727,6 +735,17 @@ def _is_request_too_large(exc):
 def _is_daily_quota_exceeded(exc):
     msg = str(exc)
     return "tokens per day" in msg or "TPD" in msg
+
+
+def _is_auth_error(exc):
+    """
+    True for errors caused by the API key itself (invalid/missing/revoked),
+    which will fail identically for every model on the same key -- as
+    opposed to a model-specific quirk (e.g. a tool-calling error unique to
+    one model's template) where trying a different model is still worth it.
+    """
+    msg = str(exc)
+    return "401" in msg or "invalid_api_key" in msg or "Incorrect API key" in msg
 
 
 def _parse_groq_retry_seconds(exc):
