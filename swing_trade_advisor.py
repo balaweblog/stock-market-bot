@@ -168,7 +168,24 @@ MEGA_LARGE_CAP_CAUTION = (
     "effort instead on SMALL-CAP and MID-CAP stocks (BSE SmallCap 250 / BSE "
     "MidCap 150 universe, sub-Rs. 50,000 crore market cap) -- growth of this "
     "magnitude is far more common off a smaller revenue base, e.g. a company "
-    "scaling from Rs. 200cr to Rs. 260cr quarterly revenue."
+    "scaling from Rs. 200cr to Rs. 260cr quarterly revenue.\n\n"
+    "Also avoid large, capital-intensive diversified conglomerates (e.g. "
+    "Grasim, Godrej Industries, and similar cement/chemicals/infra-heavy "
+    "holding companies) -- they structurally carry high debt-to-equity from "
+    "their asset base, which fails the low-debt filter almost by default. "
+    "Asset-light business models (IT services, specialty chemicals, "
+    "formulation-focused pharma, consumer brands, defence electronics) are "
+    "far more likely to combine high growth with low debt."
+)
+
+SOURCE_QUALITY_NOTE = (
+    "Source quality: do NOT rely on or cite social media posts (Instagram, "
+    "Facebook, X/Twitter, Telegram) -- they are unverifiable and frequently "
+    "wrong. If a search result is a prebuilt stock-screener page (screener.in, "
+    "Trendlyne, Chartink, etc.) that looks like it already matches these "
+    "filters, actually open/fetch that page and read the real list of stocks "
+    "in its results table -- don't just note the link exists without reading "
+    "what's on it."
 )
 
 
@@ -192,6 +209,8 @@ def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_not
 Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
 
 {MEGA_LARGE_CAP_CAUTION}
+
+{SOURCE_QUALITY_NOTE}
 
 Search ONLY within these sectors this pass: {sector_list}. (Other sectors are covered in separate passes this run -- stay focused here so you search a handful of names deeply rather than many names thinly.)
 
@@ -370,7 +389,7 @@ def _gather_tavily_context(today_str):
     return context_text, sources
 
 
-def _try_tavily_plus_groq(prompt, today_str):
+def _try_tavily_plus_groq(prompt, today_str, max_tokens=1500):
     """
     Fallback tier that decouples search from generation: fetch real search
     results via Tavily directly (its own separate free quota), prepend them
@@ -394,7 +413,7 @@ def _try_tavily_plus_groq(prompt, today_str):
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": context_text + prompt}],
             temperature=0.4,
-            max_tokens=1500,
+            max_tokens=max_tokens,
         )
         text = response.choices[0].message.content.strip()
         return text, sources, True  # True: grounded in real Tavily results
@@ -403,11 +422,19 @@ def _try_tavily_plus_groq(prompt, today_str):
         return None
 
 
-def _try_groq_compound_model(prompt, model_name, max_attempts=3):
+def _try_groq_compound_model(prompt, model_name, max_attempts=3, max_tokens=1200):
     """
     Runs the prompt against a Groq compound (tool-using, live-search-capable)
     model and returns (text, sources, True) on success, or None if it
     fails after retries -- callers should fall through to their next option.
+
+    max_tokens caps the model's TOTAL output for this call, which for a
+    compound model includes its internal tool-call/search reasoning as well
+    as the final answer -- too low a budget silently truncates how much
+    searching it actually does before it has to wrap up, which shows up as
+    "checked only 1-2 stocks" even when the prompt asked for many more.
+    Callers doing a broad multi-sector search should pass a larger budget
+    than callers checking a short, already-narrowed shortlist.
 
     A 413 ("Request Entity Too Large") or a daily-quota 429 both mean
     retrying this exact call is pointless, so those stop immediately
@@ -419,7 +446,7 @@ def _try_groq_compound_model(prompt, model_name, max_attempts=3):
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
-                max_tokens=1200,
+                max_tokens=max_tokens,
             )
             text = response.choices[0].message.content.strip()
             sources = _extract_groq_sources(response)
@@ -449,7 +476,7 @@ def _try_groq_compound_model(prompt, model_name, max_attempts=3):
     return None
 
 
-def generate_analysis(prompt):
+def generate_analysis(prompt, max_tokens=1200):
     backend = main.init_llm_generator()
     main.log.info(f"Swing trade advisor using LLM backend: {backend}")
     # None of the non-search fallbacks below (plain Groq call, plain Gemini
@@ -461,17 +488,17 @@ def generate_analysis(prompt):
     require_live = os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true"
 
     if backend == "groq":
-        result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3)
+        result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3, max_tokens=max_tokens)
         if result is not None:
             return result
 
         main.log.info("groq/compound unavailable -- trying groq/compound-mini...")
-        result = _try_groq_compound_model(prompt, "groq/compound-mini", max_attempts=2)
+        result = _try_groq_compound_model(prompt, "groq/compound-mini", max_attempts=2, max_tokens=max_tokens)
         if result is not None:
             return result
 
         today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
-        result = _try_tavily_plus_groq(prompt, today_str)
+        result = _try_tavily_plus_groq(prompt, today_str, max_tokens=max_tokens)
         if result is not None:
             return result
 
@@ -492,7 +519,7 @@ def generate_analysis(prompt):
                     model="llama-3.3-70b-versatile",
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.4,
-                    max_tokens=1500,
+                    max_tokens=max_tokens,
                 )
                 return response.choices[0].message.content.strip(), [], False
             except Exception as e2:
@@ -1457,7 +1484,10 @@ def run():
         )
 
         growth_prompt = build_growth_screen_prompt(sectors, seen_tickers, today_str, lookback_note)
-        growth_analysis, growth_sources, growth_live = generate_analysis(growth_prompt)
+        # Larger budget than the default: this call has to search several
+        # sectors, check 8-12 companies, and enumerate up to 20 candidates --
+        # 1200 tokens was silently truncating that down to 1-2 stocks checked.
+        growth_analysis, growth_sources, growth_live = generate_analysis(growth_prompt, max_tokens=3000)
 
         if not growth_analysis:
             main.log.error(
@@ -1510,7 +1540,7 @@ def run():
         )
 
         tech_prompt = build_technical_prompt(fundamentally_qualified, seen_tickers, today_str, lookback_note)
-        tech_analysis, tech_sources, tech_live = generate_analysis(tech_prompt)
+        tech_analysis, tech_sources, tech_live = generate_analysis(tech_prompt, max_tokens=2200)
 
         if not tech_analysis:
             main.log.error(
