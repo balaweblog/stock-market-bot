@@ -95,6 +95,52 @@ def _env_int(name, default):
 
 MAX_GENERATION_ATTEMPTS = _env_int("MAX_GENERATION_ATTEMPTS", 3)
 
+
+def _env_float(name, default):
+    """Same idea as _env_int, but for a float threshold (risk:reward, RSI,
+    debt-to-equity %, ROE %, growth %) -- falls back to `default` (with a
+    warning) on anything unset/empty/unparseable."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
+        return default
+
+
+def _fmt_num(x):
+    """Formats a threshold for display in prompts/messages without a
+    trailing '.0' when it's a whole number (e.g. 20.0 -> '20', 17.5 -> '17.5')."""
+    return f"{x:g}"
+
+
+# -----------------------------
+# Configurable mandatory-filter thresholds
+# -----------------------------
+# These were previously hardcoded in TWO places that had to be edited
+# together to actually change the bar: the prompt text sent to the model,
+# and the independent verifier that re-checks the model's claims against
+# real data (_verify_fundamentals / _verify_risk_reward / _verify_technicals).
+# They're env vars now so the bar can be tuned per-run (e.g. in the
+# workflow yaml) without touching code -- and every prompt/message below
+# now always describes the actual enforced value instead of a hardcoded
+# number that could silently drift out of sync with the verifier (as the
+# risk:reward text and check previously had -- the prompt said "1:2.5" but
+# the code enforced 2.0; MIN_RISK_REWARD's default below preserves that
+# previously-enforced 2.0 rather than silently tightening it).
+MIN_GROWTH_YOY_PCT = _env_float("MIN_GROWTH_YOY_PCT", 20.0)
+MIN_RISK_REWARD = _env_float("MIN_RISK_REWARD", 2.0)
+MAX_RSI_OVERBOUGHT = _env_float("MAX_RSI_OVERBOUGHT", 70.0)
+MAX_DEBT_TO_EQUITY_PCT = _env_float("MAX_DEBT_TO_EQUITY_PCT", 100.0)
+MIN_ROE_PCT = _env_float("MIN_ROE_PCT", 10.0)
+# When false, the price-above-20/50-week-SMA uptrend requirement is dropped
+# from both the prompt and the verifier entirely (RSI/MACD/growth/risk-reward
+# filters still apply) -- use this if you want to consider pullback/basing
+# setups, not just confirmed uptrends.
+REQUIRE_UPTREND_FILTER = os.getenv("REQUIRE_UPTREND_FILTER", "true").lower() == "true"
+
 # -----------------------------
 # Sector rotation across attempts
 # -----------------------------
@@ -185,8 +231,9 @@ STRATEGY_TYPES_BLOCK = """Stock Selection Strategy (choose one per stock in Stag
 MEGA_LARGE_CAP_CAUTION = (
     "IMPORTANT market-cap steering: well-known large-caps and megacaps (e.g. "
     "TCS, Infosys, HCL Tech, Wipro, Reliance, HDFC Bank, ICICI Bank, Sun "
-    "Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
-    "never post BOTH >=20% YoY revenue growth AND >=20% YoY profit growth in "
+    f"Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
+    f"never post BOTH >={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue growth AND "
+    f">={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY profit growth in "
     "the same quarter simultaneously -- their revenue base is too large for "
     "that pace of growth except in rare one-off years. Repeatedly proposing "
     "these names and having them fail this filter wastes this search. "
@@ -243,12 +290,12 @@ Search ONLY within these sectors this pass: {sector_list}. (Other sectors are co
 
 Search Strategy:
 - Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular, already-large names.
-- Run systematic, screener-style searches per sector, biased toward small/mid-cap universes, e.g.: "<sector> smallcap midcap NSE BSE India net profit growth above 20% YoY Q1 FY27", "<sector> India smallcap quarterly results revenue growth 20 percent {today_str}", "BSE SmallCap 250 <sector> results beat estimates", "BSE MidCap 150 <sector> Q1 FY27 results", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups that explicitly cover smaller names, not just index heavyweights.
+- Run systematic, screener-style searches per sector, biased toward small/mid-cap universes, e.g.: "<sector> smallcap midcap NSE BSE India net profit growth above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY Q1 FY27", "<sector> India smallcap quarterly results revenue growth {_fmt_num(MIN_GROWTH_YOY_PCT)} percent {today_str}", "BSE SmallCap 250 <sector> results beat estimates", "BSE MidCap 150 <sector> Q1 FY27 results", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups that explicitly cover smaller names, not just index heavyweights.
 - Aim to individually check at least 8-12 distinct real companies across the sectors above (weighted toward small/mid-cap) before concluding few or none qualify.
 {exclude_block}
 
 Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
-- Latest quarter: net profit AND revenue growth both above 20% YoY, with margin expansion.
+- Latest quarter: net profit AND revenue growth both above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY, with margin expansion.
 - Low debt-to-equity (or strong asset quality for financials).
 - High/improving ROCE/ROE, and check for promoter/institutional buying last quarter if known.
 
@@ -293,7 +340,7 @@ def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note
     )
     return f"""STAGE 2 OF 2 -- TECHNICALS, SENTIMENT, AND TRADE PLAN. Using the most current market data as of {today_str}, {lookback_note}
 
-The stocks below have ALREADY passed independent fundamentals verification (>=20% YoY revenue and profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no MACD crossover) -- do not force a pick that doesn't qualify.
+The stocks below have ALREADY passed independent fundamentals verification (>={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue and profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no MACD crossover) -- do not force a pick that doesn't qualify.
 
 Fundamentally-qualified shortlist to evaluate (do not propose any stock outside this list):
 {listing}
@@ -302,9 +349,9 @@ Fundamentally-qualified shortlist to evaluate (do not propose any stock outside 
 {STRATEGY_TYPES_BLOCK}
 
 Mandatory technical / sentiment / risk filters:
-- Technicals (3-5M view): price above 20-week AND 50-week SMA; weekly RSI trending up but below 70; bullish MACD crossover.
+- Technicals (3-5M view): {"price above 20-week AND 50-week SMA; " if REQUIRE_UPTREND_FILTER else ""}weekly RSI trending up but below {_fmt_num(MAX_RSI_OVERBOUGHT)}; bullish MACD crossover.
 - Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
-- Risk/reward: minimum 1:2.5 based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
+- Risk/reward: minimum 1:{_fmt_num(MIN_RISK_REWARD)} based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
 - Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
@@ -973,8 +1020,8 @@ def _verify_risk_reward(stock):
             f"Risk:reward mismatch -- model reported 1 : {stated_val}, but "
             f"target1 ({target}%) / stop-loss ({stop}%) actually gives 1 : {true_ratio}.", "hard"
         ))
-    if true_ratio < 2.0:
-        notes.append((f"Risk:reward of 1 : {true_ratio} is below the 1:2.5 minimum the prompt requires.", "hard"))
+    if true_ratio < MIN_RISK_REWARD:
+        notes.append((f"Risk:reward of 1 : {true_ratio} is below the 1:{_fmt_num(MIN_RISK_REWARD)} minimum the prompt requires.", "hard"))
     return notes
 
 
@@ -1052,7 +1099,8 @@ def _verify_technicals(stock):
         # Even with <55 weeks we may still have enough for the 20-week SMA
         # (_fetch_weekly_technicals populates it once >=20 weeks are available)
         # -- that much is checkable, so don't leave it as a blanket "unverified".
-        if tech.get("sma20w") is not None and tech.get("latest_close") is not None:
+        # Only enforced when REQUIRE_UPTREND_FILTER is true (default).
+        if REQUIRE_UPTREND_FILTER and tech.get("sma20w") is not None and tech.get("latest_close") is not None:
             if tech["latest_close"] < tech["sma20w"]:
                 notes.append((
                     f"Price ({tech['latest_close']}) is BELOW the 20-week SMA "
@@ -1063,14 +1111,15 @@ def _verify_technicals(stock):
 
     notes = []
     price = tech["latest_close"]
-    if price < tech["sma20w"]:
-        notes.append((f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.", "hard"))
-    if price < tech["sma50w"]:
-        notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.", "hard"))
+    if REQUIRE_UPTREND_FILTER:
+        if price < tech["sma20w"]:
+            notes.append((f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.", "hard"))
+        if price < tech["sma50w"]:
+            notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.", "hard"))
 
     if tech["rsi14w"] is not None:
-        if tech["rsi14w"] >= 70:
-            notes.append((f"Weekly RSI is {tech['rsi14w']} (>=70, overbought) -- contradicts the 'RSI below 70' requirement.", "hard"))
+        if tech["rsi14w"] >= MAX_RSI_OVERBOUGHT:
+            notes.append((f"Weekly RSI is {tech['rsi14w']} (>={_fmt_num(MAX_RSI_OVERBOUGHT)}, overbought) -- contradicts the 'RSI below {_fmt_num(MAX_RSI_OVERBOUGHT)}' requirement.", "hard"))
         if tech.get("rsi14w_prev") is not None and tech["rsi14w"] < tech["rsi14w_prev"]:
             notes.append((f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.", "soft"))
 
@@ -1197,30 +1246,30 @@ def _verify_fundamentals(stock):
 
     dte = data.get("debt_to_equity")
     if dte is not None:
-        if dte > 100:
-            notes.append((f"Debt-to-equity is {dte:.0f}% -- elevated, contradicts the 'low debt-to-equity' requirement.", "hard"))
+        if dte > MAX_DEBT_TO_EQUITY_PCT:
+            notes.append((f"Debt-to-equity is {dte:.0f}% -- elevated (above the {_fmt_num(MAX_DEBT_TO_EQUITY_PCT)}% threshold), contradicts the 'low debt-to-equity' requirement.", "hard"))
     else:
         notes.append(("Debt-to-equity not available from data provider -- unverified.", "soft"))
 
     roe = data.get("roe")
     if roe is not None:
         roe_pct = roe * 100 if abs(roe) <= 1 else roe
-        if roe_pct < 10:
-            notes.append((f"ROE is {roe_pct:.1f}% -- weak, contradicts the 'high/improving ROCE/ROE' requirement.", "hard"))
+        if roe_pct < MIN_ROE_PCT:
+            notes.append((f"ROE is {roe_pct:.1f}% -- weak (below the {_fmt_num(MIN_ROE_PCT)}% threshold), contradicts the 'high/improving ROCE/ROE' requirement.", "hard"))
     else:
         notes.append(("ROE not available from data provider -- unverified.", "soft"))
 
     rev_g = data.get("revenue_growth_yoy")
     if rev_g is not None:
-        if rev_g < 20:
-            notes.append((f"Revenue growth YoY is {rev_g}% -- below the 20% threshold the prompt requires.", "hard"))
+        if rev_g < MIN_GROWTH_YOY_PCT:
+            notes.append((f"Revenue growth YoY is {rev_g}% -- below the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold the prompt requires.", "hard"))
     else:
         notes.append(("Revenue YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
     profit_g = data.get("profit_growth_yoy")
     if profit_g is not None:
-        if profit_g < 20:
-            notes.append((f"Net profit growth YoY is {profit_g}% -- below the 20% threshold the prompt requires.", "hard"))
+        if profit_g < MIN_GROWTH_YOY_PCT:
+            notes.append((f"Net profit growth YoY is {profit_g}% -- below the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold the prompt requires.", "hard"))
     else:
         notes.append(("Net profit YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
@@ -1514,12 +1563,13 @@ def _no_qualifying_stock_html(rejected):
     the bug this replaces.
     """
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    uptrend_phrase = "uptrend, " if REQUIRE_UPTREND_FILTER else ""
     out = (
         f'<div style="font-family:{sans};font-size:13px;color:#14213D;line-height:1.65;'
         f'padding:14px 16px;background:#F4F2ED;border-radius:4px;border:1px solid #E7E4DC;">'
         "<strong>No qualifying trade found for this run.</strong> Every candidate considered "
-        "failed at least one of the strategy's mandatory filters (uptrend, rising RSI below 70, "
-        "bullish MACD crossover, &ge;20% YoY revenue/profit growth, or &ge;1:2.5 risk:reward) once "
+        f"failed at least one of the strategy's mandatory filters ({uptrend_phrase}rising RSI below {_fmt_num(MAX_RSI_OVERBOUGHT)}, "
+        f"bullish MACD crossover, &ge;{_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue/profit growth, or &ge;1:{_fmt_num(MIN_RISK_REWARD)} risk:reward) once "
         "checked against independently-verified data, even after retrying with feedback. No pick is "
         "being reported rather than recommending one that fails its own entry criteria."
         "</div>"

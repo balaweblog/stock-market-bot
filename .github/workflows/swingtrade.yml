@@ -21,6 +21,19 @@ jobs:
       DRY_RUN: ${{ github.event.inputs.dry_run }}
       TAVILY_API_KEY : ${{ secrets.TAVILY_API_KEY }}
       MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+
+      # --- Mandatory-filter thresholds (all optional -- values below match
+      # the script's own defaults, so this block currently changes nothing.
+      # Edit any value to loosen/tighten that specific filter without
+      # touching code. See swing_trade_advisor.py's "Configurable
+      # mandatory-filter thresholds" section for what each one enforces. ---
+      MIN_GROWTH_YOY_PCT: "20"
+      MIN_RISK_REWARD: "2.0"
+      MAX_RSI_OVERBOUGHT: "70"
+      MAX_DEBT_TO_EQUITY_PCT: "100"
+      MIN_ROE_PCT: "10"
+      REQUIRE_UPTREND_FILTER: "true"
+
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
