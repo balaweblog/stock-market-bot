@@ -69,7 +69,24 @@ REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower()
 # two-stage pipeline (fundamentals screen, then technicals -- see below), so
 # this is 2 LLM calls per attempt, not 1. 3 is a reasonable default for a
 # WEEKLY run (see SCHEDULE note below) -- it wouldn't be for a daily one.
-MAX_GENERATION_ATTEMPTS = int(os.getenv("MAX_GENERATION_ATTEMPTS", "3"))
+def _env_int(name, default):
+    """
+    Parses an integer env var, falling back to `default` (and logging a
+    warning) if it's unset, empty, or not a valid integer -- so a typo'd
+    workflow-yaml value (e.g. SECTORS_PER_ATTEMPT=six) can't crash the
+    whole script at import time before any logging is even configured.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(f"WARNING: env var {name}='{raw}' is not a valid integer -- using default {default}.")
+        return default
+
+
+MAX_GENERATION_ATTEMPTS = _env_int("MAX_GENERATION_ATTEMPTS", 3)
 
 # -----------------------------
 # Sector rotation across attempts
@@ -85,7 +102,7 @@ SECTORS = [
     "Metals & Mining", "Realty & Construction", "Energy & Power",
     "Textiles & Apparel", "Cement", "Telecom",
 ]
-SECTORS_PER_ATTEMPT = int(os.getenv("SECTORS_PER_ATTEMPT", "6"))
+SECTORS_PER_ATTEMPT = _env_int("SECTORS_PER_ATTEMPT", 6)
 
 
 def _sectors_for_attempt(attempt_idx):
@@ -93,7 +110,10 @@ def _sectors_for_attempt(attempt_idx):
     successive attempts within one run cover new ground instead of
     re-searching the same sectors."""
     n = len(SECTORS)
-    k = min(SECTORS_PER_ATTEMPT, n)
+    # Guard against a misconfigured (<=0) SECTORS_PER_ATTEMPT producing an
+    # empty slice, which would send the model a prompt with no sectors to
+    # search at all -- fall back to at least 1.
+    k = max(1, min(SECTORS_PER_ATTEMPT, n))
     start = (attempt_idx * k) % n
     return [SECTORS[(start + i) % n] for i in range(k)]
 
@@ -502,7 +522,7 @@ def generate_analysis(prompt, max_tokens=1200):
         if result is not None:
             return result
 
-        if main.gemini_client is None and not (os.getenv("GOOGLE_API_KEY") and main.genai is not None):
+        if getattr(main, "gemini_client", None) is None and not (os.getenv("GOOGLE_API_KEY") and getattr(main, "genai", None) is not None):
             main.log.info(
                 "Gemini live-search fallback skipped: GOOGLE_API_KEY is not "
                 "configured (or the google-genai package isn't installed), "
@@ -534,7 +554,7 @@ def generate_analysis(prompt, max_tokens=1200):
                         "Falling back to the local model instead of retrying Groq."
                     )
 
-    elif backend == "gemini" or main.gemini_client is not None:
+    elif backend == "gemini" or getattr(main, "gemini_client", None) is not None:
         grounded = _try_gemini_grounded(prompt)
         if grounded is not None:
             return grounded
@@ -614,9 +634,19 @@ def _parse_groq_retry_seconds(exc):
 
 
 def _try_gemini_grounded(prompt):
-    if main.gemini_client is None:
+    # NOTE: this deliberately reads/writes main.gemini_client (module-level
+    # state on the imported main module) rather than a local variable, so
+    # that once it's lazily created here it's reused -- not re-created --
+    # by any subsequent call in this process, matching main.py's own client
+    # caching. This is intentional shared state, not an oversight. It
+    # assumes single-threaded/sequential execution, which holds for this
+    # script's current run() loop -- if swing_trade_advisor and main were
+    # ever driven concurrently in the same process, the check-then-set
+    # below would need a lock to avoid a race. getattr() is used defensively
+    # in case main is ever reloaded/mocked without these attributes set.
+    if getattr(main, "gemini_client", None) is None:
         api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key or main.genai is None:
+        if not api_key or getattr(main, "genai", None) is None:
             return None
         try:
             main.gemini_client = main.genai.Client(api_key=api_key)
@@ -823,6 +853,7 @@ def _fetch_weekly_technicals(ticker):
             result = {"insufficient_history": True, "weeks_available": len(weekly_close)}
             if len(weekly_close) >= 20:
                 result["sma20w"] = round(float(weekly_close.rolling(20).mean().iloc[-1]), 2)
+                result["latest_close"] = round(float(weekly_close.iloc[-1]), 2)
             return result
 
         sma20w = weekly_close.rolling(20).mean()
@@ -867,10 +898,22 @@ def _verify_technicals(stock):
     if tech is None:
         return [("Technicals could not be independently verified (price history fetch failed).", "soft")]
     if tech.get("insufficient_history"):
-        return [(
+        notes = [(
             f"Only {tech.get('weeks_available')} weeks of price history available -- "
-            "not enough to verify the 50-week SMA; technical claims are unverified.", "soft"
+            "not enough to verify the 50-week SMA, RSI, or MACD; those claims are "
+            "unverified.", "soft"
         )]
+        # Even with <55 weeks we may still have enough for the 20-week SMA
+        # (_fetch_weekly_technicals populates it once >=20 weeks are available)
+        # -- that much is checkable, so don't leave it as a blanket "unverified".
+        if tech.get("sma20w") is not None and tech.get("latest_close") is not None:
+            if tech["latest_close"] < tech["sma20w"]:
+                notes.append((
+                    f"Price ({tech['latest_close']}) is BELOW the 20-week SMA "
+                    f"({tech['sma20w']}) -- contradicts the required uptrend filter "
+                    "(this much is checkable even with limited history).", "hard"
+                ))
+        return notes
 
     notes = []
     price = tech["latest_close"]
@@ -918,23 +961,56 @@ def _fetch_fundamentals(ticker):
         }
         try:
             qf = yt.quarterly_financials  # rows = line items, cols = quarter-end dates, most-recent first
-            if qf is not None and not qf.empty and qf.shape[1] >= 5:
-                revenue_row = next((r for r in qf.index if "total revenue" in r.lower()), None)
-                income_row = next((r for r in qf.index if r.lower() == "net income"), None)
-                if revenue_row is not None:
-                    latest, year_ago = qf.loc[revenue_row].iloc[0], qf.loc[revenue_row].iloc[4]
-                    if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
-                        result["revenue_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
-                if income_row is not None:
-                    latest, year_ago = qf.loc[income_row].iloc[0], qf.loc[income_row].iloc[4]
-                    if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
-                        result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+            if qf is not None and not qf.empty and qf.shape[1] >= 2:
+                year_ago_idx = _find_year_ago_index(list(qf.columns))
+                if year_ago_idx is None:
+                    main.log.warning(
+                        f"'{ticker}': no quarterly_financials column falls within "
+                        "45 days of 1 year before the latest quarter -- skipping "
+                        "YoY growth calc (irregular/missing quarterly history) "
+                        "rather than comparing against the wrong period."
+                    )
+                else:
+                    revenue_row = next((r for r in qf.index if "total revenue" in r.lower()), None)
+                    income_row = next((r for r in qf.index if r.lower() == "net income"), None)
+                    if revenue_row is not None:
+                        latest, year_ago = qf.loc[revenue_row].iloc[0], qf.loc[revenue_row].iloc[year_ago_idx]
+                        if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                            result["revenue_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+                    if income_row is not None:
+                        latest, year_ago = qf.loc[income_row].iloc[0], qf.loc[income_row].iloc[year_ago_idx]
+                        if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                            result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
         except Exception as e:
             main.log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
         return result
     except Exception as e:
         main.log.warning(f"Could not fetch fundamentals for '{ticker}': {e}")
         return None
+
+
+def _find_year_ago_index(columns, tolerance_days=45):
+    """
+    Given quarterly_financials' columns (most-recent-first, each a
+    quarter-end Timestamp), returns the positional index of whichever
+    column falls closest to 365 days before the most recent column --
+    instead of assuming a fixed offset of 4 quarters back. A fixed offset
+    silently compares against the wrong period whenever a company's
+    reported quarterly history has a gap or an irregular (non-quarterly)
+    reporting cadence. Returns None if no column falls within
+    tolerance_days of the 1-year-ago target, so callers can skip the
+    growth calc rather than compute it against a mismatched period.
+    """
+    if len(columns) < 2:
+        return None
+    latest_date = columns[0]
+    target = latest_date - pd.Timedelta(days=365)
+    best_idx, best_diff = None, None
+    for i, col in enumerate(columns[1:], start=1):
+        diff = abs((col - target).days)
+        if diff <= tolerance_days and (best_diff is None or diff < best_diff):
+            best_idx, best_diff = i, diff
+    return best_idx
 
 
 def _verify_fundamentals(stock):
@@ -1005,6 +1081,9 @@ def _prefilter_by_fundamentals(candidates):
     for c in candidates:
         ticker = (c.get("ticker") or "").strip()
         if not ticker:
+            record = dict(c)
+            record["_verification_notes"] = [("No ticker provided by the model for this candidate -- cannot verify or trade it.", "hard")]
+            rejected.append(record)
             continue
         notes = _verify_fundamentals({"ticker": ticker})
         hard = [n for n, sev in notes if sev == "hard"]
@@ -1313,9 +1392,13 @@ def _build_sources_html(sources):
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     items = "".join(
         f'<div style="margin:5px 0 0;font-family:{sans};font-size:11px;">'
-        f'<a href="{url}" style="color:#14213D;text-decoration:none;border-bottom:1px solid #B08D57;">{title}</a></div>'
+        f'<a href="{html.escape(url, quote=True)}" style="color:#14213D;text-decoration:none;'
+        f'border-bottom:1px solid #B08D57;">{html.escape(title)}</a></div>'
         for title, url in sources[:12]
+        if url and url.strip().lower().startswith(("http://", "https://"))
     )
+    if not items:
+        return ""
     return f"""
         <div style="margin-top:14px;padding-top:12px;border-top:1px solid #EDEAE2;">
           <div style="font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.06em;">Sources Consulted &nbsp;&middot;&nbsp; Live Web Search</div>
@@ -1429,11 +1512,10 @@ def send_swing_trade_email(html_body):
     all_recipients = to_recipients + cc_recipients
 
     try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(main.EMAIL_FROM, main.EMAIL_PASSWORD)
-        server.sendmail(main.EMAIL_FROM, all_recipients, msg.as_string())
-        server.quit()
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+            server.starttls()
+            server.login(main.EMAIL_FROM, main.EMAIL_PASSWORD)
+            server.sendmail(main.EMAIL_FROM, all_recipients, msg.as_string())
         main.log.info("Swing trade email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
