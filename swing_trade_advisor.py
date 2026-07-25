@@ -19,8 +19,15 @@ to a plain (non-live) model:
   3. Tavily direct search (TAVILY_API_KEY, free tier, 1,000 searches/month,
      no card) + a plain Groq model for synthesis -- a real live-search path
      that doesn't share compound's expensive internal orchestration budget.
+     The synthesis step itself tries a short list of Groq models in order
+     (SYNTHESIS_MODELS env var) since Groq's daily token quota is tracked
+     per model, not per account -- one model running dry doesn't mean the
+     others are unavailable too.
   4. Gemini + Google Search grounding (GOOGLE_API_KEY, separate free quota).
-Only if all four fail does it drop to non-live generation (plain Groq, then
+  5. Mistral's web_search agent (MISTRAL_API_KEY, separate free quota;
+     requires `pip install mistralai`) -- tried regardless of which primary
+     backend main.py selected, since it shares no quota with any of the above.
+Only if all five fail does it drop to non-live generation (plain Groq, then
 local Qwen2.5-1.5B) -- and even then, REQUIRE_LIVE_DATA=true (the default)
 aborts the run instead of emailing unverified, training-data-only output.
 The email lists whichever sources were actually used under "Sources
@@ -428,17 +435,108 @@ def _try_tavily_plus_groq(prompt, today_str, max_tokens=1500):
     if not context_text:
         main.log.warning("Tavily returned no usable results -- skipping this fallback tier.")
         return None
+
+    # Groq's daily token quota (TPD) is tracked per model, not per account --
+    # e.g. llama-3.3-70b-versatile has a 100K TPD cap while openai/gpt-oss-120b
+    # has 200K TPD, entirely separate budgets under the same GROQ_API_KEY. A
+    # model that's run dry today doesn't mean the account is out of quota, so
+    # try a short list of models in order rather than hard-coding just one.
+    # Override with SYNTHESIS_MODELS="model-a,model-b" (comma-separated) if
+    # you want different models/order without editing code.
+    synthesis_models = [
+        m.strip() for m in os.getenv(
+            "SYNTHESIS_MODELS",
+            "llama-3.3-70b-versatile,openai/gpt-oss-120b,llama-3.1-8b-instant",
+        ).split(",") if m.strip()
+    ]
+    for model_name in synthesis_models:
+        try:
+            response = main.groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": context_text + prompt}],
+                temperature=0.4,
+                max_tokens=max_tokens,
+            )
+            text = response.choices[0].message.content.strip()
+            return text, sources, True  # True: grounded in real Tavily results
+        except Exception as e:
+            main.log.error(f"Groq synthesis over Tavily context failed with {model_name}: {e}")
+            if not _is_daily_quota_exceeded(e) and not _is_request_too_large(e):
+                # Not a quota/size issue (e.g. auth or model-not-found) --
+                # trying another model won't fix that, so stop here instead
+                # of burning requests on models that will fail the same way.
+                break
+    return None
+
+
+def _try_mistral_web_search(prompt, max_tokens=1500):
+    """
+    Fifth live-search fallback tier: Mistral's free-tier Agents API, which
+    has a first-party `web_search` tool -- an entirely separate quota from
+    Groq's (all models), Tavily's, and Gemini's, so it's still available
+    even if all of those are exhausted on a given day.
+
+    Requires MISTRAL_API_KEY (console.mistral.ai, free tier, no card) and
+    the `mistralai` package (`pip install mistralai`). Skips cleanly (no
+    exception) if either is missing, matching how the Gemini fallback above
+    treats a missing GOOGLE_API_KEY / google-genai package.
+
+    IMPORTANT: web_search only works via the Agents/Conversations API
+    (client.beta.agents / client.beta.conversations), not the plain Chat
+    Completions API (client.chat.complete) -- Mistral's docs are explicit
+    that Chat Completions responses can't carry the search-result
+    references the tool returns. That's why this creates a throwaway
+    agent per call rather than using a simple chat completion.
+
+    Returns (text, sources, True) on success, or None on any failure so
+    callers can fall through to their next option.
+    """
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
+        main.log.info("Mistral fallback skipped: MISTRAL_API_KEY is not configured.")
+        return None
     try:
-        response = main.groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": context_text + prompt}],
-            temperature=0.4,
-            max_tokens=max_tokens,
+        from mistralai import Mistral
+    except ImportError:
+        main.log.info(
+            "Mistral fallback skipped: the `mistralai` package isn't "
+            "installed (pip install mistralai)."
         )
-        text = response.choices[0].message.content.strip()
-        return text, sources, True  # True: grounded in real Tavily results
+        return None
+    try:
+        client = Mistral(api_key=api_key)
+        agent = client.beta.agents.create(
+            model="mistral-medium-latest",
+            name="swing-trade-live-search",
+            description="One-off agent for live-search-grounded swing-trade generation.",
+            tools=[{"type": "web_search"}],
+        )
+        response = client.beta.conversations.start(
+            agent_id=agent.id,
+            inputs=prompt,
+        )
+        text_parts, sources = [], []
+        for item in getattr(response, "outputs", None) or []:
+            content = getattr(item, "content", None)
+            if isinstance(content, str):
+                text_parts.append(content)
+                continue
+            for chunk in content or []:
+                chunk_type = getattr(chunk, "type", None)
+                if chunk_type == "text":
+                    text_parts.append(getattr(chunk, "text", "") or "")
+                elif chunk_type in ("tool_reference", "url_citation"):
+                    url = getattr(chunk, "url", None)
+                    title = getattr(chunk, "title", None) or url
+                    if url and (title, url) not in sources:
+                        sources.append((title, url))
+        text = "".join(text_parts).strip()
+        if not text:
+            main.log.warning("Mistral web-search agent returned no text content.")
+            return None
+        return text, sources, True  # True: grounded via Mistral's web_search tool
     except Exception as e:
-        main.log.error(f"Groq synthesis over Tavily context failed: {e}")
+        main.log.error(f"Mistral web-search fallback failed: {e}")
         return None
 
 
@@ -567,6 +665,14 @@ def generate_analysis(prompt, max_tokens=1200):
                 return response.text.strip(), [], False
             except Exception as e:
                 main.log.error(f"Gemini swing-trade generation failed: {e}")
+
+    # Fifth live-search tier, tried regardless of which primary backend was
+    # selected above: Mistral's web_search agent, on a quota entirely
+    # separate from Groq (all models) and Gemini. Only reached if nothing
+    # above already returned.
+    mistral_result = _try_mistral_web_search(prompt, max_tokens=max_tokens)
+    if mistral_result is not None:
+        return mistral_result
 
     if require_live:
         main.log.info(

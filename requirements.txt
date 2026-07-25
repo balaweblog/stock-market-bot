@@ -16,3 +16,4 @@ pyqt5
 pyqtwebengine
 playwright
 google-genai
+mistralai

@@ -20,6 +20,7 @@ jobs:
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       DRY_RUN: ${{ github.event.inputs.dry_run }}
       TAVILY_API_KEY : ${{ secrets.TAVILY_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
