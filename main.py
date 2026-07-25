@@ -1633,7 +1633,11 @@ def build_fundamentals_html(fundamentals, fund_score):
 
 def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamentals, market_context):
     # Use the existing final_score weighting and fold advanced fundamentals into total score.
-    combined_fund = fundamentals + (adv_fundamentals * 0.4)
+    # Clamped to 100: final_score's 0.4/0.35/0.25 weights are only calibrated to produce
+    # a genuine 0-100 result if each input is itself 0-100 -- letting the bonus push
+    # combined_fund above 100 (e.g. 100 + 100*0.4 = 140) would silently over-weight the
+    # fundamentals leg relative to technical/sentiment instead of blending it at 35%.
+    combined_fund = min(100, fundamentals + (adv_fundamentals * 0.4))
     total = final_score(technical, combined_fund, sentiment)
 
     trend_text = str(market_context.get("trend", "")).lower()
@@ -1743,7 +1747,6 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
 
         # consolidated technical score calculation
         tech_score, reasons = calculate_score(df)
-        tech_signal = get_signal(tech_score)
 
         fund_raw = fetch_fundamentals(ticker)
         fund_score = score_fundamentals(fund_raw)
@@ -3037,16 +3040,16 @@ def main(mode, use_llm, detailed_llm=False):
         "US": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
         "India": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
     }
-    for pr, score, name, html, _, market in rows:
+    for pr, score, name, row_html, _, market in rows:
         market_key = market if market in groups else "US"
         if pr == 1:
-            groups[market_key]["Buy"].append((score, name, html))
+            groups[market_key]["Buy"].append((score, name, row_html))
         elif pr == 2:
-            groups[market_key]["Hold"].append((score, name, html))
+            groups[market_key]["Hold"].append((score, name, row_html))
         elif pr == 3:
-            groups[market_key]["Sell"].append((score, name, html))
+            groups[market_key]["Sell"].append((score, name, row_html))
         else:
-            groups[market_key]["Errors"].append((score, name, html))
+            groups[market_key]["Errors"].append((score, name, row_html))
 
     for market_key in groups:
         for key in groups[market_key]:
@@ -3073,7 +3076,7 @@ def main(mode, use_llm, detailed_llm=False):
                 <td style="text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;">{formatted_date_ist}</td>
               </tr>
             </table>
-            <p style="margin:8px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#4A5063;">Coverage: <strong style="color:#14213D;">{len(rows)}</strong> symbols &nbsp;&middot;&nbsp; Buy: <strong style="color:#2F5233;">{buy_count}</strong> &nbsp;&middot;&nbsp; Hold: <strong style="color:#8A6D3B;">{hold_count}</strong> &nbsp;&middot;&nbsp; Sell: <strong style="color:#8B2E2E;">{sell_count}</strong></p>
+            <p style="margin:8px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#4A5063;">Coverage: <strong style="color:#14213D;">{len(rows)}</strong> symbols &nbsp;&middot;&nbsp; Buy: <strong style="color:#2F5233;">{buy_count}</strong> &nbsp;&middot;&nbsp; Hold: <strong style="color:#8A6D3B;">{hold_count}</strong> &nbsp;&middot;&nbsp; Sell: <strong style="color:#8B2E2E;">{sell_count}</strong>{f' &nbsp;&middot;&nbsp; Errors: <strong style="color:#8B2E2E;">{err_count}</strong>' if err_count else ''}</p>
           </td>
         </tr>
     """

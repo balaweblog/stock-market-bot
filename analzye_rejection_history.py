@@ -44,7 +44,7 @@ def summarize(rows):
 
     for metric, entries in sorted(by_metric.items(), key=lambda kv: -len(kv[1])):
         margins = [e["margin_missed_by"] for e in entries]
-        threshold = entries[0]["threshold"]
+        threshold = entries[-1]["threshold"]  # most recently logged value, in case auto-adjust has moved it since the first entry
         run_dates = set(e["date"] for e in entries)
         tickers = set(e["ticker"] for e in entries)
         # "near-miss" = missed by no more than 25% of the threshold's own size
@@ -59,7 +59,13 @@ def summarize(rows):
             for e in worst:
                 print(f"    {e['date']}  {e['name']} ({e['ticker']}): actual={e['actual_value']}, missed by {e['margin_missed_by']}")
 
-        if len(run_dates) >= 3 and len(near_misses) >= max(2, len(entries) // 2):
+        # A pattern requires the near-misses themselves to be spread across
+        # several different run dates -- not just that this metric was hit
+        # >=3 times overall while the near-misses happen to cluster in one
+        # bad run (that's still "one run's coincidence", the exact failure
+        # mode this script exists to catch).
+        near_miss_dates = set(e["date"] for e in near_misses)
+        if len(run_dates) >= 3 and len(near_miss_dates) >= max(2, len(run_dates) // 2):
             print("  -> Recurring near-misses across multiple runs -- this threshold may genuinely be tighter than needed.")
         elif len(run_dates) <= 1:
             print("  -> Only one run so far -- not enough history yet to tell coincidence from a real pattern.")

@@ -90,6 +90,15 @@ NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
 
+# Nifty's constituents pay a real dividend yield (historically ~1.1-1.5%
+# annualized). Every Greek/probability calculation below previously priced
+# the index as if it paid no dividend at all (q=0), which biases delta,
+# theta, POP, and touch-probability for the underlying's expected drift --
+# the bias compounds with time-to-expiry, so it matters most for the
+# Monthly/Quarterly horizons. Default is a reasonable long-run estimate;
+# override via env if you track the live trailing yield.
+DIVIDEND_YIELD = float(os.getenv("OPTIONS_DIVIDEND_YIELD", "0.012"))
+
 # -----------------------------
 # Live data fetch (NSE India option-chain API + Yahoo Finance)
 # -----------------------------
@@ -910,7 +919,14 @@ def time_to_expiry_years(expiry_dt, now=None):
     return max((expiry_close - now).total_seconds() / (365.0 * 86400), 1e-6)
 
 
-def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE):
+def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE, q=DIVIDEND_YIELD):
+    """
+    Black-Scholes-Merton greeks with a continuous dividend yield q on the
+    underlying. Nifty is a dividend-paying index, so q=0 (the previous
+    behavior) understates the cost-of-carry drag on calls and overstates it
+    on puts -- every d1/d2, delta, gamma, theta, and vega below carries the
+    standard e^{-qT} discount factor to correct for that.
+    """
     try:
         sigma = _iv_to_frac(iv)
         if spot is None or strike is None or sigma is None or t_years is None:
@@ -918,23 +934,27 @@ def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE):
         if t_years <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
             return None
         sqrt_t = math.sqrt(t_years)
-        d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+        d1 = (math.log(spot / strike) + (r - q + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
         d2 = d1 - sigma * sqrt_t
         pdf_d1 = _norm_pdf(d1)
+        disc_q = math.exp(-q * t_years)
+        disc_r = math.exp(-r * t_years)
         if opt_type == "CE":
-            delta = _norm_cdf(d1)
+            delta = disc_q * _norm_cdf(d1)
             theta = (
-                -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
-                - r * strike * math.exp(-r * t_years) * _norm_cdf(d2)
+                -(spot * disc_q * pdf_d1 * sigma) / (2 * sqrt_t)
+                - r * strike * disc_r * _norm_cdf(d2)
+                + q * spot * disc_q * _norm_cdf(d1)
             ) / 365.0
         else:
-            delta = _norm_cdf(d1) - 1.0
+            delta = disc_q * (_norm_cdf(d1) - 1.0)
             theta = (
-                -(spot * pdf_d1 * sigma) / (2 * sqrt_t)
-                + r * strike * math.exp(-r * t_years) * _norm_cdf(-d2)
+                -(spot * disc_q * pdf_d1 * sigma) / (2 * sqrt_t)
+                + r * strike * disc_r * _norm_cdf(-d2)
+                - q * spot * disc_q * _norm_cdf(-d1)
             ) / 365.0
-        gamma = pdf_d1 / (spot * sigma * sqrt_t)
-        vega = spot * pdf_d1 * sqrt_t / 100.0
+        gamma = disc_q * pdf_d1 / (spot * sigma * sqrt_t)
+        vega = spot * disc_q * pdf_d1 * sqrt_t / 100.0
         return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
@@ -968,7 +988,7 @@ def _pop_diagnostics(spot, t_years, iv, breakevens):
     }
 
 
-def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
+def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE, q=DIVIDEND_YIELD):
     sigma = _iv_to_frac(iv)
     if spot is None or sigma is None or t_years is None or t_years <= 0 or sigma <= 0:
         return None
@@ -977,7 +997,7 @@ def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
         if K <= 0:
             return 0.0
         sqrt_t = math.sqrt(t_years)
-        d1 = (math.log(spot / K) + (r + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
+        d1 = (math.log(spot / K) + (r - q + 0.5 * sigma ** 2) * t_years) / (sigma * sqrt_t)
         d2 = d1 - sigma * sqrt_t
         return 1.0 - _norm_cdf(d2)
 
@@ -994,7 +1014,7 @@ def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE):
     return round(max(0.0, min(1.0, prob_profit)) * 100, 1)
 
 
-def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE):
+def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE, q=DIVIDEND_YIELD):
     sigma = _iv_to_frac(iv)
     if (
         spot is None or sigma is None or t_years is None or t_years <= 0
@@ -1002,7 +1022,7 @@ def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE):
     ):
         return None
     try:
-        mu = r - 0.5 * sigma ** 2
+        mu = r - q - 0.5 * sigma ** 2
         a = math.log(barrier / spot)
         sqrt_t = math.sqrt(t_years)
         if a > 0:
@@ -1047,10 +1067,35 @@ def compute_expectancy_metrics(pop_pct, max_profit_inr, max_loss_inr):
     }
 
 
+_DEFINED_RISK_MARGIN_MULTIPLIER = float(os.getenv("OPTIONS_MARGIN_MULTIPLIER", "1.2"))
+
+
 def estimate_margin_and_rom(max_loss_inr, max_profit_inr, priced_legs, lot_size):
-    short_legs = [l for l in priced_legs if l["action"] == "Sell"]
-    exposure_buffer = 0.03 * sum(l["strike"] for l in short_legs) * lot_size if short_legs else 0.0
-    margin = max(max_loss_inr, exposure_buffer, 1.0)
+    """
+    Approximate NSE SPAN + Exposure margin for a VERIFIED defined-risk
+    options spread (bull put / bear call / iron condor -- this function is
+    only ever reached after apply_verified_payoff has already rejected any
+    unbounded-risk structure).
+
+    BUG FIXED: this previously computed an `exposure_buffer` as 3% of the
+    short leg's full notional (strike x lot_size) and took the max of that
+    against max_loss_inr. For a typical Nifty spread that buffer dwarfs the
+    real max loss -- e.g. spot 25000, lot_size 75, one short leg: 0.03 x
+    25000 x 75 = Rs 56,250, versus a real max loss on a 100-150pt wide
+    spread of roughly Rs 5,000-8,000. That 3% figure is the right order of
+    magnitude for margining a NAKED/uncovered short option, not a
+    risk-defined spread. Since Feb 2021 SEBI peak-margin norms, exchanges
+    grant same-underlying/same-expiry spread margin benefit on these
+    structures, so the real SPAN+Exposure margin blocked is close to (and
+    only modestly above) the worst-case loss -- commonly ~1.15-1.3x max
+    loss in practice. Using the 3% notional buffer silently overstated
+    margin by 5-10x and understated Return on Margin by the same factor,
+    making genuinely good defined-risk trades look capital-inefficient.
+    """
+    if max_loss_inr is None or max_loss_inr <= 0:
+        margin = max(max_loss_inr or 0.0, 1.0)
+    else:
+        margin = max_loss_inr * _DEFINED_RISK_MARGIN_MULTIPLIER
     rom_pct = round(max_profit_inr / margin * 100, 2) if margin else None
     return round(margin, 0), rom_pct
 
@@ -3081,6 +3126,27 @@ def _horizon_rejected(h):
     )
 
 
+def _aggregate_risk_from_verified(horizons):
+    """
+    Sum the already-computed per-lot max loss across horizons without
+    re-running apply_verified_payoff. BUG FIXED: run() previously called
+    reverify_horizons(..., only_names=None) as a final step *after*
+    repair_rejected_legs had already reverified everything it touched --
+    that unconditionally re-applied apply_verified_payoff to every horizon
+    a second (sometimes third) time purely to get an aggregate percentage,
+    which is wasted work with no effect on the numbers (the computation is
+    idempotent) but made the aggregate-cap check dependent on re-deriving
+    state that was already sitting on each horizon dict.
+    """
+    total_at_risk = sum(
+        v for v in (h.get("_verified_max_loss_inr", 0.0) for h in horizons)
+        if v not in (None, float("inf"))
+    )
+    aggregate_pct = round(total_at_risk / TOTAL_CAPITAL_INR * 100, 2) if TOTAL_CAPITAL_INR else 0.0
+    over_cap = aggregate_pct > AGGREGATE_CAP_PCT
+    return aggregate_pct, over_cap
+
+
 def reverify_horizons(horizons, live_data, only_names=None):
     for h in horizons:
         name = h.get("horizon")
@@ -3404,7 +3470,7 @@ def run():
 
         horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data)
         horizons = repair_rejected_legs(horizons, live_data)
-        aggregate_pct, over_cap = reverify_horizons(horizons, live_data, only_names=None)
+        aggregate_pct, over_cap = _aggregate_risk_from_verified(horizons)
         if over_cap:
             main.log.warning(
                 f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "

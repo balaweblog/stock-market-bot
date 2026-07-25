@@ -3,7 +3,14 @@ def calculate_position_size(cash, confidence, risk_per_trade=0.01, stop_loss_pct
         return 0
 
     if stop_loss_pct is None:
-        if confidence >= 0.85:
+        # Fallback tiers, only used when the caller doesn't supply the actual
+        # stop distance. Kept in sync with the thresholds in
+        # apply_risk_management()'s target/stop block (0.8 / 0.65) -- these
+        # previously used 0.85 / 0.65, a different cutoff, so a confidence in
+        # [0.80, 0.85) sized the position off a 5% stop while the stop-loss
+        # actually shown to the user was 4% away. Whenever possible, prefer
+        # passing stop_loss_pct explicitly instead of relying on this fallback.
+        if confidence >= 0.8:
             stop_loss_pct = 0.04
         elif confidence >= 0.65:
             stop_loss_pct = 0.05
@@ -35,8 +42,6 @@ def apply_risk_management(signal, total_score, cash, price, entry_context=None):
                 "aggressive_entry": round(price * 1.02, 2),
             },
         }
-
-    size = calculate_position_size(cash, confidence)
 
     if signal == "STRONG BUY":
         patient_discount = 0.03 if confidence >= 0.8 else 0.04
@@ -87,6 +92,11 @@ def apply_risk_management(signal, total_score, cash, price, entry_context=None):
 
     target = price * (1 + target_pct)
     stop_loss = price * (1 - stop_loss_pct)
+
+    # Size the position off the SAME stop_loss_pct used for the stop-loss
+    # shown above, so "risk_per_trade% of cash" actually matches the real
+    # distance to the stop instead of a different, independently-derived tier.
+    size = calculate_position_size(cash, confidence, stop_loss_pct=stop_loss_pct)
 
     return {
         "confidence": round(confidence, 2),

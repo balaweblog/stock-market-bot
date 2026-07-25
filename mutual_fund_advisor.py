@@ -582,7 +582,7 @@ def render_market_news(market_data):
 def render_sector_table(sectors_data):
     def stars(rating):
         try:
-            n = max(0, min(5, int(rating)))
+            n = max(0, min(5, round(float(rating))))
         except (TypeError, ValueError):
             n = 0
         return "&#9733;" * n + "&#9734;" * (5 - n)

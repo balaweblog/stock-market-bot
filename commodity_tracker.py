@@ -4,6 +4,12 @@ import yfinance as yf
 
 from recommendation_logic import derive_commodity_buy_levels
 
+try:
+    from market_context import get_resilient_session
+except ImportError:
+    def get_resilient_session():
+        return None
+
 
 class CommodityTracker:
     BASE_URL = "https://api.gold-api.com"
@@ -14,7 +20,13 @@ class CommodityTracker:
     GOLD_KARAT = 22
 
     def __init__(self, api_key=None):
-        pass
+        # Cache so a single tracker run makes one FX call instead of three
+        # (fetch_current_prices + fetch_history for gold + fetch_history for
+        # silver each called usd_to_inr() independently). Beyond the wasted
+        # requests, each call could return a slightly different live rate;
+        # caching keeps "current" and "history" priced off the same USD/INR
+        # number for internal consistency.
+        self._usd_inr_cache = None
 
     # ---------------- API ----------------
     def call_api(self, endpoint):
@@ -49,13 +61,16 @@ class CommodityTracker:
 
     # ---------------- FX ----------------
     def usd_to_inr(self):
+        if self._usd_inr_cache is not None:
+            return self._usd_inr_cache
         url = "https://open.er-api.com/v6/latest/USD"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         if "rates" not in data:
             raise Exception(f"FX API Error: {data}")
-        return data["rates"]["INR"]
+        self._usd_inr_cache = data["rates"]["INR"]
+        return self._usd_inr_cache
 
     # ---------------- Prices ----------------
     def fetch_current_prices(self):
@@ -94,6 +109,7 @@ class CommodityTracker:
             period=f"{int(days * 1.6) + 5}d",
             interval="1d",
             progress=False,
+            session=get_resilient_session(),
         )
 
         close_series = df["Close"].squeeze().dropna().tail(days)

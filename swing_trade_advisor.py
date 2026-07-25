@@ -1757,6 +1757,20 @@ def _risk_level_badge(level):
     )
 
 
+def _risk_reward_display(stock):
+    verified = stock.get("risk_reward_ratio_verified")
+    stated = stock.get("risk_reward_ratio")
+    stated_str = str(stated).strip() if stated not in (None, "") else None
+    if verified is None:
+        return html.escape(stated_str) if stated_str else None
+    if stated_str and stated_str != verified:
+        return (
+            f'<strong>{html.escape(verified)}</strong> '
+            f'<span style="font-size:11px;color:#8A8F9C;">(model stated {html.escape(stated_str)})</span>'
+        )
+    return f'<strong>{html.escape(verified)}</strong>'
+
+
 def _render_one_stock_card(stock, idx, sans):
     def esc(v):
         v = "" if v is None else str(v).strip()
@@ -1784,7 +1798,7 @@ def _render_one_stock_card(stock, idx, sans):
         raw_row("Confidence Score", _confidence_display),
         raw_row("Risk Level", lambda s: _risk_level_badge(s.get("risk_level"))),
         row("Key Catalysts", "key_catalysts"),
-        row("Risk : Reward", "risk_reward_ratio", bold=True),
+        raw_row("Risk : Reward", _risk_reward_display),
         row("Allocation (% of capital)", "allocation_pct"),
         row("Entry Date (Targeted)", "entry_date"),
         row("Exit Date (Expected)", "exit_date"),
