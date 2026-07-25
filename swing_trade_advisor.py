@@ -155,6 +155,23 @@ STRATEGY_TYPES_BLOCK = """Stock Selection Strategy (choose one per stock in Stag
 - Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play."""
 
 
+MEGA_LARGE_CAP_CAUTION = (
+    "IMPORTANT market-cap steering: well-known large-caps and megacaps (e.g. "
+    "TCS, Infosys, HCL Tech, Wipro, Reliance, HDFC Bank, ICICI Bank, Sun "
+    "Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
+    "never post BOTH >=20% YoY revenue growth AND >=20% YoY profit growth in "
+    "the same quarter simultaneously -- their revenue base is too large for "
+    "that pace of growth except in rare one-off years. Repeatedly proposing "
+    "these names and having them fail this filter wastes this search. "
+    "Deprioritize them unless you have concrete, verifiable evidence of an "
+    "unusual one-off beat this specific quarter. Spend most of your search "
+    "effort instead on SMALL-CAP and MID-CAP stocks (BSE SmallCap 250 / BSE "
+    "MidCap 150 universe, sub-Rs. 50,000 crore market cap) -- growth of this "
+    "magnitude is far more common off a smaller revenue base, e.g. a company "
+    "scaling from Rs. 200cr to Rs. 260cr quarterly revenue."
+)
+
+
 def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_note):
     """
     STAGE 1: fundamentals-only screen, scoped to a rotating slice of sectors
@@ -174,12 +191,14 @@ def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_not
 
 Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
 
+{MEGA_LARGE_CAP_CAUTION}
+
 Search ONLY within these sectors this pass: {sector_list}. (Other sectors are covered in separate passes this run -- stay focused here so you search a handful of names deeply rather than many names thinly.)
 
 Search Strategy:
-- Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular names.
-- Run systematic, screener-style searches per sector, e.g.: "<sector> NSE BSE India net profit growth above 20% YoY Q1 FY27", "<sector> India quarterly results revenue growth 20 percent {today_str}", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups.
-- Aim to individually check at least 6-10 distinct real companies across the sectors above before concluding few or none qualify.
+- Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular, already-large names.
+- Run systematic, screener-style searches per sector, biased toward small/mid-cap universes, e.g.: "<sector> smallcap midcap NSE BSE India net profit growth above 20% YoY Q1 FY27", "<sector> India smallcap quarterly results revenue growth 20 percent {today_str}", "BSE SmallCap 250 <sector> results beat estimates", "BSE MidCap 150 <sector> Q1 FY27 results", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups that explicitly cover smaller names, not just index heavyweights.
+- Aim to individually check at least 8-12 distinct real companies across the sectors above (weighted toward small/mid-cap) before concluding few or none qualify.
 {exclude_block}
 
 Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
@@ -195,13 +214,14 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, nothing e
       "name": "Stock name",
       "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS') -- must be a real symbol you are confident is correct",
       "sector": "One of the sectors listed above",
+      "market_cap_bucket": "One of: 'Small-cap', 'Mid-cap', 'Large-cap' -- your best estimate",
       "revenue_growth_yoy_pct": "e.g. 24.5",
       "profit_growth_yoy_pct": "e.g. 31.2",
       "why": "One sentence on the growth driver"
     }}
   ]
 }}
-List every genuine candidate you find meeting the bar in these sectors -- up to 15. It is normal for very few (even zero) to qualify in a given sector slice -- return "candidates": [] rather than padding the list.
+List every genuine candidate you find meeting the bar in these sectors -- up to 20, and favor small/mid-cap names per the market-cap steering above. It is normal for very few (even zero) to qualify in a given sector slice -- return "candidates": [] rather than padding the list.
 """
 
 
@@ -215,7 +235,8 @@ def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note
     """
     listing = "\n".join(
         f"- {c.get('name')} ({c.get('ticker')}) -- sector: {c.get('sector', '?')}, "
-        f"independently-confirmed growth: revenue {c.get('revenue_growth_yoy_pct', '?')}% / "
+        f"cap: {c.get('market_cap_bucket', '?')}, independently-confirmed growth: "
+        f"revenue {c.get('revenue_growth_yoy_pct', '?')}% / "
         f"profit {c.get('profit_growth_yoy_pct', '?')}% YoY"
         for c in candidates
     )
