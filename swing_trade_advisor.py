@@ -42,11 +42,14 @@ to verify against a live quote/news source yourself -- not investment advice.
 import os
 import re
 import sys
+import csv
 import json
 import html
 import time
 import requests
 import traceback
+from pathlib import Path
+from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -140,6 +143,271 @@ MIN_ROE_PCT = _env_float("MIN_ROE_PCT", 10.0)
 # filters still apply) -- use this if you want to consider pullback/basing
 # setups, not just confirmed uptrends.
 REQUIRE_UPTREND_FILTER = os.getenv("REQUIRE_UPTREND_FILTER", "true").lower() == "true"
+
+# -----------------------------
+# Rejection-history logging (for deciding whether a threshold is genuinely
+# too tight, versus one run's coincidence)
+# -----------------------------
+# Every "hard" rejection note already contains the real recomputed number in
+# its text (e.g. "Revenue growth YoY is 12.5%"). Rather than re-deriving that
+# number from scratch, these patterns just pull it back out of the note text
+# so it can be logged alongside the threshold that was active for that run.
+# This is a FUNCTION rather than a fixed list because _apply_auto_adjustments
+# (below) can change MIN_GROWTH_YOY_PCT etc. mid-run -- callers must always
+# get the CURRENT threshold value, not whatever was in effect at import time.
+# Each tuple: (metric_name, regex-with-one-capture-group, current_threshold, "min"|"max")
+# "min" means the candidate needed to be >= threshold (growth, ROE, risk:reward);
+# "max" means it needed to be <= threshold (debt-to-equity, RSI overbought ceiling).
+def _metric_patterns():
+    return [
+        ("revenue_growth_yoy_pct", re.compile(r"Revenue growth YoY is (-?[\d.]+)%"), MIN_GROWTH_YOY_PCT, "min"),
+        ("profit_growth_yoy_pct", re.compile(r"Net profit growth YoY is (-?[\d.]+)%"), MIN_GROWTH_YOY_PCT, "min"),
+        ("debt_to_equity_pct", re.compile(r"Debt-to-equity is (-?[\d.]+)%"), MAX_DEBT_TO_EQUITY_PCT, "max"),
+        ("roe_pct", re.compile(r"ROE is (-?[\d.]+)%"), MIN_ROE_PCT, "min"),
+        ("risk_reward_ratio", re.compile(r"Risk:reward of 1 : (-?[\d.]+) is below"), MIN_RISK_REWARD, "min"),
+        ("weekly_rsi_overbought", re.compile(r"Weekly RSI is (-?[\d.]+) \(>="), MAX_RSI_OVERBOUGHT, "max"),
+    ]
+
+
+REJECTION_HISTORY_LOG = os.getenv("REJECTION_HISTORY_LOG", "swing_trade_rejection_history.csv")
+
+
+def _log_rejection_history(rejected, today_str, log_path=REJECTION_HISTORY_LOG):
+    """
+    Appends one row per (ticker, matched threshold-miss) to a local CSV, so
+    near-miss numbers accumulate across runs instead of only being visible in
+    a single run's email. Only logs threshold-comparison misses (the ones in
+    _metric_patterns()) -- not every "hard" note, since some hard notes (e.g.
+    a model/recomputed risk:reward MISMATCH, or "price below its SMA") aren't
+    a "how close to the threshold was this" comparison and would just add
+    noise to a threshold-tuning analysis.
+
+    Best-effort and silent-on-failure by design: a broken log write should
+    never abort or change the outcome of an actual run.
+    """
+    try:
+        rows = []
+        for s in rejected:
+            ticker = (s.get("ticker") or "").strip()
+            name = s.get("name") or ticker or "?"
+            for note_text, sev in (s.get("_verification_notes") or []):
+                if sev != "hard":
+                    continue
+                for metric, pattern, threshold, direction in _metric_patterns():
+                    m = pattern.search(note_text)
+                    if not m:
+                        continue
+                    try:
+                        actual = float(m.group(1))
+                    except ValueError:
+                        continue
+                    margin = (threshold - actual) if direction == "min" else (actual - threshold)
+                    rows.append({
+                        "date": today_str,
+                        "ticker": ticker,
+                        "name": name,
+                        "metric": metric,
+                        "threshold": threshold,
+                        "actual_value": actual,
+                        "margin_missed_by": round(margin, 2),
+                    })
+        if not rows:
+            return
+        path = Path(log_path)
+        write_header = not path.exists()
+        with path.open("a", newline="") as f:
+            writer = csv.DictWriter(
+                f, fieldnames=["date", "ticker", "name", "metric", "threshold", "actual_value", "margin_missed_by"]
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        main.log.warning(f"Could not write rejection history log: {e}")
+
+
+# -----------------------------
+# Automatic threshold self-tuning -- OPT-IN, bounded, and fully logged
+# -----------------------------
+# Off by default. When enabled, each run reads the accumulated rejection-
+# history log and, ONLY where several DIFFERENT runs and DIFFERENT tickers
+# show a recurring near-miss on the same threshold, nudges that threshold a
+# small bounded step -- never past MAX_THRESHOLD_DRIFT_PCT away from the
+# value you actually configured, and never more than ADJUST_STEP_PCT of that
+# original value in a single run. It never tightens a threshold and never
+# acts on a single run's data (that's "coincidence, not pattern" -- same rule
+# analyze_rejection_history.py applies). Every change it makes is written to
+# THRESHOLD_ADJUSTMENT_LOG and disclosed in the email itself -- this is meant
+# to replace you manually re-reading the history and editing the workflow
+# yaml, not to quietly drift the strategy's own bar with no visible trail.
+AUTO_ADJUST_THRESHOLDS = os.getenv("AUTO_ADJUST_THRESHOLDS", "false").lower() == "true"
+MIN_RUNS_BEFORE_ADJUST = _env_int("MIN_RUNS_BEFORE_ADJUST", 4)
+MAX_THRESHOLD_DRIFT_PCT = _env_float("MAX_THRESHOLD_DRIFT_PCT", 25.0)
+ADJUST_STEP_PCT = _env_float("ADJUST_STEP_PCT", 5.0)
+THRESHOLD_ADJUSTMENT_LOG = os.getenv("THRESHOLD_ADJUSTMENT_LOG", "swing_trade_threshold_adjustments.csv")
+
+# Captured once, before any auto-adjustment ever runs, so drift is always
+# measured from the value YOU set in the workflow yaml -- not from an
+# already-adjusted value from a previous run (which would let drift compound
+# past MAX_THRESHOLD_DRIFT_PCT over many runs instead of being capped by it).
+_ORIGINAL_THRESHOLDS = {
+    "MIN_GROWTH_YOY_PCT": MIN_GROWTH_YOY_PCT,
+    "MIN_RISK_REWARD": MIN_RISK_REWARD,
+    "MAX_RSI_OVERBOUGHT": MAX_RSI_OVERBOUGHT,
+    "MAX_DEBT_TO_EQUITY_PCT": MAX_DEBT_TO_EQUITY_PCT,
+    "MIN_ROE_PCT": MIN_ROE_PCT,
+}
+_GLOBAL_DIRECTION = {
+    "MIN_GROWTH_YOY_PCT": "min",
+    "MIN_RISK_REWARD": "min",
+    "MAX_RSI_OVERBOUGHT": "max",
+    "MAX_DEBT_TO_EQUITY_PCT": "max",
+    "MIN_ROE_PCT": "min",
+}
+_METRIC_TO_GLOBAL = {
+    "revenue_growth_yoy_pct": "MIN_GROWTH_YOY_PCT",
+    "profit_growth_yoy_pct": "MIN_GROWTH_YOY_PCT",
+    "debt_to_equity_pct": "MAX_DEBT_TO_EQUITY_PCT",
+    "roe_pct": "MIN_ROE_PCT",
+    "risk_reward_ratio": "MIN_RISK_REWARD",
+    "weekly_rsi_overbought": "MAX_RSI_OVERBOUGHT",
+}
+
+
+def _load_history_rows(log_path=REJECTION_HISTORY_LOG):
+    path = Path(log_path)
+    if not path.exists():
+        return []
+    rows = []
+    try:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                try:
+                    r["threshold"] = float(r["threshold"])
+                    r["actual_value"] = float(r["actual_value"])
+                    r["margin_missed_by"] = float(r["margin_missed_by"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                rows.append(r)
+    except Exception as e:
+        main.log.warning(f"Could not read rejection history log '{log_path}': {e}")
+    return rows
+
+
+def _log_threshold_adjustments(applied, log_path=THRESHOLD_ADJUSTMENT_LOG):
+    """Audit trail of every auto-adjustment ever applied, independent of the
+    (transient) email/console log for that one run -- so the full history of
+    what the strategy's own bar used to be is always reconstructable."""
+    if not applied:
+        return
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    try:
+        path = Path(log_path)
+        write_header = not path.exists()
+        with path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["date", "constant", "old_value", "new_value", "reason"])
+            if write_header:
+                writer.writeheader()
+            for gname, old, new, reason in applied:
+                writer.writerow({"date": today_str, "constant": gname, "old_value": old, "new_value": new, "reason": reason})
+    except Exception as e:
+        main.log.warning(f"Could not write threshold adjustment log: {e}")
+
+
+def _apply_auto_adjustments(log_path=REJECTION_HISTORY_LOG):
+    """
+    Mutates the module-level threshold globals directly (so every downstream
+    prompt, verifier, and email-text reference already picks up the new
+    value with no other code changes needed) and returns a list of
+    (constant_name, old_value, new_value, reason) tuples for anything it
+    changed -- empty if AUTO_ADJUST_THRESHOLDS is off, there's no history
+    yet, or nothing showed a strong enough pattern this run.
+    """
+    if not AUTO_ADJUST_THRESHOLDS:
+        return []
+
+    rows = _load_history_rows(log_path)
+    if not rows:
+        return []
+
+    by_global = defaultdict(list)
+    for r in rows:
+        gname = _METRIC_TO_GLOBAL.get(r.get("metric"))
+        if gname:
+            by_global[gname].append(r)
+
+    applied = []
+    for gname, entries in by_global.items():
+        direction = _GLOBAL_DIRECTION[gname]
+        original = _ORIGINAL_THRESHOLDS[gname]
+        current = globals()[gname]
+
+        run_dates = set(e["date"] for e in entries)
+        if len(run_dates) < MIN_RUNS_BEFORE_ADJUST:
+            continue  # not enough independent runs yet -- could easily be one bad stretch
+
+        near_misses = [e for e in entries if 0 < e["margin_missed_by"] <= abs(original) * 0.25]
+        near_miss_dates = set(e["date"] for e in near_misses)
+        # Require the near-misses to be spread across at least half the runs
+        # that hit this threshold at all -- not just clustered in one run --
+        # so one unusually-close week can't look like a durable pattern.
+        if not near_misses or len(near_miss_dates) < max(2, len(run_dates) // 2):
+            continue
+
+        near_miss_values = sorted(e["actual_value"] for e in near_misses)
+        median_near_miss = near_miss_values[len(near_miss_values) // 2]
+
+        cap = abs(original) * (MAX_THRESHOLD_DRIFT_PCT / 100.0)
+        step = abs(original) * (ADJUST_STEP_PCT / 100.0)
+
+        if direction == "min":
+            target = max(median_near_miss, original - cap)   # never loosen past the drift cap
+            target = min(target, original)                    # never "loosen" upward past the original by mistake
+            new_value = current if target >= current else max(current - step, target)
+        else:
+            target = min(median_near_miss, original + cap)
+            target = max(target, original)
+            new_value = current if target <= current else min(current + step, target)
+
+        new_value = round(new_value, 2)
+        if new_value != current:
+            reason = (
+                f"{len(near_misses)} near-miss(es) across {len(near_miss_dates)} of "
+                f"{len(run_dates)} run(s) that hit this threshold (median near-miss "
+                f"value: {median_near_miss})"
+            )
+            applied.append((gname, current, new_value, reason))
+            globals()[gname] = new_value
+
+    if applied:
+        _log_threshold_adjustments(applied)
+    return applied
+
+
+def _adjustments_html(applied):
+    """Small notice box for the email disclosing exactly what was auto-adjusted
+    this run and why -- auto-tuning with no visible trail is the same failure
+    mode as a human quietly loosening the bar until something passes."""
+    if not applied:
+        return ""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    rows = "".join(
+        f'<div style="margin-top:6px;">'
+        f'<strong>{html.escape(gname)}</strong>: {old} &rarr; {new} '
+        f'<span style="color:#8A8F9C;">({html.escape(reason)})</span></div>'
+        for gname, old, new, reason in applied
+    )
+    return (
+        f'<div style="font-family:{sans};font-size:12px;color:#5C4A1E;line-height:1.6;'
+        f'padding:12px 16px;background:#FBF3DC;border-radius:4px;border:1px solid #E9DCB0;'
+        f'margin-bottom:14px;">'
+        f'<strong>Thresholds auto-adjusted this run</strong> (recurring near-misses in the '
+        f'rejection history -- see {html.escape(THRESHOLD_ADJUSTMENT_LOG)} for the full trail):'
+        f"{rows}"
+        "</div>"
+    )
+
 
 # -----------------------------
 # Sector rotation across attempts
@@ -1578,7 +1846,7 @@ def _no_qualifying_stock_html(rejected):
         items = "".join(
             f'<div style="margin-top:8px;font-family:{sans};font-size:12px;color:#4A5063;">'
             f'<strong style="color:#14213D;">{html.escape(str(s.get("name") or s.get("ticker") or "Unnamed"))}</strong>'
-            f' &mdash; rejected: {html.escape("; ".join(_hard_contradictions(s)) or "unspecified")}'
+            f' &mdash; rejected: {html.escape("; ".join(n for n, sev in (s.get("_verification_notes") or []) if sev in ("hard", "nodata")) or "unspecified")}'
             "</div>"
             for s in rejected[-6:]
         )
@@ -1657,7 +1925,7 @@ def _build_sources_html(sources):
     """
 
 
-def build_email_html(analysis_html, today_str, sources, used_live_search):
+def build_email_html(analysis_html, today_str, sources, used_live_search, adjustments_html=""):
     if used_live_search:
         disclaimer = (
             "Generated using Groq's compound model, which can run live web searches -- see "
@@ -1718,6 +1986,7 @@ def build_email_html(analysis_html, today_str, sources, used_live_search):
           </tr>
           <tr>
             <td style="padding:14px 28px 18px;" class="email-padding">
+              {adjustments_html}
               {analysis_html}
               {sources_html}
             </td>
@@ -1793,6 +2062,12 @@ def _require_live_or_abort(used_live, stage_label):
 
 
 def run():
+    applied_adjustments = _apply_auto_adjustments()
+    if applied_adjustments:
+        main.log.info("Auto-adjusted thresholds this run based on rejection history:")
+        for gname, old, new, reason in applied_adjustments:
+            main.log.info(f"  {gname}: {old} -> {new}  ({reason})")
+
     today_str, is_monday, lookback_note = _run_context()
     if is_monday:
         main.log.info("Monday run detected -- widening news/catalyst lookback to the past week.")
@@ -1920,6 +2195,11 @@ def run():
             "candidate(s) failed independent verification at Stage 2."
         )
 
+    # Log regardless of whether this run ultimately found a qualifying stock --
+    # a threshold can be worth revisiting even in a run that DID produce a
+    # pick, if other candidates that run missed it by a hair.
+    _log_rejection_history(all_rejected, today_str)
+
     if analysis_html is None:
         main.log.warning(
             f"All {MAX_GENERATION_ATTEMPTS} attempt(s) failed to produce a stock "
@@ -1928,7 +2208,7 @@ def run():
         )
         analysis_html = _no_qualifying_stock_html(all_rejected)
 
-    email_html = build_email_html(analysis_html, today_str, sources, used_live_search)
+    email_html = build_email_html(analysis_html, today_str, sources, used_live_search, _adjustments_html(applied_adjustments))
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("swing_trade_report.html", "w") as f:

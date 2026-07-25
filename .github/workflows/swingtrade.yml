@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write   # was 'read' -- needs write so the commit-back step below can push
 
 jobs:
   swing-trade-advisor:
@@ -33,6 +33,10 @@ jobs:
       MAX_DEBT_TO_EQUITY_PCT: "100"
       MIN_ROE_PCT: "10"
       REQUIRE_UPTREND_FILTER: "true"
+      AUTO_ADJUST_THRESHOLDS: "true"
+      MIN_RUNS_BEFORE_ADJUST: "4"      # needs 4+ distinct runs before it'll touch anything
+      MAX_THRESHOLD_DRIFT_PCT: "25"    # never drifts more than 25% from your configured value, ever
+      ADJUST_STEP_PCT: "5"             # moves at most 5% of the original value per run — gradual, not a jump   
 
     steps:
       - name: Checkout source
@@ -48,7 +52,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-
-
       - name: Run Option Trade
         run: python swing_trade_advisor.py
+
+      # --- NEW: persist the two CSV logs the auto-adjustment feature relies
+      # on. checkout@v4 gives a fresh clone every run, so without this,
+      # swing_trade_rejection_history.csv and swing_trade_threshold_adjustments.csv
+      # would start empty each time -- AUTO_ADJUST_THRESHOLDS would never see
+      # more than one run's worth of history and would never act.
+      - name: Commit updated history logs back to repo
+        if: always()   # keep this run's history even if the run above errored/aborted midway
+        run: |
+          git config user.name "swing-trade-bot"
+          git config user.email "actions@users.noreply.github.com"
+
+          # Only stage the two log files -- avoids accidentally committing
+          # anything else the run happened to leave on disk (e.g. a
+          # DRY_RUN swing_trade_report.html).
+          git add -A -- swing_trade_rejection_history.csv swing_trade_threshold_adjustments.csv 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "No history-log changes to commit this run."
+          else
+            git commit -m "Update swing-trade rejection/threshold history [skip ci]"
+            git push
+          fi
