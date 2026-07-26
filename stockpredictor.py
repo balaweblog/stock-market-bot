@@ -87,6 +87,23 @@ SILVER_MONTHLY_BUDGET = float(os.getenv("SILVER_MONTHLY_BUDGET", "5000"))
 # Buy list, a concentration alert card is shown.
 SECTOR_CONCENTRATION_THRESHOLD_PCT = float(os.getenv("SECTOR_CONCENTRATION_THRESHOLD_PCT", "40"))
 
+# Cash figures used by apply_risk_management() to size every equity position
+# (risk_per_trade % of this, per stock). Previously a single literal 100000
+# was hardcoded at both call sites and applied to EVERY stock regardless of
+# market -- but this script prices US stocks in USD and Indian stocks in INR
+# (see classify_market()/currency_symbol elsewhere in this file), so one flat
+# number fed into position sizing for both currencies over/understates real
+# risk by roughly the INR/USD exchange rate. Split into two market-specific
+# pools so each stock is sized against cash in its own price's currency.
+EQUITY_ACCOUNT_CASH_USD = float(os.getenv("EQUITY_ACCOUNT_CASH_USD", "100000"))
+EQUITY_ACCOUNT_CASH_INR = float(os.getenv("EQUITY_ACCOUNT_CASH_INR", "100000"))
+
+
+def _equity_account_cash(ticker):
+    """Returns the right cash pool (in the same currency as `price`) for
+    apply_risk_management(), based on which market this ticker trades in."""
+    return EQUITY_ACCOUNT_CASH_INR if classify_market(ticker) == "India" else EQUITY_ACCOUNT_CASH_USD
+
 
 def load_run_history():
     """
@@ -1561,10 +1578,10 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         # to get target/stop (target_pct/stop_loss_pct only depend on
         # confidence, not on entry_context, so this pass is unaffected by
         # not having rr yet), then a second pass with the real rr in place.
-        preliminary_risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
+        preliminary_risk_data = apply_risk_management(signal, total_score, cash=_equity_account_cash(ticker), price=latest["close"], entry_context=entry_context)
         entry_context["risk_reward_ratio"] = round((preliminary_risk_data["target"] - latest["close"]) / max(latest["close"] - preliminary_risk_data["stop_loss"], 1e-6), 2) if latest["close"] > preliminary_risk_data["stop_loss"] else None
 
-        risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
+        risk_data = apply_risk_management(signal, total_score, cash=_equity_account_cash(ticker), price=latest["close"], entry_context=entry_context)
         risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
         range_52w = calculate_52_week_range(df, latest)
         pivot_levels = compute_pivot_levels(df)
