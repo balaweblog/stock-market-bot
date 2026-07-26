@@ -45,11 +45,33 @@ import threading
 
 # LLM client state and init now live in llm_backend.py (shared with
 # swing_trade_advisor.py / optionstrategy.py). These names are kept as
-# thin aliases so any external code still referencing main.groq_client /
-# main.gemini_client / main.llm_pipeline / main.model_lock / main.init_llm_generator
-# keeps working -- they all point at the same shared module state.
+# thin aliases so any external code still referencing stockpredictor.groq_client /
+# stockpredictor.gemini_client / stockpredictor.llm_pipeline / stockpredictor.model_lock /
+# stockpredictor.init_llm_generator keeps working -- they all point at the same
+# shared module state.
 model_lock = llm_backend.model_lock
 init_llm_generator = llm_backend.init_llm_generator
+
+
+# model_lock and init_llm_generator above are safe as plain aliases --
+# a threading.Lock() is a single object that's mutated in place, and
+# init_llm_generator is a function that's never rebound after import.
+# groq_client / gemini_client / llm_pipeline / genai are different:
+# llm_backend.init_llm_generator() REBINDS those names inside
+# llm_backend's own namespace at runtime (e.g. `global groq_client;
+# groq_client = Groq(...)`). A plain `groq_client = llm_backend.groq_client`
+# captured here at import time -- before init_llm_generator() has ever
+# run -- would freeze at None forever, regardless of what llm_backend
+# later assigns. stock_market_advisor.py and mutual_fund_advisor.py both
+# read stockpredictor.groq_client / stockpredictor.gemini_client /
+# stockpredictor.llm_pipeline / stockpredictor.genai after calling
+# init_llm_generator(), so they need the LIVE current value, not a
+# snapshot -- hence a PEP 562 module __getattr__ that forwards to
+# llm_backend on every lookup instead of copying once.
+def __getattr__(name):
+    if hasattr(llm_backend, name):
+        return getattr(llm_backend, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # -----------------------------
 # Run-history persistence (enables signal-change tracking, stop/target

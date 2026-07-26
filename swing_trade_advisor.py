@@ -1822,5 +1822,28 @@ def run():
     send_swing_trade_email(email_html)
 
 
+# -----------------------------------------------------------------------
+# Backward-compat shim (PEP 562)
+# -----------------------------------------------------------------------
+# stock_market_advisor.py and mutual_fund_advisor.py still do
+#   from swing_trade_advisor import (..., _generate_local, ...)
+# from before the LLM fallback chain (model init, groq/gemini clients,
+# _generate_local, etc.) was consolidated into llm_backend.py. This
+# module no longer defines those names itself -- it only calls
+# llm_backend.generate_analysis() -- so a plain `from swing_trade_advisor
+# import _generate_local` now raises ImportError.
+#
+# Rather than either breaking those two callers or re-adding a stale
+# duplicate implementation here, forward any attribute this module
+# doesn't define itself to llm_backend, where it actually lives. This
+# covers _generate_local specifically (the one causing the ImportError)
+# as well as anything else callers may still expect at
+# swing_trade_advisor.<name> from the pre-consolidation layout.
+def __getattr__(name):
+    if hasattr(llm_backend, name):
+        return getattr(llm_backend, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 if __name__ == "__main__":
     run()
