@@ -6,7 +6,6 @@ MCP/
 terraform/
 *.DS_Store
 .DS_Store
-.github/
 .gitignore
 .vscode/
 advanced_fundamentals.py

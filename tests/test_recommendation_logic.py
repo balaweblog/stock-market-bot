@@ -7,7 +7,7 @@ import pandas as pd
 from commodity_tracker import CommodityTracker
 from position_sizing import apply_risk_management
 from recommendation_logic import derive_commodity_buy_levels
-from main import build_fundamentals_html, build_quick_summary, calculate_52_week_range, calculate_risk_meter
+from stockpredictor import build_fundamentals_html, build_quick_summary, calculate_52_week_range, calculate_risk_meter
 
 
 class RecommendationLogicTests(unittest.TestCase):

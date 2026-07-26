@@ -63,7 +63,7 @@ except ImportError:
 import smtplib
 from email.mime.text import MIMEText
 
-import main                 # LLM init + email config/credentials (via config.py)
+import stockpredictor                 # LLM init + email config/credentials (via config.py)
 import swing_trade_advisor as swing  # reuses generate_analysis() + helpers, no duplication
 from compliance import build_compliance_block_html
 
@@ -282,19 +282,19 @@ def fetch_nse_option_chain(symbol="NIFTY", timeout=12, max_attempts=3):
             return resp.json()
         except Exception as e:
             last_err = e
-            main.log.warning(
+            stockpredictor.log.warning(
                 f"NSE option-chain fetch attempt {attempt}/{max_attempts} failed for "
                 f"{symbol}: {_describe_http_error(e)}"
             )
             if attempt < max_attempts and _is_retryable_nse_error(e):
                 time.sleep(1.5 * attempt)
             elif attempt < max_attempts:
-                main.log.warning(
+                stockpredictor.log.warning(
                     f"NSE option-chain fetch for {symbol}: error looks like a block "
                     f"rather than a transient blip -- skipping remaining retries."
                 )
                 break
-    main.log.warning(
+    stockpredictor.log.warning(
         f"NSE option-chain fetch failed for {symbol}: {_describe_http_error(last_err)}"
     )
     return None
@@ -333,7 +333,7 @@ def fetch_nse_fii_dii(timeout=12, max_attempts=2):
                     fii_dii_date = row.get("date") or fii_dii_date
 
             if fii_net is None and dii_net is None:
-                main.log.warning(
+                stockpredictor.log.warning(
                     "NSE FII/DII fetch succeeded but returned no recognizable "
                     "FII/DII rows -- endpoint shape may have changed."
                 )
@@ -346,15 +346,15 @@ def fetch_nse_fii_dii(timeout=12, max_attempts=2):
             }
         except Exception as e:
             last_err = e
-            main.log.warning(
+            stockpredictor.log.warning(
                 f"NSE FII/DII fetch attempt {attempt}/{max_attempts} failed: {_describe_http_error(e)}"
             )
             if attempt < max_attempts and _is_retryable_nse_error(e):
                 time.sleep(1.5 * attempt)
             elif attempt < max_attempts:
-                main.log.warning("NSE FII/DII fetch: error looks like a block -- skipping remaining retries.")
+                stockpredictor.log.warning("NSE FII/DII fetch: error looks like a block -- skipping remaining retries.")
                 break
-    main.log.warning(f"NSE FII/DII fetch failed: {_describe_http_error(last_err)}")
+    stockpredictor.log.warning(f"NSE FII/DII fetch failed: {_describe_http_error(last_err)}")
     return None
 
 
@@ -577,7 +577,7 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
                         return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
             except Exception as e:
                 last_err = e
-                main.log.warning(
+                stockpredictor.log.warning(
                     f"NSE Bhavcopy fetch failed for {trade_date.date()} via {host} "
                     f"(attempt {attempt}/{max_attempts_per_host}): {_describe_http_error(e)}"
                 )
@@ -585,7 +585,7 @@ def fetch_nse_bhavcopy_fo(trade_date, timeout=15, max_attempts_per_host=2):
                     time.sleep(1.0 * attempt)
                 else:
                     break
-    main.log.warning(
+    stockpredictor.log.warning(
         f"NSE Bhavcopy fetch failed for {trade_date.date()} across all hosts "
         f"({', '.join(_BHAVCOPY_FO_HOSTS)}): {_describe_http_error(last_err)}"
     )
@@ -3047,27 +3047,27 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
 
 
 def send_option_strategy_email(html_body):
-    if not all([main.EMAIL_FROM, main.EMAIL_PASSWORD, main.EMAIL_TO]):
-        main.log.error(
+    if not all([stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD, stockpredictor.EMAIL_TO]):
+        stockpredictor.log.error(
             "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
             "and EMAIL_TO (the same env vars main.py uses)."
         )
         return False
 
-    to_recipients = main.parse_email_list(main.EMAIL_TO)
-    cc_recipients = main.parse_email_list(getattr(main, "EMAIL_CC", "") or "")
+    to_recipients = stockpredictor.parse_email_list(stockpredictor.EMAIL_TO)
+    cc_recipients = stockpredictor.parse_email_list(getattr(stockpredictor, "EMAIL_CC", "") or "")
 
     if not to_recipients:
-        main.log.error("No valid TO recipients found in EMAIL_TO.")
+        stockpredictor.log.error("No valid TO recipients found in EMAIL_TO.")
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"Nifty Options Strategy Note — {main.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"Nifty Options Strategy Note — {stockpredictor.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
-    msg["From"] = main.EMAIL_FROM
+    msg["From"] = stockpredictor.EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -3077,18 +3077,18 @@ def send_option_strategy_email(html_body):
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
-        server.login(main.EMAIL_FROM, main.EMAIL_PASSWORD)
-        server.sendmail(main.EMAIL_FROM, all_recipients, msg.as_string())
+        server.login(stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD)
+        server.sendmail(stockpredictor.EMAIL_FROM, all_recipients, msg.as_string())
         server.quit()
-        main.log.info("Nifty options strategy email sent successfully.")
+        stockpredictor.log.info("Nifty options strategy email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
-        main.log.error(
+        stockpredictor.log.error(
             "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
             "(use a Gmail App Password, not the account password)."
         )
     except Exception as e:
-        main.log.error(f"Failed to send Nifty options strategy email: {e}")
+        stockpredictor.log.error(f"Failed to send Nifty options strategy email: {e}")
         traceback.print_exc()
     return False
 
@@ -3200,11 +3200,11 @@ def repair_rejected_legs(horizons, live_data):
     try:
         repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(repair_prompt)
     except Exception:
-        main.log.warning("Repair pass call failed; keeping original rejection(s).")
+        stockpredictor.log.warning("Repair pass call failed; keeping original rejection(s).")
         return horizons
 
     if not repair_text:
-        main.log.warning("Repair pass produced no output; keeping original rejection(s).")
+        stockpredictor.log.warning("Repair pass produced no output; keeping original rejection(s).")
         return horizons
 
     fixed_by_name = {}
@@ -3216,7 +3216,7 @@ def repair_rejected_legs(horizons, live_data):
             if name and item.get("legs"):
                 fixed_by_name[name] = item
     except (json.JSONDecodeError, AttributeError, TypeError):
-        main.log.warning("Repair pass returned unparseable JSON; keeping original rejection(s).")
+        stockpredictor.log.warning("Repair pass returned unparseable JSON; keeping original rejection(s).")
         return horizons
 
     if not fixed_by_name:
@@ -3232,7 +3232,7 @@ def repair_rejected_legs(horizons, live_data):
     reverify_horizons(horizons, live_data, only_names=set(fixed_by_name.keys()))
     still_bad = [h.get("horizon") for h in horizons if h.get("horizon") in fixed_by_name and _horizon_rejected(h)]
     if still_bad:
-        main.log.warning(f"Repair pass attempted but still rejected after retry: {', '.join(still_bad)}")
+        stockpredictor.log.warning(f"Repair pass attempted but still rejected after retry: {', '.join(still_bad)}")
     return horizons
 
 
@@ -3404,7 +3404,7 @@ def run():
     session_label, _in_session = _market_session_label()
 
     live_data = fetch_live_market_data()
-    main.log.info(
+    stockpredictor.log.info(
         f"Live data feed status: {live_data['status']}"
         + (f" -- {'; '.join(live_data['notes'])}" if live_data["notes"] else "")
     )
@@ -3412,7 +3412,7 @@ def run():
 
     analysis, sources, used_live_search = swing.generate_analysis(prompt)
     if not analysis:
-        main.log.error(
+        stockpredictor.log.error(
             "No LLM backend produced output. Aborting without sending an email."
         )
         sys.exit(1)
@@ -3421,7 +3421,7 @@ def run():
         live_data.get("spot") or live_data.get("horizons")
     )
     if not used_live_search and not live_feed_ok and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        main.log.error(
+        stockpredictor.log.error(
             "Neither the direct NSE/Yahoo live data fetch nor the LLM's own live "
             "web search succeeded this run. Aborting."
         )
@@ -3466,19 +3466,19 @@ def run():
                 elif st == "Iron Condor":
                     h["legs"] = f"Buy {best['long_put']:g} PE, Sell {best['short_put']:g} PE, Sell {best['short_call']:g} CE, Buy {best['long_call']:g} CE"
             else:
-                main.log.info(f"Deterministic strike selection for {horizon_name} ({target_strat}): {res.get('reason')}")
+                stockpredictor.log.info(f"Deterministic strike selection for {horizon_name} ({target_strat}): {res.get('reason')}")
 
         horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data)
         horizons = repair_rejected_legs(horizons, live_data)
         aggregate_pct, over_cap = _aggregate_risk_from_verified(horizons)
         if over_cap:
-            main.log.warning(
+            stockpredictor.log.warning(
                 f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "
                 f"{AGGREGATE_CAP_PCT:.0f}% cap -- flagging in the report."
             )
         horizons_html = render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data)
     else:
-        main.log.error("Could not parse JSON from LLM output; falling back to raw text display.")
+        stockpredictor.log.error("Could not parse JSON from LLM output; falling back to raw text display.")
         sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
         horizons_html = (
             f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
@@ -3491,7 +3491,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("option_strategy_report.html", "w") as f:
             f.write(email_html)
-        main.log.info("DRY_RUN enabled -- wrote option_strategy_report.html instead of emailing.")
+        stockpredictor.log.info("DRY_RUN enabled -- wrote option_strategy_report.html instead of emailing.")
         return
 
     send_option_strategy_email(email_html)

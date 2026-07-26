@@ -36,6 +36,18 @@ Only if every one of those fails, and only if REQUIRE_LIVE_DATA=false (the
 project default is "true"), does this fall through to non-live generation:
 plain Groq, then the local Qwen2.5-1.5B model.
 
+The list above is the order used when nothing is known about current
+quota yet (e.g. the first stock of a batch run). From the 2nd call
+onward in the same process, steps 1-2 and the SYNTHESIS_MODELS list
+inside step 3 are re-ordered (and thin/exhausted models skipped
+outright) based on real remaining-tokens/remaining-requests headers
+captured off every actual Groq call, and step 3 as a whole is skipped
+if a cached Tavily /usage check shows no credits left. This is quota-
+adaptive routing, not a fixed sequence -- see "Live quota tracking"
+below _try_groq_compound_model's helpers for how it works. Gemini has
+no equivalent signal (no headers, no usage endpoint) so it stays
+purely reactive: tried in place, falls through only on an actual error.
+
 Callers own their own prompt construction, response parsing, and
 domain-specific context gathering (e.g. which Tavily queries to run) --
 this module only owns "which model, in which order, with which
@@ -132,6 +144,143 @@ use_gemini_flash = False
 gemini_client = None
 use_groq = False
 groq_client = None
+
+
+# -----------------------------------------------------------------------
+# Live quota tracking -- lets the chain route to whichever tier actually
+# has headroom left *right now* instead of always trying tiers in the
+# same hardcoded order and discovering mid-batch that #1 is out of tokens.
+#
+# HOW IT WORKS
+#   Groq and Mistral both return remaining-tokens/requests headers on
+#   every real response, for free -- so instead of a separate "probe"
+#   call (which would itself burn quota just to ask about quota), every
+#   real call captures its own headers and updates this module-global
+#   state for the *next* call to consult. That means:
+#     - The 1st call to a given model in a process still goes in the
+#       documented default order (no data yet -- treated as "unknown",
+#       not "exhausted").
+#     - From the 2nd call onward in the same run (e.g. stock #2 of a
+#       50-stock batch), a tier that's already thin gets skipped or
+#       deprioritized based on what the *previous* call actually saw,
+#       instead of being retried and failing again.
+#     - Data older than its own reported reset window is treated as
+#       unknown again (the bucket has almost certainly refilled),
+#       rather than trusted indefinitely.
+#   Gemini has no equivalent signal (no headers, no usage endpoint) so
+#   it stays purely reactive -- try it, and only fall through on a real
+#   error. Tavily has a real GET /usage endpoint but no per-response
+#   headers, so it's checked at most once every few minutes rather than
+#   on every call, and the local estimate is decremented between checks.
+# -----------------------------------------------------------------------
+_quota_lock = threading.Lock()
+_groq_quota = {}   # model_name -> {"remaining_tokens", "remaining_requests", "updated_at"}
+_tavily_quota = {"remaining_credits": None, "updated_at": None}
+
+# A tier reporting fewer tokens than this is treated as having no real
+# headroom even if technically nonzero -- avoids picking a tier that has
+# just enough left for *this* call but nothing for the next stock in the
+# same batch, which would just move the 429 one call later.
+_QUOTA_SAFETY_MARGIN_TOKENS = 500
+
+# Tavily's /usage costs an HTTP round-trip with no telemetry benefit
+# beyond the check itself, so it's cached rather than called every time
+# generate_analysis() considers the Tavily tier.
+_TAVILY_QUOTA_REFRESH_SECONDS = 300
+
+
+def _record_groq_headers(headers, model_name):
+    """Pulls remaining-tokens/requests off a raw Groq response and stashes
+    them so the *next* call routing decision can see them."""
+    if not headers:
+        return
+    try:
+        rem_tok = headers.get("x-ratelimit-remaining-tokens")
+        rem_req = headers.get("x-ratelimit-remaining-requests")
+        with _quota_lock:
+            _groq_quota[model_name] = {
+                "remaining_tokens": int(rem_tok) if rem_tok is not None else None,
+                "remaining_requests": int(rem_req) if rem_req is not None else None,
+                "updated_at": time.time(),
+            }
+    except Exception as e:
+        log.warning(f"Could not record Groq quota headers for {model_name}: {e}")
+
+
+def _groq_headroom(model_name, needed_tokens):
+    """
+    True/False/None for whether `model_name` looks able to serve a call
+    needing ~needed_tokens right now, based on the last real response
+    from that model this run:
+      True  -- last-known remaining tokens/requests comfortably cover it
+      False -- last-known remaining tokens/requests do NOT cover it
+      None  -- no (fresh) data -- caller should still try it
+    TPM windows are under a minute, so data older than 65s is treated as
+    unknown rather than trusted -- the bucket has likely already reset.
+    """
+    with _quota_lock:
+        info = _groq_quota.get(model_name)
+    if not info:
+        return None
+    if time.time() - info["updated_at"] > 65:
+        return None
+    rem_tok, rem_req = info.get("remaining_tokens"), info.get("remaining_requests")
+    if rem_req is not None and rem_req <= 0:
+        return False
+    if rem_tok is not None and rem_tok < needed_tokens + _QUOTA_SAFETY_MARGIN_TOKENS:
+        return False
+    return True
+
+
+def _order_by_headroom(model_names, needed_tokens):
+    """
+    Sorts model_names so ones with known headroom go first, ones with
+    known exhaustion go last, and ones with no data yet keep their
+    original relative order in the middle. This is what makes the chain
+    "route based on pending tokens" rather than always trying the same
+    model first: if compound-mini currently has more headroom than
+    compound, it gets tried first.
+    """
+    def _key(name):
+        headroom = _groq_headroom(name, needed_tokens)
+        return {True: 0, None: 1, False: 2}[headroom]
+    return sorted(model_names, key=_key)
+
+
+def _tavily_remaining_credits():
+    """
+    Best-effort remaining-credit count for Tavily's free tier. Cached for
+    _TAVILY_QUOTA_REFRESH_SECONDS so checking quota doesn't itself become
+    an extra network call on every single stock in a batch. Returns None
+    (treated as "assume available") if there's no key, the check fails,
+    or nothing's been checked yet this run.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return None
+    with _quota_lock:
+        cached = _tavily_quota["remaining_credits"]
+        fresh = _tavily_quota["updated_at"] and (time.time() - _tavily_quota["updated_at"] < _TAVILY_QUOTA_REFRESH_SECONDS)
+        if fresh:
+            return cached
+    try:
+        import requests
+        resp = requests.get(
+            "https://api.tavily.com/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        account = resp.json().get("account", {})
+        plan_limit, plan_usage = account.get("plan_limit"), account.get("plan_usage")
+        remaining = (plan_limit - plan_usage) if (plan_limit is not None and plan_usage is not None) else None
+        with _quota_lock:
+            _tavily_quota["remaining_credits"] = remaining
+            _tavily_quota["updated_at"] = time.time()
+        return remaining
+    except Exception as e:
+        log.warning(f"Could not refresh Tavily quota: {e}")
+        return None
 
 
 def init_llm_generator(force_local=False):
@@ -298,14 +447,24 @@ def _try_groq_compound_model(prompt, model_name, max_attempts, max_tokens, log_l
     instead of burning the remaining attempts.
     """
     max_tokens = min(max_tokens, MAX_TOKENS_CEILING)
+
+    if _groq_headroom(model_name, max_tokens) is False:
+        log.info(
+            f"Skipping {model_name} for {log_label} -- last-known quota (from an "
+            f"earlier call this run) shows no headroom for ~{max_tokens} tokens."
+        )
+        return None
+
     for attempt in range(max_attempts):
         try:
-            response = groq_client.chat.completions.create(
+            raw = groq_client.chat.completions.with_raw_response.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
                 max_tokens=max_tokens,
             )
+            _record_groq_headers(raw.headers, model_name)
+            response = raw.parse()
             text = response.choices[0].message.content.strip()
             sources = _extract_groq_sources(response)
             return text, sources, True  # True = had live web search available
@@ -341,14 +500,27 @@ def _try_synthesis_models(prompt, max_tokens, log_label="analysis"):
     if groq_client is None:
         return None
     max_tokens = min(max_tokens, MAX_TOKENS_CEILING)
-    for model_name in SYNTHESIS_MODELS:
+    ordered_models = _order_by_headroom(SYNTHESIS_MODELS, max_tokens)
+    if ordered_models != SYNTHESIS_MODELS:
+        log.info(
+            f"Reordered synthesis models by current quota headroom for {log_label}: {ordered_models}"
+        )
+    for model_name in ordered_models:
+        if _groq_headroom(model_name, max_tokens) is False:
+            log.info(
+                f"Skipping synthesis model {model_name} for {log_label} -- last-known "
+                f"quota shows no headroom for ~{max_tokens} tokens."
+            )
+            continue
         try:
-            response = groq_client.chat.completions.create(
+            raw = groq_client.chat.completions.with_raw_response.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
                 max_tokens=max_tokens,
             )
+            _record_groq_headers(raw.headers, model_name)
+            response = raw.parse()
             text = response.choices[0].message.content.strip()
             return text, True  # True: grounded in real pre-gathered context
         except Exception as e:
@@ -540,23 +712,38 @@ def generate_analysis(
     require_live = os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true"
 
     if backend == "groq":
-        result = _try_groq_compound_model(
-            prompt, "groq/compound", max_attempts=GROQ_COMPOUND_ATTEMPTS,
-            max_tokens=max_tokens, log_label=log_label,
-        )
-        if result is not None and validate_fn(result[0]):
-            return result
-
-        log.info(f"groq/compound unavailable for {log_label} -- trying groq/compound-mini...")
-        result = _try_groq_compound_model(
-            prompt, "groq/compound-mini", max_attempts=GROQ_COMPOUND_MINI_ATTEMPTS,
-            max_tokens=max_tokens, log_label=log_label,
-        )
-        if result is not None and validate_fn(result[0]):
-            return result
+        compound_attempts = {
+            "groq/compound": GROQ_COMPOUND_ATTEMPTS,
+            "groq/compound-mini": GROQ_COMPOUND_MINI_ATTEMPTS,
+        }
+        compound_order = _order_by_headroom(GROQ_COMPOUND_MODELS, max_tokens)
+        if compound_order != GROQ_COMPOUND_MODELS:
+            log.info(
+                f"Trying compound tiers in quota-adjusted order for {log_label}: {compound_order} "
+                "(reordered from the default groq/compound -> groq/compound-mini based on what "
+                "an earlier call this run saw)."
+            )
+        result = None
+        for model_name in compound_order:
+            result = _try_groq_compound_model(
+                prompt, model_name, max_attempts=compound_attempts[model_name],
+                max_tokens=max_tokens, log_label=log_label,
+            )
+            if result is not None and validate_fn(result[0]):
+                return result
+            if model_name != compound_order[-1]:
+                log.info(f"{model_name} unavailable for {log_label} -- trying {compound_order[compound_order.index(model_name) + 1]}...")
 
         if gather_context_fn is not None:
-            context_text, gathered_sources = gather_context_fn()
+            tavily_remaining = _tavily_remaining_credits()
+            if tavily_remaining is not None and tavily_remaining <= 0:
+                log.info(
+                    f"Skipping Tavily-context tier for {log_label} -- last-known Tavily "
+                    f"quota shows {tavily_remaining} credits remaining."
+                )
+                context_text = None
+            else:
+                context_text, gathered_sources = gather_context_fn()
             if context_text:
                 grounded_prompt = (
                     build_grounded_prompt(context_text) if build_grounded_prompt

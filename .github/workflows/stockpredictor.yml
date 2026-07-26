@@ -39,4 +39,4 @@ jobs:
 
       
       - name: Run Stock Bot
-        run: python main.py
+        run: python stockpredictor.py

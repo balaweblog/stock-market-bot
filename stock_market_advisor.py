@@ -54,7 +54,7 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 
-import main  # reuses LLM init, email config/credentials, and helpers
+import stockpredictor  # reuses LLM init, email config/credentials, and helpers
 from compliance import build_compliance_block_html
 from swing_trade_advisor import (
     _env_int,
@@ -122,12 +122,12 @@ def _load_watchlist():
             data = json.loads(raw)
             if isinstance(data, list) and data and all(isinstance(x, str) and x.strip() for x in data):
                 return [x.strip() for x in data]
-            main.log.warning(
+            stockpredictor.log.warning(
                 "STOCK_WATCHLIST_JSON parsed but is not a non-empty list of "
                 "strings -- using the default watchlist instead."
             )
         except json.JSONDecodeError as e:
-            main.log.warning(f"STOCK_WATCHLIST_JSON is not valid JSON ({e}) -- using the default watchlist.")
+            stockpredictor.log.warning(f"STOCK_WATCHLIST_JSON is not valid JSON ({e}) -- using the default watchlist.")
     return DEFAULT_WATCHLIST
 
 
@@ -321,12 +321,12 @@ def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
     text, sources, live = generate_analysis(prompt, max_tokens=3000)
     if not text:
-        main.log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
+        stockpredictor.log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
         sys.exit(1)
     _require_live_or_abort(live, "Stage 1 (market/macro)")
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        main.log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
+        stockpredictor.log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
         data = {}
     data.setdefault("developments", [])
     data.setdefault("market_sentiment", "Neutral")
@@ -336,11 +336,11 @@ def run_market_stage(today_str, lookback_note):
 def run_stock_stage(today_str, lookback_note):
     all_stocks, sources, used_live = [], [], False
     for batch in _chunks(WATCHLIST, STOCK_PER_BATCH):
-        main.log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
+        stockpredictor.log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
         prompt = build_stock_prompt(batch, today_str, lookback_note)
         text, s, live = generate_analysis(prompt, max_tokens=3200)
         if not text:
-            main.log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
+            stockpredictor.log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 2 (stock batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -348,7 +348,7 @@ def run_stock_stage(today_str, lookback_note):
         if isinstance(stocks, list):
             all_stocks.extend(stocks)
         else:
-            main.log.warning(f"Could not parse stock JSON for batch: {', '.join(batch)}")
+            stockpredictor.log.warning(f"Could not parse stock JSON for batch: {', '.join(batch)}")
         for src in s:
             if src not in sources:
                 sources.append(src)
@@ -359,11 +359,11 @@ def run_stock_stage(today_str, lookback_note):
 def run_sector_stage(today_str, lookback_note):
     all_sectors, sources, used_live = [], [], False
     for batch in _chunks(SECTORS_STOCK, SECTORS_PER_BATCH):
-        main.log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
+        stockpredictor.log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
         prompt = build_sector_prompt(batch, today_str, lookback_note)
         text, s, live = generate_analysis(prompt, max_tokens=2000)
         if not text:
-            main.log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
+            stockpredictor.log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 3 (sector batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -371,7 +371,7 @@ def run_sector_stage(today_str, lookback_note):
         if isinstance(sectors, list):
             all_sectors.extend(sectors)
         else:
-            main.log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
+            stockpredictor.log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
         for src in s:
             if src not in sources:
                 sources.append(src)
@@ -387,12 +387,12 @@ def _plain_generate(prompt, max_tokens=3800):
     -> local model, mirroring generate_analysis's backend order without
     any of the search-cascade machinery.
     """
-    backend = main.init_llm_generator()
-    main.log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
+    backend = stockpredictor.init_llm_generator()
+    stockpredictor.log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
 
-    if backend == "groq" and getattr(main, "groq_client", None) is not None:
+    if backend == "groq" and getattr(stockpredictor, "groq_client", None) is not None:
         try:
-            response = main.groq_client.chat.completions.create(
+            response = stockpredictor.groq_client.chat.completions.create(
                 model=os.getenv("STOCK_SYNTHESIS_MODEL", "llama-3.3-70b-versatile"),
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
@@ -400,25 +400,25 @@ def _plain_generate(prompt, max_tokens=3800):
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            main.log.error(f"Groq synthesis call failed: {e}")
+            stockpredictor.log.error(f"Groq synthesis call failed: {e}")
 
-    have_gemini = getattr(main, "gemini_client", None) is not None or (
-        os.getenv("GOOGLE_API_KEY") and getattr(main, "genai", None) is not None
+    have_gemini = getattr(stockpredictor, "gemini_client", None) is not None or (
+        os.getenv("GOOGLE_API_KEY") and getattr(stockpredictor, "genai", None) is not None
     )
     if have_gemini:
         try:
-            if getattr(main, "gemini_client", None) is None:
-                main.gemini_client = main.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = main.gemini_client.models.generate_content(
+            if getattr(stockpredictor, "gemini_client", None) is None:
+                stockpredictor.gemini_client = stockpredictor.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+            response = stockpredictor.gemini_client.models.generate_content(
                 model="gemini-flash-latest",
                 contents=prompt,
             )
             return response.text.strip()
         except Exception as e:
-            main.log.error(f"Gemini synthesis call failed: {e}")
+            stockpredictor.log.error(f"Gemini synthesis call failed: {e}")
 
-    local_backend = main.init_llm_generator(force_local=True)
-    if local_backend == "local" and main.llm_pipeline is not None:
+    local_backend = stockpredictor.init_llm_generator(force_local=True)
+    if local_backend == "local" and stockpredictor.llm_pipeline is not None:
         text = _generate_local(prompt)
         if text:
             return text
@@ -430,11 +430,11 @@ def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, stocks_data, sectors_data, WATCHLIST, today_str)
     text = _plain_generate(prompt)
     if not text:
-        main.log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
+        stockpredictor.log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
         sys.exit(1)
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        main.log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
+        stockpredictor.log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
         data = {}
     data.setdefault("top_developments", [])
     return data
@@ -691,27 +691,27 @@ def build_email_html(market_data, stocks_data, sectors_data, synthesis_data, sou
 
 
 def send_stock_email(html_body, today_str):
-    if not all([main.EMAIL_FROM, main.EMAIL_PASSWORD, main.EMAIL_TO]):
-        main.log.error(
+    if not all([stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD, stockpredictor.EMAIL_TO]):
+        stockpredictor.log.error(
             "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
             "and EMAIL_TO (the same env vars main.py uses)."
         )
         return False
 
-    to_recipients = main.parse_email_list(main.EMAIL_TO)
-    cc_recipients = main.parse_email_list(getattr(main, "EMAIL_CC", "") or "")
+    to_recipients = stockpredictor.parse_email_list(stockpredictor.EMAIL_TO)
+    cc_recipients = stockpredictor.parse_email_list(getattr(stockpredictor, "EMAIL_CC", "") or "")
 
     if not to_recipients:
-        main.log.error("No valid TO recipients found in EMAIL_TO.")
+        stockpredictor.log.error("No valid TO recipients found in EMAIL_TO.")
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"Stock Market News Review — {main.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"Stock Market News Review — {stockpredictor.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
-    msg["From"] = main.EMAIL_FROM
+    msg["From"] = stockpredictor.EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -721,24 +721,24 @@ def send_stock_email(html_body, today_str):
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
-            server.login(main.EMAIL_FROM, main.EMAIL_PASSWORD)
-            server.sendmail(main.EMAIL_FROM, all_recipients, msg.as_string())
-        main.log.info("Stock market news email sent successfully.")
+            server.login(stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD)
+            server.sendmail(stockpredictor.EMAIL_FROM, all_recipients, msg.as_string())
+        stockpredictor.log.info("Stock market news email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
-        main.log.error(
+        stockpredictor.log.error(
             "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
             "(use a Gmail App Password, not the account password)."
         )
     except Exception as e:
-        main.log.error(f"Failed to send stock market news email: {e}")
+        stockpredictor.log.error(f"Failed to send stock market news email: {e}")
         traceback.print_exc()
     return False
 
 
 def run():
     today_str, now_ist, lookback_note = _run_context()
-    main.log.info(f"Stock market news review starting for {today_str} (watchlist: {len(WATCHLIST)} stocks).")
+    stockpredictor.log.info(f"Stock market news review starting for {today_str} (watchlist: {len(WATCHLIST)} stocks).")
 
     market_data, market_sources, market_live = run_market_stage(today_str, lookback_note)
     stocks_data, stock_sources, stocks_live = run_stock_stage(today_str, lookback_note)
@@ -761,7 +761,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("stock_market_report.html", "w") as f:
             f.write(email_html)
-        main.log.info("DRY_RUN enabled -- wrote stock_market_report.html instead of emailing.")
+        stockpredictor.log.info("DRY_RUN enabled -- wrote stock_market_report.html instead of emailing.")
         return
 
     send_stock_email(email_html, today_str)
