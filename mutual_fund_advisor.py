@@ -339,17 +339,29 @@ def run_fund_stage(today_str, lookback_note):
     for batch in _chunks(PORTFOLIO, FUNDS_PER_BATCH):
         stockpredictor.log.info(f"Stage 2 -- fund batch: {', '.join(batch)}")
         prompt = build_fund_prompt(batch, today_str, lookback_note)
-        text, s, live = generate_analysis(prompt, max_tokens=3200)
+        text, s, live = generate_analysis(prompt, max_tokens=4500)
         if not text:
             stockpredictor.log.error(f"No LLM output for fund batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 2 (fund batch: {', '.join(batch)})")
         data = _parse_json_object(text)
         funds = data.get("funds") if isinstance(data, dict) else None
+        if isinstance(funds, dict):
+            # Some models return a bare object instead of a list when the
+            # batch has only one fund -- normalize instead of dropping it.
+            funds = [funds]
         if isinstance(funds, list):
             all_funds.extend(funds)
         else:
-            stockpredictor.log.warning(f"Could not parse fund JSON for batch: {', '.join(batch)}")
+            snippet_len = 400
+            head = text[:snippet_len]
+            tail = text[-snippet_len:] if len(text) > snippet_len else ""
+            stockpredictor.log.warning(
+                f"Could not parse fund JSON for batch: {', '.join(batch)} "
+                f"(raw length={len(text)} chars). "
+                f"Start of output: {head!r}"
+                + (f" ... End of output: {tail!r}" if tail else "")
+            )
         for src in s:
             if src not in sources:
                 sources.append(src)

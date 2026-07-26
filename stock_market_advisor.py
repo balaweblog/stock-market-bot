@@ -54,6 +54,8 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 
+import yfinance as yf
+
 import stockpredictor  # reuses LLM init, email config/credentials, and helpers
 from compliance import build_compliance_block_html
 from swing_trade_advisor import (
@@ -132,6 +134,88 @@ def _load_watchlist():
 
 
 WATCHLIST = _load_watchlist()
+
+# -----------------------------
+# Weekly return -- computed from real price data, not the LLM
+# -----------------------------
+# The LLM's "weekly_return_pct" field is only ever a search-based guess and
+# frequently comes back null (e.g. when its search pass found no news for a
+# stock that week). We already know exactly which stocks are on the
+# watchlist, so compute the actual trailing-week % move directly via
+# yfinance and use that instead, falling back to the LLM's figure only if a
+# ticker has no mapping.
+DEFAULT_WATCHLIST_TICKERS = {
+    "Reliance Industries": "RELIANCE.NS",
+    "HDFC Bank": "HDFCBANK.NS",
+    "Infosys": "INFY.NS",
+    "Tata Consultancy Services": "TCS.NS",
+    "ICICI Bank": "ICICIBANK.NS",
+    "Larsen & Toubro": "LT.NS",
+    "Bharti Airtel": "BHARTIARTL.NS",
+    "Shriram Finance": "SHRIRAMFIN.NS",
+}
+
+
+def _load_ticker_map():
+    merged = dict(DEFAULT_WATCHLIST_TICKERS)
+    raw = os.getenv("STOCK_TICKER_MAP_JSON")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                merged.update({
+                    k.strip(): v.strip()
+                    for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+                })
+            else:
+                stockpredictor.log.warning("STOCK_TICKER_MAP_JSON is not a JSON object -- ignoring.")
+        except json.JSONDecodeError as e:
+            stockpredictor.log.warning(f"STOCK_TICKER_MAP_JSON is not valid JSON ({e}) -- ignoring.")
+    return merged
+
+
+TICKER_MAP = _load_ticker_map()
+
+
+def fetch_weekly_returns(watchlist):
+    """
+    Real trailing ~1-week % price move per watchlist stock, computed from
+    actual close prices (yfinance) rather than an LLM guess.
+
+    Returns {stock_name: pct_change_float_or_None}. None means either the
+    stock has no ticker mapping (see STOCK_TICKER_MAP_JSON / add it to
+    DEFAULT_WATCHLIST_TICKERS) or the price fetch failed for it.
+    """
+    results = {name: None for name in watchlist}
+
+    unmapped = [name for name in watchlist if not TICKER_MAP.get(name)]
+    if unmapped:
+        stockpredictor.log.warning(
+            "No ticker mapping for: %s -- weekly return will show n/a for "
+            "these until added to DEFAULT_WATCHLIST_TICKERS or "
+            "STOCK_TICKER_MAP_JSON." % ", ".join(unmapped)
+        )
+
+    for name in watchlist:
+        ticker = TICKER_MAP.get(name)
+        if not ticker:
+            continue
+        try:
+            hist = yf.Ticker(ticker).history(period="12d", interval="1d", auto_adjust=True)
+            closes = hist["Close"].dropna()
+            if len(closes) < 2:
+                stockpredictor.log.warning(f"Not enough price history to compute weekly return for {name} ({ticker}).")
+                continue
+            recent = float(closes.iloc[-1])
+            # ~5 trading days back approximates "last week"; clamp for short history.
+            week_ago = float(closes.iloc[max(0, len(closes) - 6)])
+            if week_ago:
+                results[name] = round((recent - week_ago) / week_ago * 100, 2)
+        except Exception as e:
+            stockpredictor.log.warning(f"Could not compute weekly return for {name} ({ticker}): {e}")
+
+    return results
 
 
 def _chunks(items, size):
@@ -353,6 +437,19 @@ def run_stock_stage(today_str, lookback_note):
             if src not in sources:
                 sources.append(src)
         used_live = used_live or live
+
+    real_returns = fetch_weekly_returns(WATCHLIST)
+    by_name = {s.get("stock_name"): s for s in all_stocks if isinstance(s, dict)}
+    for name, pct in real_returns.items():
+        if pct is None:
+            continue  # no ticker mapping or fetch failed -- leave the LLM's field (likely still null) alone
+        stock = by_name.get(name)
+        if stock is not None:
+            stock["weekly_return_pct"] = str(pct)
+        else:
+            # LLM produced no card at all for this stock -- still surface the real number.
+            all_stocks.append({"stock_name": name, "weekly_return_pct": str(pct)})
+
     return all_stocks, sources, used_live
 
 
