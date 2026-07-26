@@ -1958,28 +1958,44 @@ def build_prompt(live_data=None):
     session_label, in_session = _market_session_label()
     live_data_block = format_live_data_block(live_data)
 
-    return f"""Core Objective: You are an expert at analysing Nifty options-related data. A LIVE DATA FEED has already been fetched for you and is provided below -- use those figures as ground truth for this run rather than searching for or guessing them yourself. Using that feed (plus web search only for what it doesn't cover), analyze market conditions and determine the optimal strategy stance independently across THREE time horizons:
+    return f"""Core Objective: You are an expert quantitative derivatives analyst for Indian index options (Nifty 50). A LIVE DATA FEED has been provided below and must be treated as your absolute source of truth for this run. Do not invent, guess, or infer data not provided in the feed (web search is fine only for context this feed doesn't cover).
 
 {live_data_block}
 
+Analyze current market conditions and determine the optimal strategy stance independently across THREE distinct time horizons:
 1. Nifty Weekly -- (current/nearest weekly expiry)
 2. Nifty Monthly -- (current monthly expiry)
 3. Nifty Quarterly -- (nearest quarterly expiry on the Mar/Jun/Sep/Dec cycle)
 
-STRUCTURE CONSTRAINT -- for each horizon, "strategy_name" MUST be exactly one of
-these six, and "legs" MUST contain EXACTLY the legs that structure implies --
-nothing added, nothing renamed, no "with increased leverage" or other custom
-variants:
+--------------------------------------------------------------------------------
+STRATEGY & LEGS CONSTRAINT:
+For each horizon, "strategy_name" MUST be exactly one of these six DEFINED-RISK,
+capped-loss structures -- nothing else. Do not invent ratio spreads, backspreads,
+naked legs, broken-wing variants, or any structure with an extra/unequal leg
+beyond what's listed below -- those carry undefined risk, cannot be verified by
+this pipeline, and will be rejected outright:
   - Bull Call Spread (2 legs: Buy lower-strike Call, Sell higher-strike Call)
   - Bear Call Spread (2 legs: Sell lower-strike Call, Buy higher-strike Call)
   - Bull Put Spread  (2 legs: Sell higher-strike Put, Buy lower-strike Put)
   - Bear Put Spread  (2 legs: Buy higher-strike Put, Sell lower-strike Put)
-  - Iron Condor      (4 legs: Buy far Put, Sell near Put, Sell near Call, Buy far Call)
-  - Iron Butterfly   (4 legs: Buy far Put, Sell ATM Put, Sell ATM Call, Buy far Call)
-Every one of these six is a DEFINED-RISK, capped-loss structure by construction.
-Do not invent ratio spreads, backspreads, naked legs, or any structure with an
-extra leg beyond what's listed above -- those either carry undefined risk or
-cannot be verified by this pipeline, and will be rejected outright.
+  - Iron Condor      (4 legs: Buy far OTM Put, Sell near OTM Put, Sell near OTM Call, Buy far OTM Call)
+  - Iron Butterfly   (4 legs: Buy far OTM Put, Sell ATM Put, Sell ATM Call, Buy far OTM Call)
+
+"legs" MUST be a single comma-separated STRING (not a JSON array) containing
+EXACTLY the legs that structure implies, with concrete strikes from the live
+data, in this exact format: "Sell 24000 PE, Buy 23800 PE" -- always
+"<Buy|Sell> <strike> <CE|PE>".
+
+--------------------------------------------------------------------------------
+RISK & SELECTION RULES:
+- Heavy CALL open interest signals overhead resistance (bearish tilt).
+- Heavy PUT open interest signals underlying support (bullish tilt) -- the
+  opposite of reading heavy call activity as bullish.
+- Within the six allowed structures, prefer strike widths and short-strike
+  placement that maximize the credit-to-width (or reward-to-risk) ratio given
+  current IV, while keeping short strikes outside the expected move. Better
+  risk/reward comes from strike selection within these defined-risk
+  structures, not from adding undefined-risk ones.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else:
 
@@ -1990,9 +2006,9 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "expiry_date": "The actual expiry date for this horizon, copied EXACTLY as shown in the LIVE DATA FEED above (e.g. '24 Jul 2026').",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data you found. If you mention PCR/OI dominance, remember the standard convention: heavy CALL open interest signals overhead resistance (bearish), heavy PUT open interest signals underlying support (bullish) -- the opposite of reading heavy call activity as bullish.",
+      "bias_reason": "One or two sentences grounded in the live data you found, referencing specific OI levels or PCR where relevant.",
       "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
-      "legs": "",
+      "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
       "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
       "confidence": "High",
       "data_status": "live"
