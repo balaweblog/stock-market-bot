@@ -1,4 +1,4 @@
-name: SStock Scheduler Agent
+name: Stock Scheduler Agent
 on:
   workflow_dispatch:
 
