@@ -743,6 +743,34 @@ def calculate_score(df):
     return score, reason
 
 
+# calculate_score's rule set can add at most: 55 (price-vs-EMA20/50/100/200)
+# + 20 (trend structure) + 20 (RSI) + 15 (MACD) + 10 (ADX) + 10 (volume)
+# + 5 (breakout/pullback) = 135, with a floor around -5 (RSI>70 penalty,
+# everything else 0). It is NOT a 0-100 score.
+#
+# Everything downstream of calculate_score (get_signal's 80/50 buckets,
+# compute_signal_confirmation's tech_dir thresholds, and
+# calculate_combined_score's blend into final_score) is calibrated
+# assuming a genuine 0-100 input -- same reason calculate_combined_score
+# already clamps combined_fund to 100. Feeding the raw 0-135 score into
+# any of those unnormalized silently over-weights the technical leg of
+# every score and makes the 80/50 "bullish"/"bearish" buckets far too
+# easy to hit. process_stock() normalizes calculate_score's raw output
+# through normalize_tech_score() before using it anywhere else, and that
+# normalized value is what "tech_score" means from that point on.
+TECH_SCORE_MAX = 135
+
+
+def normalize_tech_score(raw_score):
+    """Rescales calculate_score's raw ~[-5, 135] output onto a genuine
+    0-100 scale so it's comparable with fund_score/sentiment_score and
+    safe to feed into thresholds and weights calibrated for 0-100 inputs."""
+    if raw_score is None:
+        return 0.0
+    pct = (raw_score / TECH_SCORE_MAX) * 100
+    return round(max(0.0, min(100.0, pct)), 2)
+
+
     # -----------------------------
     # Signal
 
@@ -1449,7 +1477,12 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         df = calculate_indicators(df)
 
         # consolidated technical score calculation
-        tech_score, reasons = calculate_score(df)
+        # calculate_score's raw output is 0-135, not 0-100 (see TECH_SCORE_MAX)
+        # -- normalize it here, once, before anything downstream (combined
+        # score weighting, signal confirmation thresholds, the report
+        # display) treats it as a 0-100 value.
+        tech_score_raw, reasons = calculate_score(df)
+        tech_score = normalize_tech_score(tech_score_raw)
 
         fund_raw = fetch_fundamentals(ticker)
         fund_score = score_fundamentals(fund_raw)
@@ -1518,13 +1551,24 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
             "volume_vs_avg_pct": round(((latest["volume"] - latest["vol_avg"]) / latest["vol_avg"]) * 100, 2) if pd.notna(latest["vol_avg"]) and latest["vol_avg"] else None,
         }
 
+        # apply_risk_management() reads entry_context["risk_reward_ratio"] to
+        # decide whether to shave the aggressive-entry premium (rr >= 1.5),
+        # but target/stop_loss -- which rr is computed FROM -- are only
+        # known once apply_risk_management() has already run. Previously
+        # this was one call: entry_context had no risk_reward_ratio key yet
+        # at call time, so that read always defaulted to 0 and the rr-based
+        # adjustment could never fire. Fixed with a cheap first pass purely
+        # to get target/stop (target_pct/stop_loss_pct only depend on
+        # confidence, not on entry_context, so this pass is unaffected by
+        # not having rr yet), then a second pass with the real rr in place.
+        preliminary_risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
+        entry_context["risk_reward_ratio"] = round((preliminary_risk_data["target"] - latest["close"]) / max(latest["close"] - preliminary_risk_data["stop_loss"], 1e-6), 2) if latest["close"] > preliminary_risk_data["stop_loss"] else None
+
         risk_data = apply_risk_management(signal, total_score, cash=100000, price=latest["close"], entry_context=entry_context)
         risk_meter = calculate_risk_meter(df, latest, fund_raw.get("beta"))
         range_52w = calculate_52_week_range(df, latest)
         pivot_levels = compute_pivot_levels(df)
         swing_zones = compute_swing_zones(df)
-
-        entry_context["risk_reward_ratio"] = round((risk_data["target"] - latest["close"]) / max(latest["close"] - risk_data["stop_loss"], 1e-6), 2) if latest["close"] > risk_data["stop_loss"] else None
 
         recommended_entry = get_recommended_entry(signal, total_score, latest, market_context, entry_context)
         risk_data["recommended_entry"] = recommended_entry
