@@ -339,7 +339,8 @@ def run_fund_stage(today_str, lookback_note):
     for batch in _chunks(PORTFOLIO, FUNDS_PER_BATCH):
         stockpredictor.log.info(f"Stage 2 -- fund batch: {', '.join(batch)}")
         prompt = build_fund_prompt(batch, today_str, lookback_note)
-        text, s, live = generate_analysis(prompt, max_tokens=4500)
+        fund_queries = [f"{name} NAV factsheet AUM news {today_str}" for name in batch]
+        text, s, live = generate_analysis(prompt, max_tokens=4500, extra_context_queries=fund_queries)
         if not text:
             stockpredictor.log.error(f"No LLM output for fund batch ({', '.join(batch)}) -- skipping this batch.")
             continue

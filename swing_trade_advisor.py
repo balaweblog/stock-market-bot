@@ -44,6 +44,18 @@ import stockpredictor  # reuses email config/credentials and helpers
 import llm_backend  # shared LLM init + fallback chain (see llm_backend.py)
 from compliance import build_compliance_block_html
 
+# Independent-of-the-LLM risk/regime/scoring/tracking modules -- see each
+# file's own docstring for the rationale. Kept as separate modules rather
+# than folded into this already-1800-line file so each concern (position
+# sizing, market regime, composite scoring, outcome tracking) is
+# independently testable and can be reused by optionstrategy.py /
+# stock_market_advisor.py later without dragging in this file's Stage-1/
+# Stage-2 prompt-building code.
+import swing_trade_risk as risk
+import swing_trade_regime as regime
+import swing_trade_scoring as scoring
+import swing_trade_outcomes as outcomes
+
 # -----------------------------
 # Qualifying-stock gate
 # -----------------------------
@@ -214,6 +226,35 @@ MIN_RUNS_BEFORE_ADJUST = _env_int("MIN_RUNS_BEFORE_ADJUST", 4)
 MAX_THRESHOLD_DRIFT_PCT = _env_float("MAX_THRESHOLD_DRIFT_PCT", 25.0)
 ADJUST_STEP_PCT = _env_float("ADJUST_STEP_PCT", 5.0)
 THRESHOLD_ADJUSTMENT_LOG = os.getenv("THRESHOLD_ADJUSTMENT_LOG", "swing_trade_threshold_adjustments.csv")
+
+# SAFETY GATE (review item 8): an auto-loosening mechanism can quietly
+# degrade signal quality specifically in a regime where quality setups are
+# genuinely rare -- the worst possible time to lower the bar. Rejection
+# history alone (which is all AUTO_ADJUST_THRESHOLDS looks at) cannot tell
+# the difference between "this threshold is miscalibrated" and "the market
+# just isn't offering this setup right now"; only a walk-forward backtest
+# (see swing_trade_backtest.py) against several years of real price data
+# can distinguish the two. So AUTO_ADJUST_THRESHOLDS is forced back off at
+# runtime -- even if the env var is set -- unless the operator has also
+# set CONFIRM_AUTO_ADJUST_BACKTESTED=true, an explicit acknowledgment that
+# they've actually run the backtest harness and reviewed its numbers
+# before trusting this feature. This is a deliberate speed bump, not a
+# hard technical dependency (there's no way to programmatically verify a
+# human actually looked at backtest output) -- but it makes "I forgot this
+# was dangerous" require a second, separate, explicit opt-in rather than
+# one boolean flag someone set months ago and forgot about.
+_CONFIRM_AUTO_ADJUST_BACKTESTED = os.getenv("CONFIRM_AUTO_ADJUST_BACKTESTED", "false").lower() == "true"
+if AUTO_ADJUST_THRESHOLDS and not _CONFIRM_AUTO_ADJUST_BACKTESTED:
+    print(
+        "WARNING: AUTO_ADJUST_THRESHOLDS=true but CONFIRM_AUTO_ADJUST_BACKTESTED is "
+        "not set -- forcing auto-adjustment OFF for this run. Rejection-history "
+        "near-misses alone cannot distinguish 'this threshold is miscalibrated' from "
+        "'quality setups are genuinely rare right now' -- only a walk-forward "
+        "backtest (see swing_trade_backtest.py) can. Run the backtest, review its "
+        "win-rate/drawdown numbers, and set CONFIRM_AUTO_ADJUST_BACKTESTED=true "
+        "once you actually trust this feature."
+    )
+    AUTO_ADJUST_THRESHOLDS = False
 
 # Captured once, before any auto-adjustment ever runs, so drift is always
 # measured from the value YOU set in the workflow yaml -- not from an
@@ -465,29 +506,41 @@ STRATEGY_TYPES_BLOCK = """Stock Selection Strategy (choose one per stock in Stag
 - Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play."""
 
 
-MEGA_LARGE_CAP_CAUTION = (
-    "IMPORTANT market-cap steering: well-known large-caps and megacaps (e.g. "
-    "TCS, Infosys, HCL Tech, Wipro, Reliance, HDFC Bank, ICICI Bank, Sun "
-    f"Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
-    f"never post BOTH >={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue growth AND "
-    f">={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY profit growth in "
-    "the same quarter simultaneously -- their revenue base is too large for "
-    "that pace of growth except in rare one-off years. Repeatedly proposing "
-    "these names and having them fail this filter wastes this search. "
-    "Deprioritize them unless you have concrete, verifiable evidence of an "
-    "unusual one-off beat this specific quarter. Spend most of your search "
-    "effort instead on SMALL-CAP and MID-CAP stocks (BSE SmallCap 250 / BSE "
-    "MidCap 150 universe, sub-Rs. 50,000 crore market cap) -- growth of this "
-    "magnitude is far more common off a smaller revenue base, e.g. a company "
-    "scaling from Rs. 200cr to Rs. 260cr quarterly revenue.\n\n"
-    "Also avoid large, capital-intensive diversified conglomerates (e.g. "
-    "Grasim, Godrej Industries, and similar cement/chemicals/infra-heavy "
-    "holding companies) -- they structurally carry high debt-to-equity from "
-    "their asset base, which fails the low-debt filter almost by default. "
-    "Asset-light business models (IT services, specialty chemicals, "
-    "formulation-focused pharma, consumer brands, defence electronics) are "
-    "far more likely to combine high growth with low debt."
-)
+def _mega_large_cap_caution():
+    """
+    Was previously a module-level string constant, formatted once at import
+    time with whatever MIN_GROWTH_YOY_PCT happened to be then. That's a
+    latent bug: _apply_auto_adjustments() mutates the MIN_GROWTH_YOY_PCT
+    global mid-run (via globals()[gname] = new_value), but a string that was
+    already formatted at import time can't retroactively pick that up -- the
+    model would keep being told the ORIGINAL threshold forever, silently out
+    of sync with the number the verifier is actually enforcing that run.
+    Made into a function so every call re-reads the current global, same as
+    every other threshold-bearing prompt string in this file already does.
+    """
+    return (
+        "IMPORTANT market-cap steering: well-known large-caps and megacaps (e.g. "
+        "TCS, Infosys, HCL Tech, Wipro, Reliance, HDFC Bank, ICICI Bank, Sun "
+        f"Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
+        f"never post BOTH >={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue growth AND "
+        f">={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY profit growth in "
+        "the same quarter simultaneously -- their revenue base is too large for "
+        "that pace of growth except in rare one-off years. Repeatedly proposing "
+        "these names and having them fail this filter wastes this search. "
+        "Deprioritize them unless you have concrete, verifiable evidence of an "
+        "unusual one-off beat this specific quarter. Spend most of your search "
+        "effort instead on SMALL-CAP and MID-CAP stocks (BSE SmallCap 250 / BSE "
+        "MidCap 150 universe, sub-Rs. 50,000 crore market cap) -- growth of this "
+        "magnitude is far more common off a smaller revenue base, e.g. a company "
+        "scaling from Rs. 200cr to Rs. 260cr quarterly revenue.\n\n"
+        "Also avoid large, capital-intensive diversified conglomerates (e.g. "
+        "Grasim, Godrej Industries, and similar cement/chemicals/infra-heavy "
+        "holding companies) -- they structurally carry high debt-to-equity from "
+        "their asset base, which fails the low-debt filter almost by default. "
+        "Asset-light business models (IT services, specialty chemicals, "
+        "formulation-focused pharma, consumer brands, defence electronics) are "
+        "far more likely to combine high growth with low debt."
+    )
 
 SOURCE_QUALITY_NOTE = (
     "Source quality: do NOT rely on or cite social media posts (Instagram, "
@@ -519,7 +572,7 @@ def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_not
 
 Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
 
-{MEGA_LARGE_CAP_CAUTION}
+{_mega_large_cap_caution()}
 
 {SOURCE_QUALITY_NOTE}
 
@@ -687,7 +740,7 @@ _TAVILY_FINANCE_DOMAINS = [
 ]
 
 
-def _gather_tavily_context(today_str):
+def _gather_tavily_context(today_str, extra_queries=None):
     """
     Runs a small, fixed set of targeted queries covering the areas the
     prompt actually needs (momentum/breakout setups, FII/DII activity,
@@ -695,12 +748,21 @@ def _gather_tavily_context(today_str):
     plus a deduplicated (title, url) source list. Returns (context_text,
     sources) -- context_text is "" if Tavily isn't configured or every
     query failed.
+
+    extra_queries: optional list of additional, caller-supplied queries --
+    e.g. the specific stock or fund names in the batch currently being
+    analyzed. Without these, this tier only ever searches generic
+    market-wide terms, so a name that isn't already part of the day's
+    broad momentum/FII-DII/broker-call chatter gets no grounding at all
+    even when this tier is the one that ends up serving the call.
     """
     queries = [
         f"NSE BSE India stock momentum breakout {today_str}",
         f"India stock market FII DII buying activity {today_str}",
         f"Indian stock brokerage buy rating target price upgrade {today_str}",
     ]
+    if extra_queries:
+        queries = queries + list(extra_queries)
     sources = []
     blocks = []
     for q in queries:
@@ -721,7 +783,7 @@ def _gather_tavily_context(today_str):
     return context_text, sources
 
 
-def generate_analysis(prompt, max_tokens=1200):
+def generate_analysis(prompt, max_tokens=1200, extra_context_queries=None, validate_fn=None):
     """
     Thin wrapper around llm_backend.generate_analysis() -- this module used
     to hand-roll its own copy of the entire fallback chain (groq/compound ->
@@ -732,6 +794,22 @@ def generate_analysis(prompt, max_tokens=1200):
     Only the swing-trade-specific piece stays here: which Tavily queries to
     run for the "grounded" tier (see _gather_tavily_context above).
 
+    extra_context_queries: optional list of extra search terms to fold into
+    the Tavily grounding tier -- pass the specific stock/fund names a batch
+    call is about here so that tier, if it ends up serving the call, is
+    actually searching for them instead of only generic market terms.
+
+    validate_fn: optional text -> bool, forwarded to llm_backend.generate_analysis.
+    Without this, the chain's default validator only checks "non-empty" --
+    so a tier that ignores the "respond with ONLY raw JSON" instruction and
+    returns commentary/preamble text still counts as a "success", and the
+    chain never falls through to a later tier (Gemini/Mistral/local) that
+    might have actually returned parseable JSON. Callers building Stage 1/
+    Stage 2 prompts should pass a validator that confirms the response
+    parses as their expected schema (see run()'s call sites) so a
+    malformed-but-nonempty reply is treated as this tier failing, not as a
+    real "zero candidates" result.
+
     Returns (text, sources, used_live_search). `text` is "" (falsy) on total
     failure, same as before when it returned None -- existing `if not text:`
     checks in callers (this file and optionstrategy.py) work unchanged.
@@ -739,12 +817,13 @@ def generate_analysis(prompt, max_tokens=1200):
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
 
     def _gather_context():
-        return _gather_tavily_context(today_str)
+        return _gather_tavily_context(today_str, extra_queries=extra_context_queries)
 
     return llm_backend.generate_analysis(
         prompt,
         max_tokens=max_tokens,
         gather_context_fn=_gather_context,
+        validate_fn=validate_fn,
         log_label="swing-trade generation",
     )
 
@@ -817,6 +896,49 @@ def _attach_live_prices(stocks):
         else:
             stock["current_price_display"] = None
     return stocks
+
+
+def _attach_risk_plan(stocks):
+    """
+    Attaches an independently-computed, ATR-based stop/target/position-size
+    plan to each stock (review items 2+3) -- computed purely from real price
+    history via swing_trade_risk, never from the model's flat stop_loss_pct/
+    target1_pct. Deliberately additive: the model's flat-% fields are left
+    untouched so the report can show both side by side (see
+    _risk_plan_display) rather than silently overwriting a value that might
+    itself be informative (e.g. if the two disagree sharply, that's worth
+    seeing, not hiding).
+    """
+    for stock in stocks:
+        plan = risk.compute_volatility_adjusted_plan(stock.get("ticker"), min_risk_reward=MIN_RISK_REWARD)
+        stock["_atr_risk_plan"] = plan
+    return stocks
+
+
+def _risk_plan_display(stock):
+    plan = stock.get("_atr_risk_plan")
+    if not plan:
+        return '<span style="color:#8A8F9C;">Could not compute (insufficient price history for ATR).</span>'
+    lines = [
+        f'Stop {plan["stop_loss_pct"]}% / Target {plan["target1_pct"]}% '
+        f'<span style="color:#8A8F9C;">(from {risk.ATR_STOP_MULTIPLE:g}&times; weekly ATR of '
+        f'{plan["atr_weekly"]} on a {plan["latest_close"]} close)</span>'
+    ]
+    if plan.get("shares_for_1pct_risk") is not None:
+        lines.append(
+            f'<div style="margin-top:2px;font-size:11px;color:#8A8F9C;">'
+            f'Position size for {risk.RISK_PCT_PER_TRADE:g}% portfolio risk: '
+            f'{plan["shares_for_1pct_risk"]} shares '
+            f'(&asymp;{plan["position_value_for_1pct_risk"]:,.0f})</div>'
+        )
+    else:
+        fallback_msg = html.escape(plan.get("position_size_note") or "")
+        lines.append(
+            '<div style="margin-top:2px;font-size:11px;color:#8A8F9C;">'
+            + (fallback_msg or "Set PORTFOLIO_VALUE to get a share-count position size, not just a %.")
+            + "</div>"
+        )
+    return "".join(lines)
 
 
 def _parse_first_number(value):
@@ -1065,6 +1187,75 @@ def _find_year_ago_index(columns, tolerance_days=45):
     return best_idx
 
 
+# Growth this far above the mandatory threshold is disproportionately
+# likely to be a one-off (impairment reversal, asset sale, exceptional
+# item) rather than organic operating improvement -- e.g. a -308% "profit
+# growth" figure for a name in an earlier run's rejected list smelled like
+# exactly this, not genuine deterioration. yfinance's quarterly numbers are
+# taken at face value elsewhere in this file; this check doesn't reject an
+# anomalous figure (a real business CAN grow profit 80%+ YoY off a small
+# base), it flags it as needing a human look at the actual exchange filing
+# before being trusted, and asks the Stage 2 model to specifically address
+# it rather than silently repeating the headline number.
+ANOMALOUS_GROWTH_MULTIPLE = _env_float("ANOMALOUS_GROWTH_MULTIPLE", 3.0)  # 3x the mandatory threshold
+
+
+def _check_anomalous_growth(ticker, data):
+    """
+    Returns a list of (note_text, "soft") tuples flagging growth figures
+    that are large enough to warrant manual cross-verification against the
+    actual quarterly result / exchange filing, rather than trusting
+    yfinance's derived YoY number at face value. Two independent checks:
+
+    1. Magnitude: revenue or profit growth >= ANOMALOUS_GROWTH_MULTIPLE x
+       the mandatory threshold.
+    2. Divergence: profit growth far outpacing revenue growth (e.g. profit
+       +150% on flat/modest revenue growth) is the classic signature of a
+       non-operating gain (asset sale, tax credit, one-off write-back)
+       inflating net income without the underlying business actually
+       growing that fast -- worth a second look even if neither figure
+       alone crosses the magnitude threshold.
+
+    Always "soft" (informational), never "hard" -- this module has no way
+    to confirm from yfinance data alone whether a large number is a real
+    beat or a one-off; that confirmation is exactly what it's asking a
+    human (or the Stage 2 model's own web search) to go do.
+    """
+    notes = []
+    rev_g = data.get("revenue_growth_yoy")
+    profit_g = data.get("profit_growth_yoy")
+    cap = MIN_GROWTH_YOY_PCT * ANOMALOUS_GROWTH_MULTIPLE
+
+    if profit_g is not None and abs(profit_g) >= cap:
+        notes.append((
+            f"Net profit growth of {profit_g}% is {ANOMALOUS_GROWTH_MULTIPLE:g}x+ the "
+            f"{_fmt_num(MIN_GROWTH_YOY_PCT)}% mandatory threshold -- unusually large swings "
+            "like this are disproportionately likely to reflect a one-off item (impairment "
+            "reversal, asset sale, exceptional charge) rather than organic growth. "
+            "Cross-check against the actual quarterly result/exchange filing before trusting "
+            f"this figure for '{ticker}'.", "soft"
+        ))
+    if rev_g is not None and abs(rev_g) >= cap:
+        notes.append((
+            f"Revenue growth of {rev_g}% is {ANOMALOUS_GROWTH_MULTIPLE:g}x+ the "
+            f"{_fmt_num(MIN_GROWTH_YOY_PCT)}% mandatory threshold for '{ticker}' -- verify "
+            "against the exchange filing (this can be a real scale-up, but can also be a "
+            "one-off bulk order, M&A-driven consolidation, or restated prior-year base).", "soft"
+        ))
+    if (
+        profit_g is not None and rev_g is not None and rev_g > 0
+        and profit_g > rev_g * 3 and profit_g >= MIN_GROWTH_YOY_PCT
+    ):
+        notes.append((
+            f"Profit growth ({profit_g}%) is far outpacing revenue growth ({rev_g}%) for "
+            f"'{ticker}' -- this divergence is the classic signature of a non-operating gain "
+            "(asset sale, tax credit, write-back) inflating net income rather than the "
+            "underlying business growing this fast. Worth confirming against the P&L's "
+            "'exceptional items' / 'other income' line before trusting it.", "soft"
+        ))
+    return notes
+
+
 def _verify_fundamentals(stock):
     """
     Independently checks the prompt's mandatory fundamentals filters
@@ -1129,6 +1320,8 @@ def _verify_fundamentals(stock):
             notes.append((f"Net profit growth YoY is {profit_g}% -- below the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold the prompt requires.", "hard"))
     else:
         notes.append(("Net profit YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
+
+    notes.extend(_check_anomalous_growth(ticker, data))
 
     return notes
 
@@ -1238,6 +1431,16 @@ def _verify_stock_claims(stocks):
 
         stock["_verification_notes"] = notes
         _adjust_confidence(stock, notes)
+
+        # Composite score (review item 6): the hard-gate pass/fail above is
+        # unchanged and still decides qualify/reject -- this adds a ranked,
+        # 0-100 diagnostic on top so "how close did this candidate actually
+        # come" is visible instead of thrown away, and so multiple
+        # qualifying candidates in one run can be ranked rather than taken
+        # in whatever order the model listed them.
+        composite, breakdown = scoring.compute_composite_score(rr_notes, tech_notes, fund_notes, sanity_notes)
+        stock["_composite_score"] = composite
+        stock["_composite_breakdown"] = breakdown
     return stocks
 
 
@@ -1385,6 +1588,7 @@ def _render_one_stock_card(stock, idx, sans):
     rows = "".join([
         row("Current Market Price", "current_price_display", bold=True),
         raw_row("Confidence Score", _confidence_display),
+        raw_row("Composite Score (0-100)", scoring.composite_score_html),
         raw_row("Risk Level", lambda s: _risk_level_badge(s.get("risk_level"))),
         row("Key Catalysts", "key_catalysts"),
         raw_row("Risk : Reward", _risk_reward_display),
@@ -1396,6 +1600,7 @@ def _render_one_stock_card(stock, idx, sans):
         row("Stop-Loss %", "stop_loss_pct", value_color="#8B2E2E", bold=True),
         row("Target 1 (T1) %", "target1_pct"),
         row("Target 2 (T2) %", "target2_pct"),
+        raw_row("ATR-Based Risk Plan", _risk_plan_display),
         row("Recent Top Buyers (FII/DII)", "top_buyers"),
         row("Broker Recommendations", "broker_recommendations"),
         raw_row("Data Verification", _verification_display),
@@ -1446,17 +1651,26 @@ def _no_qualifying_stock_html(rejected):
         "</div>"
     )
     if rejected:
+        # Ranked by composite score (best near-misses first) rather than
+        # just "whichever 6 were seen last" -- this is the diagnostic value
+        # a pure pass/fail throws away: seeing how CLOSE the strongest
+        # rejected candidates actually came (review item 6).
+        ranked = scoring.rank_by_composite([s for s in rejected if "_composite_score" in s])
+        unscored = [s for s in rejected if "_composite_score" not in s]  # e.g. Stage-1 fundamentals-only rejections
+        display_list = (ranked + unscored)[-6:] if not ranked else ranked[:6]
         items = "".join(
             f'<div style="margin-top:8px;font-family:{sans};font-size:12px;color:#4A5063;">'
             f'<strong style="color:#14213D;">{html.escape(str(s.get("name") or s.get("ticker") or "Unnamed"))}</strong>'
-            f' &mdash; rejected: {html.escape("; ".join(n for n, sev in (s.get("_verification_notes") or []) if sev in ("hard", "nodata")) or "unspecified")}'
+            + (f' &mdash; composite {s["_composite_score"]:.1f}/100' if "_composite_score" in s else "")
+            + f' &mdash; rejected: {html.escape("; ".join(n for n, sev in (s.get("_verification_notes") or []) if sev in ("hard", "nodata")) or "unspecified")}'
             "</div>"
-            for s in rejected[-6:]
+            for s in display_list
         )
         out += (
             f'<div style="margin-top:14px;padding-top:10px;border-top:1px solid #EDEAE2;'
             f'font-family:{sans};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;'
-            f'letter-spacing:0.05em;">Candidates considered and rejected this run</div>{items}'
+            f'letter-spacing:0.05em;">Candidates considered and rejected this run '
+            f'(ranked by how close they came)</div>{items}'
         )
     return out
 
@@ -1679,12 +1893,44 @@ def run():
     sources = []
     used_live_search = False
     all_rejected = []
+    qualifying = []  # default if every attempt "continue"s before ever assigning it
+    regime_ok, regime_detail = regime.check_market_regime()
+    stockpredictor.log.info(f"Market-regime check: {regime_detail}")
 
     # Every ticker rejected so far this run (at either the fundamentals or
     # technicals stage) -- excluded from later attempts' prompts AND
     # enforced here directly, since prompt instructions alone aren't
     # reliably honored by the model.
     seen_tickers = set()
+
+    # Market-regime gate (review item 4): buying individual bullish setups
+    # during a broad market downtrend has a materially worse hit rate than
+    # the same setup in a bullish tape -- gate the WHOLE run behind the
+    # index trend rather than letting a strong-looking individual stock
+    # override a bearish broader market. This also saves every Stage 1/
+    # Stage 2 LLM call this run would otherwise have spent, since there's
+    # no point screening candidates the strategy itself says not to trust
+    # right now. Set REQUIRE_MARKET_REGIME_FILTER=false (in
+    # swing_trade_regime.py's env) to disable and fall back to the old
+    # per-stock-only behavior.
+    if regime.REQUIRE_MARKET_REGIME_FILTER and not regime_ok:
+        stockpredictor.log.warning(
+            f"Market regime gate failed ({regime_detail.get('classification')}) -- "
+            "skipping this run's scan entirely rather than screening individual "
+            "stocks against an unfavorable broad-market backdrop."
+        )
+        analysis_html = (
+            _no_qualifying_stock_html([])
+            + regime.regime_note_html(regime_detail)
+        )
+        email_html = build_email_html(analysis_html, today_str, [], False, _adjustments_html(applied_adjustments))
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            with open("swing_trade_report.html", "w") as f:
+                f.write(email_html)
+            stockpredictor.log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
+            return
+        send_swing_trade_email(email_html)
+        return
 
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         sectors = _sectors_for_attempt(attempt - 1)
@@ -1697,7 +1943,16 @@ def run():
         # Larger budget than the default: this call has to search several
         # sectors, check 8-12 companies, and enumerate up to 20 candidates --
         # 1200 tokens was silently truncating that down to 1-2 stocks checked.
-        growth_analysis, growth_sources, growth_live = generate_analysis(growth_prompt, max_tokens=3000)
+        # validate_fn requires the reply to actually parse as the expected
+        # {"candidates": [...]} shape -- without this, a tier that ignores
+        # the "ONLY raw JSON" instruction and returns commentary text still
+        # counts as a chain "success", and the whole attempt gets treated as
+        # zero candidates instead of falling through to a tier that might
+        # have returned usable JSON.
+        growth_analysis, growth_sources, growth_live = generate_analysis(
+            growth_prompt, max_tokens=3000,
+            validate_fn=lambda t: _parse_candidates_json(t) is not None,
+        )
 
         if not growth_analysis:
             stockpredictor.log.error(
@@ -1750,7 +2005,10 @@ def run():
         )
 
         tech_prompt = build_technical_prompt(fundamentally_qualified, seen_tickers, today_str, lookback_note)
-        tech_analysis, tech_sources, tech_live = generate_analysis(tech_prompt, max_tokens=2200)
+        tech_analysis, tech_sources, tech_live = generate_analysis(
+            tech_prompt, max_tokens=2200,
+            validate_fn=lambda t: _parse_analysis_json(t) is not None,
+        )
 
         if not tech_analysis:
             stockpredictor.log.error(
@@ -1782,8 +2040,25 @@ def run():
             continue
 
         stocks = _attach_live_prices(stocks)
+        stocks = _attach_risk_plan(stocks)
         stocks = _verify_stock_claims(stocks)
         qualifying, rejected = _split_qualifying(stocks)
+
+        # When enabled, rank qualifying candidates by composite score before
+        # the concentration cap below picks which one(s) to keep per sector --
+        # otherwise "which pick survives the cap" is just "whichever the
+        # model happened to list first" (review item 6).
+        if scoring.USE_COMPOSITE_SCORE:
+            qualifying = scoring.rank_by_composite(qualifying)
+
+        # Sector-concentration cap (review item 9): if this attempt's Stage 2
+        # call returned multiple qualifying names, don't let several
+        # same-sector picks (often the same underlying factor bet) all
+        # through in one run.
+        qualifying, dropped_for_concentration = risk.apply_sector_concentration_cap(qualifying)
+        for d in dropped_for_concentration:
+            d["_verification_notes"] = (d.get("_verification_notes") or []) + [(d["_concentration_note"], "hard")]
+        all_rejected.extend(dropped_for_concentration)
         all_rejected.extend(rejected)
         seen_tickers.update(
             (s.get("ticker") or "").strip().upper() for s in rejected if s.get("ticker")
@@ -1811,7 +2086,18 @@ def run():
         )
         analysis_html = _no_qualifying_stock_html(all_rejected)
 
+    analysis_html = (analysis_html or "") + regime.regime_note_html(regime_detail)
     email_html = build_email_html(analysis_html, today_str, sources, used_live_search, _adjustments_html(applied_adjustments))
+
+    # Outcome-tracking feedback loop (review item 7): log every stock this
+    # run actually emailed so swing_trade_outcomes.py can later check real
+    # price history and report whether it hit target, hit stop, or neither.
+    # Runs regardless of DRY_RUN so local testing doesn't silently pollute
+    # (or silently skip populating) the outcomes log inconsistently -- if
+    # you don't want DRY_RUN runs logged, don't run with picks that qualify.
+    if qualifying:
+        for s in qualifying:
+            outcomes.log_recommendation(s, today_str_iso=datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d"))
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("swing_trade_report.html", "w") as f:

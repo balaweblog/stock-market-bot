@@ -422,7 +422,8 @@ def run_stock_stage(today_str, lookback_note):
     for batch in _chunks(WATCHLIST, STOCK_PER_BATCH):
         stockpredictor.log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
         prompt = build_stock_prompt(batch, today_str, lookback_note)
-        text, s, live = generate_analysis(prompt, max_tokens=3200)
+        stock_queries = [f"{name} share price target news {today_str}" for name in batch]
+        text, s, live = generate_analysis(prompt, max_tokens=3200, extra_context_queries=stock_queries)
         if not text:
             stockpredictor.log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
             continue
