@@ -3,35 +3,17 @@ swing_trade_advisor.py
 
 Standalone companion to main.py. Runs a single, open-ended "find me a
 high-conviction 3-5 month swing trade" prompt against whichever free LLM
-backend main.py already knows how to set up (Groq free tier -> Gemini
-2.5 Flash free tier -> local Qwen2.5-1.5B fallback), then emails the
-result to the same recipients configured for the stock report
-(EMAIL_TO / EMAIL_CC in config.py / the workflow yaml's env vars).
+backend is available, then emails the result to the same recipients
+configured for the stock report (EMAIL_TO / EMAIL_CC in config.py / the
+workflow yaml's env vars).
 
-This intentionally reuses main.py's LLM-selection and email-credential
-plumbing instead of duplicating it, so both scripts stay in sync with
-whatever provider is configured.
-
-LIVE DATA: tries several live-search paths in order before ever falling back
-to a plain (non-live) model:
-  1. groq/compound -- Groq's free tool-using system, autonomous web search.
-  2. groq/compound-mini -- lighter variant, tried if #1 is unavailable.
-  3. Tavily direct search (TAVILY_API_KEY, free tier, 1,000 searches/month,
-     no card) + a plain Groq model for synthesis -- a real live-search path
-     that doesn't share compound's expensive internal orchestration budget.
-     The synthesis step itself tries a short list of Groq models in order
-     (SYNTHESIS_MODELS env var) since Groq's daily token quota is tracked
-     per model, not per account -- one model running dry doesn't mean the
-     others are unavailable too.
-  4. Gemini + Google Search grounding (GOOGLE_API_KEY, separate free quota).
-  5. Mistral's web_search agent (MISTRAL_API_KEY, separate free quota;
-     requires `pip install mistralai`) -- tried regardless of which primary
-     backend main.py selected, since it shares no quota with any of the above.
-Only if all five fail does it drop to non-live generation (plain Groq, then
-local Qwen2.5-1.5B) -- and even then, REQUIRE_LIVE_DATA=true (the default)
-aborts the run instead of emailing unverified, training-data-only output.
-The email lists whichever sources were actually used under "Sources
-checked" so you can spot-check the claims.
+LLM init, model tiers, retry/backoff, and the live-search fallback chain
+all live in llm_backend.py now (shared with main.py's AI Stocks Story and,
+via this module's generate_analysis(), optionstrategy.py) -- see that
+file's docstring for the full chain order and rationale. This module only
+owns what's specific to the swing-trade prompt: which Tavily queries to
+run for the grounded-context tier (_gather_tavily_context), the stock
+qualification/verification logic below, and result formatting/email.
 
 CAVEAT: this is still not a verified real-time trade signal. Web search
 results can be a few hours stale, incomplete, or misread by the model.
@@ -58,7 +40,8 @@ from email.mime.text import MIMEText
 
 import pandas as pd
 
-import main  # reuses LLM init, email config/credentials, and helpers
+import main  # reuses email config/credentials and helpers
+import llm_backend  # shared LLM init + fallback chain (see llm_backend.py)
 from compliance import build_compliance_block_html
 
 # -----------------------------
@@ -79,22 +62,8 @@ REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower()
 # two-stage pipeline (fundamentals screen, then technicals -- see below), so
 # this is 2 LLM calls per attempt, not 1. 3 is a reasonable default for a
 # WEEKLY run (see SCHEDULE note below) -- it wouldn't be for a daily one.
-def _env_int(name, default):
-    """
-    Parses an integer env var, falling back to `default` (and logging a
-    warning) if it's unset, empty, or not a valid integer -- so a typo'd
-    workflow-yaml value (e.g. SECTORS_PER_ATTEMPT=six) can't crash the
-    whole script at import time before any logging is even configured.
-    """
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(raw.strip())
-    except ValueError:
-        print(f"WARNING: env var {name}='{raw}' is not a valid integer -- using default {default}.")
-        return default
-
+# _env_int lives in llm_backend.py now (shared with main.py's config too).
+_env_int = llm_backend._env_int
 
 MAX_GENERATION_ATTEMPTS = _env_int("MAX_GENERATION_ATTEMPTS", 3)
 
@@ -752,414 +721,34 @@ def _gather_tavily_context(today_str):
     return context_text, sources
 
 
-def _try_tavily_plus_groq(prompt, today_str, max_tokens=1500):
-    """
-    Fallback tier that decouples search from generation: fetch real search
-    results via Tavily directly (its own separate free quota), prepend them
-    to the prompt as grounding context, then run that through Groq's plain
-    (non-compound) model -- which has no tool-orchestration overhead and so
-    doesn't burn through a shared TPM budget the way groq/compound does.
-    Returns (text, sources, True) on success, or None if Tavily isn't
-    configured / returned nothing, or the Groq call fails.
-    """
-    if not os.getenv("TAVILY_API_KEY"):
-        main.log.info(
-            "Tavily fallback skipped: TAVILY_API_KEY is not configured."
-        )
-        return None
-    context_text, sources = _gather_tavily_context(today_str)
-    if not context_text:
-        main.log.warning("Tavily returned no usable results -- skipping this fallback tier.")
-        return None
-
-    # Groq's daily token quota (TPD) is tracked per model, not per account --
-    # e.g. llama-3.3-70b-versatile has a 100K TPD cap while llama-3.1-8b-instant
-    # has its own separate budget under the same GROQ_API_KEY. A model that's
-    # run dry today doesn't mean the account is out of quota, so try a short
-    # list of models in order rather than hard-coding just one. Override with
-    # SYNTHESIS_MODELS="model-a,model-b" (comma-separated) if you want
-    # different models/order without editing code.
-    #
-    # NOTE: openai/gpt-oss-120b is deliberately not in the default list --
-    # GPT-OSS models on Groq ship with a built-in "browser" tool baked into
-    # their template that can fire on its own (tool_use_failed) even when no
-    # tools are passed in this call, so it isn't reliable here. Add it back
-    # via SYNTHESIS_MODELS if you want to try it anyway.
-    synthesis_models = [
-        m.strip() for m in os.getenv(
-            "SYNTHESIS_MODELS",
-            "llama-3.3-70b-versatile,llama-3.1-8b-instant,qwen/qwen3-32b",
-        ).split(",") if m.strip()
-    ]
-    for model_name in synthesis_models:
-        try:
-            response = main.groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": context_text + prompt}],
-                temperature=0.4,
-                max_tokens=max_tokens,
-            )
-            text = response.choices[0].message.content.strip()
-            return text, sources, True  # True: grounded in real Tavily results
-        except Exception as e:
-            main.log.error(f"Groq synthesis over Tavily context failed with {model_name}: {e}")
-            if _is_auth_error(e):
-                # Same key, so every other model would fail identically --
-                # no point burning more requests trying them.
-                break
-            # Otherwise (quota, request-too-large, or a model-specific quirk
-            # like GPT-OSS's tool-call issue) keep trying the next model --
-            # none of those reasons generalize to a different model.
-    return None
-
-
-def _try_mistral_web_search(prompt, max_tokens=1500):
-    """
-    Fifth live-search fallback tier: Mistral's free-tier Agents API, which
-    has a first-party `web_search` tool -- an entirely separate quota from
-    Groq's (all models), Tavily's, and Gemini's, so it's still available
-    even if all of those are exhausted on a given day.
-
-    Requires MISTRAL_API_KEY (console.mistral.ai, free tier, no card) and
-    the `mistralai` package (`pip install mistralai`). Skips cleanly (no
-    exception) if either is missing, matching how the Gemini fallback above
-    treats a missing GOOGLE_API_KEY / google-genai package.
-
-    IMPORTANT: web_search only works via the Agents/Conversations API
-    (client.beta.agents / client.beta.conversations), not the plain Chat
-    Completions API (client.chat.complete) -- Mistral's docs are explicit
-    that Chat Completions responses can't carry the search-result
-    references the tool returns. That's why this creates a throwaway
-    agent per call rather than using a simple chat completion.
-
-    Returns (text, sources, True) on success, or None on any failure so
-    callers can fall through to their next option.
-    """
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        main.log.info("Mistral fallback skipped: MISTRAL_API_KEY is not configured.")
-        return None
-    try:
-        from mistralai import Mistral
-    except ImportError:
-        main.log.info(
-            "Mistral fallback skipped: the `mistralai` package isn't "
-            "installed (pip install mistralai)."
-        )
-        return None
-    try:
-        client = Mistral(api_key=api_key)
-        agent = client.beta.agents.create(
-            model="mistral-medium-latest",
-            name="swing-trade-live-search",
-            description="One-off agent for live-search-grounded swing-trade generation.",
-            tools=[{"type": "web_search"}],
-        )
-        response = client.beta.conversations.start(
-            agent_id=agent.id,
-            inputs=prompt,
-        )
-        text_parts, sources = [], []
-        for item in getattr(response, "outputs", None) or []:
-            content = getattr(item, "content", None)
-            if isinstance(content, str):
-                text_parts.append(content)
-                continue
-            for chunk in content or []:
-                chunk_type = getattr(chunk, "type", None)
-                if chunk_type == "text":
-                    text_parts.append(getattr(chunk, "text", "") or "")
-                elif chunk_type in ("tool_reference", "url_citation"):
-                    url = getattr(chunk, "url", None)
-                    title = getattr(chunk, "title", None) or url
-                    if url and (title, url) not in sources:
-                        sources.append((title, url))
-        text = "".join(text_parts).strip()
-        if not text:
-            main.log.warning("Mistral web-search agent returned no text content.")
-            return None
-        return text, sources, True  # True: grounded via Mistral's web_search tool
-    except Exception as e:
-        main.log.error(f"Mistral web-search fallback failed: {e}")
-        return None
-
-
-def _try_groq_compound_model(prompt, model_name, max_attempts=3, max_tokens=1200):
-    """
-    Runs the prompt against a Groq compound (tool-using, live-search-capable)
-    model and returns (text, sources, True) on success, or None if it
-    fails after retries -- callers should fall through to their next option.
-
-    max_tokens caps the model's TOTAL output for this call, which for a
-    compound model includes its internal tool-call/search reasoning as well
-    as the final answer -- too low a budget silently truncates how much
-    searching it actually does before it has to wrap up, which shows up as
-    "checked only 1-2 stocks" even when the prompt asked for many more.
-    Callers doing a broad multi-sector search should pass a larger budget
-    than callers checking a short, already-narrowed shortlist.
-
-    A 413 ("Request Entity Too Large") or a daily-quota 429 both mean
-    retrying this exact call is pointless, so those stop immediately
-    instead of burning the remaining attempts.
-    """
-    for attempt in range(max_attempts):
-        try:
-            response = main.groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=max_tokens,
-            )
-            text = response.choices[0].message.content.strip()
-            sources = _extract_groq_sources(response)
-            return text, sources, True  # True = had live web search available
-        except Exception as e:
-            main.log.error(
-                f"Groq ({model_name}) swing-trade generation failed "
-                f"(attempt {attempt + 1}/{max_attempts}): {e}"
-            )
-            if _is_request_too_large(e):
-                main.log.error(
-                    f"Request too large for {model_name} -- skipping "
-                    "further retries of this payload."
-                )
-                return None
-            if _is_daily_quota_exceeded(e):
-                main.log.error(
-                    f"Groq daily token quota (TPD) exhausted for "
-                    f"{model_name} -- retrying within seconds cannot help. "
-                    "Skipping remaining retries."
-                )
-                return None
-            if attempt < max_attempts - 1:
-                wait_s = _parse_groq_retry_seconds(e) or 10
-                main.log.info(f"Retrying {model_name} in {wait_s:.1f}s...")
-                time.sleep(wait_s)
-    return None
-
-
 def generate_analysis(prompt, max_tokens=1200):
-    backend = main.init_llm_generator()
-    main.log.info(f"Swing trade advisor using LLM backend: {backend}")
-    # None of the non-search fallbacks below (plain Groq call, plain Gemini
-    # call, local model) can ever set used_live_search=True, so when
-    # REQUIRE_LIVE_DATA=true their output is discarded by run() regardless of
-    # whether they succeed. Skipping them in that case avoids spending
-    # further Groq token quota and, for the local model, several minutes of
-    # CPU inference on a result that can never be used.
-    require_live = os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true"
-
-    if backend == "groq":
-        result = _try_groq_compound_model(prompt, "groq/compound", max_attempts=3, max_tokens=max_tokens)
-        if result is not None:
-            return result
-
-        main.log.info("groq/compound unavailable -- trying groq/compound-mini...")
-        result = _try_groq_compound_model(prompt, "groq/compound-mini", max_attempts=2, max_tokens=max_tokens)
-        if result is not None:
-            return result
-
-        today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
-        result = _try_tavily_plus_groq(prompt, today_str, max_tokens=max_tokens)
-        if result is not None:
-            return result
-
-        if getattr(main, "gemini_client", None) is None and not (os.getenv("GOOGLE_API_KEY") and getattr(main, "genai", None) is not None):
-            main.log.info(
-                "Gemini live-search fallback skipped: GOOGLE_API_KEY is not "
-                "configured (or the google-genai package isn't installed), "
-                "so there is no second live-data path available for this run."
-            )
-        else:
-            grounded = _try_gemini_grounded(prompt)
-            if grounded is not None:
-                return grounded
-
-        if not require_live:
-            try:
-                response = main.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.4,
-                    max_tokens=max_tokens,
-                )
-                return response.choices[0].message.content.strip(), [], False
-            except Exception as e2:
-                main.log.error(f"Groq fallback (no search) generation also failed: {e2}")
-                if _is_daily_quota_exceeded(e2):
-                    main.log.error(
-                        "Groq's daily token quota is exhausted for this org -- "
-                        "this is shared with main.py's per-stock reasoning calls "
-                        "(same GROQ_API_KEY, same default model). If main.py ran "
-                        "earlier today against many stocks, it may have used "
-                        "most of the 100k/day budget before this script ran. "
-                        "Falling back to the local model instead of retrying Groq."
-                    )
-
-    elif backend == "gemini" or getattr(main, "gemini_client", None) is not None:
-        grounded = _try_gemini_grounded(prompt)
-        if grounded is not None:
-            return grounded
-        if not require_live:
-            try:
-                response = main.gemini_client.models.generate_content(
-                    model="gemini-flash-latest",
-                    contents=prompt,
-                )
-                return response.text.strip(), [], False
-            except Exception as e:
-                main.log.error(f"Gemini swing-trade generation failed: {e}")
-
-    # Fifth live-search tier, tried regardless of which primary backend was
-    # selected above: Mistral's web_search agent, on a quota entirely
-    # separate from Groq (all models) and Gemini. Only reached if nothing
-    # above already returned.
-    mistral_result = _try_mistral_web_search(prompt, max_tokens=max_tokens)
-    if mistral_result is not None:
-        return mistral_result
-
-    if require_live:
-        main.log.info(
-            "Every live-search path failed this run, and REQUIRE_LIVE_DATA=true "
-            "means a non-search fallback's output would be discarded anyway -- "
-            "skipping the no-search Groq/Gemini call and the local model "
-            "entirely rather than spending remaining quota/CPU time on a "
-            "result that can't be used. Set REQUIRE_LIVE_DATA=false to allow "
-            "a clearly-labeled stale-data run instead."
-        )
-        return None, [], False
-
-    local_backend = main.init_llm_generator(force_local=True)
-    if local_backend == "local" and main.llm_pipeline is not None:
-        text = _generate_local(prompt)
-        if text:
-            return text, [], False
-
-    return None, [], False
-
-
-def _generate_local(prompt):
-    if main.llm_pipeline is None:
-        return None
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = main.llm_pipeline.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        with main.model_lock:
-            outputs = main.llm_pipeline(
-                formatted_prompt,
-                max_new_tokens=1200,
-                do_sample=True,
-                temperature=0.4,
-                top_k=50,
-                top_p=0.95,
-            )
-        generated_text = outputs[0]["generated_text"]
-        text = generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-        return text
-    except Exception as e:
-        main.log.error(f"Local swing-trade generation failed: {e}")
-        return None
-
-
-def _is_request_too_large(exc):
-    msg = str(exc)
-    return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
-
-
-def _is_daily_quota_exceeded(exc):
-    msg = str(exc)
-    return "tokens per day" in msg or "TPD" in msg
-
-
-def _is_auth_error(exc):
     """
-    True for errors caused by the API key itself (invalid/missing/revoked),
-    which will fail identically for every model on the same key -- as
-    opposed to a model-specific quirk (e.g. a tool-calling error unique to
-    one model's template) where trying a different model is still worth it.
+    Thin wrapper around llm_backend.generate_analysis() -- this module used
+    to hand-roll its own copy of the entire fallback chain (groq/compound ->
+    compound-mini -> Tavily+synthesis -> Gemini -> Mistral -> local); that
+    logic now lives once in llm_backend.py, shared with main.py's AI Stocks
+    Story and (via this function) optionstrategy.py.
+
+    Only the swing-trade-specific piece stays here: which Tavily queries to
+    run for the "grounded" tier (see _gather_tavily_context above).
+
+    Returns (text, sources, used_live_search). `text` is "" (falsy) on total
+    failure, same as before when it returned None -- existing `if not text:`
+    checks in callers (this file and optionstrategy.py) work unchanged.
     """
-    msg = str(exc)
-    return "401" in msg or "invalid_api_key" in msg or "Incorrect API key" in msg
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
+
+    def _gather_context():
+        return _gather_tavily_context(today_str)
+
+    return llm_backend.generate_analysis(
+        prompt,
+        max_tokens=max_tokens,
+        gather_context_fn=_gather_context,
+        log_label="swing-trade generation",
+    )
 
 
-def _parse_groq_retry_seconds(exc):
-    match = re.search(r"try again in ([\d.]+)s", str(exc))
-    if match:
-        try:
-            return float(match.group(1)) + 0.5
-        except ValueError:
-            return None
-    return None
-
-
-def _try_gemini_grounded(prompt):
-    # NOTE: this deliberately reads/writes main.gemini_client (module-level
-    # state on the imported main module) rather than a local variable, so
-    # that once it's lazily created here it's reused -- not re-created --
-    # by any subsequent call in this process, matching main.py's own client
-    # caching. This is intentional shared state, not an oversight. It
-    # assumes single-threaded/sequential execution, which holds for this
-    # script's current run() loop -- if swing_trade_advisor and main were
-    # ever driven concurrently in the same process, the check-then-set
-    # below would need a lock to avoid a race. getattr() is used defensively
-    # in case main is ever reloaded/mocked without these attributes set.
-    if getattr(main, "gemini_client", None) is None:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key or getattr(main, "genai", None) is None:
-            return None
-        try:
-            main.gemini_client = main.genai.Client(api_key=api_key)
-        except Exception as e:
-            main.log.error(f"Could not lazily initialize Gemini client for grounded fallback: {e}")
-            return None
-    try:
-        from google.genai import types
-        grounding_tool = types.Tool(google_search=types.GoogleSearch())
-        response = main.gemini_client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=[grounding_tool]),
-        )
-        sources = []
-        try:
-            for candidate in response.candidates:
-                gm = getattr(candidate, "grounding_metadata", None)
-                for chunk in (getattr(gm, "grounding_chunks", None) or []):
-                    web = getattr(chunk, "web", None)
-                    if web and web.uri and (web.title, web.uri) not in sources:
-                        sources.append((web.title or web.uri, web.uri))
-        except Exception as e:
-            main.log.warning(f"Could not extract Gemini grounding sources: {e}")
-        used_live = bool(sources)
-        return response.text.strip(), sources, used_live
-    except Exception as e:
-        main.log.error(f"Gemini grounded (live search) generation failed: {e}")
-        return None
-
-
-def _extract_groq_sources(response):
-    def _get(obj, key):
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    sources = []
-    try:
-        message = response.choices[0].message
-        for tool in (_get(message, "executed_tools") or []):
-            search_results = _get(tool, "search_results")
-            for r in (_get(search_results, "results") or []):
-                url = _get(r, "url")
-                title = _get(r, "title") or url
-                if url and (title, url) not in sources:
-                    sources.append((title, url))
-    except Exception as e:
-        main.log.warning(f"Could not extract Groq search sources: {e}")
-    return sources
 
 
 def _parse_analysis_json(text):

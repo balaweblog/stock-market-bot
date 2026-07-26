@@ -19,18 +19,9 @@ try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     sync_playwright = None
-try:
-    from transformers import pipeline
-except ImportError:
-    pipeline = None
-try:
-    from groq import Groq
-except ImportError:
-    Groq = None
-try:
-    from google import genai
-except ImportError:
-    genai = None
+# NOTE: transformers/Groq/google-genai imports and all LLM client state now
+# live in llm_backend.py (shared with swing_trade_advisor.py and
+# optionstrategy.py) -- see the llm_backend import below.
 from config import *
 from stock_fetcher import fetch_fundamentals
 from fundamentals import score_fundamentals
@@ -48,16 +39,17 @@ from commodity_tracker import CommodityTracker
 from compliance import build_compliance_block_html
 from track_record import update_track_record, build_track_record_html
 from support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
+import llm_backend
 
 import threading
 
-model_lock = threading.Lock()
-
-llm_pipeline = None
-use_gemini_flash = False
-gemini_client = None
-use_groq = False
-groq_client = None
+# LLM client state and init now live in llm_backend.py (shared with
+# swing_trade_advisor.py / optionstrategy.py). These names are kept as
+# thin aliases so any external code still referencing main.groq_client /
+# main.gemini_client / main.llm_pipeline / main.model_lock / main.init_llm_generator
+# keeps working -- they all point at the same shared module state.
+model_lock = llm_backend.model_lock
+init_llm_generator = llm_backend.init_llm_generator
 
 # -----------------------------
 # Run-history persistence (enables signal-change tracking, stop/target
@@ -105,90 +97,6 @@ def save_run_history(history):
             json.dump(history, f, indent=2, default=str)
     except Exception as e:
         log.error(f"Failed to save run history to {RUN_HISTORY_PATH}: {e}")
-
-def init_llm_generator(force_local=False):
-    """
-    Initializes the AI model.
-    Priority: Groq (free tier, fast hosted inference on Llama/DeepSeek) if
-    GROQ_API_KEY is present, then Gemini 2.5 Flash if GOOGLE_API_KEY is
-    present, then falls back to the local Qwen2.5-1.5B model.
-
-    force_local=True skips the Groq/Gemini checks entirely and goes
-    straight to the local model. Use this when Groq/Gemini were already
-    tried (e.g. by a prior call to this function) and exhausted their
-    quota for the current request -- otherwise this function always
-    re-picks Groq first because it only checks whether GROQ_API_KEY is
-    set, not whether it still has quota left.
-    """
-    global llm_pipeline, use_gemini_flash, gemini_client, use_groq, groq_client
-
-    if not force_local:
-        # 1. Check for Groq API key -- fastest option, no local compute needed,
-        # and (unlike the local model) safe to call concurrently from every
-        # worker thread since there's no shared model/GPU to serialize on.
-        groq_key = os.getenv("GROQ_API_KEY")
-        if groq_key and Groq is not None:
-            try:
-                log.info("Groq API key detected. Initializing Groq (Free Tier)...")
-                groq_client = Groq(api_key=groq_key)
-                use_groq = True
-                log.info("Groq initialized successfully.")
-                return "groq"
-            except Exception as exc:
-                log.warning(f"Failed to initialize Groq, falling back: {exc}")
-                use_groq = False
-                groq_client = None
-
-        # 2. Check for Gemini API key
-        api_key = os.getenv("GOOGLE_API_KEY") or globals().get("GOOGLE_API_KEY")
-        if api_key and genai is not None:
-            try:
-                log.info("Google API key detected. Initializing Gemini 2.5 Flash (Free Cloud Tier)...")
-                gemini_client = genai.Client(api_key=api_key)
-                use_gemini_flash = True
-                log.info("Gemini 2.5 Flash initialized successfully.")
-                return "gemini"
-            except Exception as exc:
-                log.warning(f"Failed to initialize Gemini, falling back to local model: {exc}")
-                use_gemini_flash = False
-                gemini_client = None
-
-    # 3. Fallback to local model
-    if pipeline is None:
-        log.warning("The 'transformers' library is not installed. LLM reasoning will be disabled.")
-        return None
-        
-    if llm_pipeline is None:
-        try:
-            import torch
-            device = -1
-            torch_dtype = torch.float32
-            
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-                torch_dtype = torch.float16
-                log.info("Apple Silicon GPU (MPS) detected. Enabling hardware acceleration.")
-            elif torch.cuda.is_available():
-                device = 0
-                torch_dtype = torch.float16
-                log.info("Nvidia GPU (CUDA) detected. Enabling hardware acceleration.")
-            else:
-                log.info("No compatible GPU detected. Running model on CPU.")
-
-            log.info("Initializing high-quality local AI model (Qwen2.5-1.5B-Instruct)...")
-            # Using Qwen2.5-1.5B-Instruct: extremely smart, fast on MPS/CPU, vastly superior reasoning
-            llm_pipeline = pipeline(
-                "text-generation", 
-                model="Qwen/Qwen2.5-1.5B-Instruct",
-                device=device,
-                torch_dtype=torch_dtype
-            )
-            log.info("Local AI model initialized successfully.")
-        except Exception as e:
-            log.error(f"Failed to initialize local AI model: {e}")
-            llm_pipeline = None
-            
-    return "local" if llm_pipeline is not None else None
 
 
 # -----------------------------
@@ -344,58 +252,6 @@ def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
     )
 
 
-def _extract_groq_sources(response):
-    """Pulls (title, url) pairs out of groq/compound's executed_tools field
-    so callers can show what was actually searched. Defensive about
-    attribute-vs-dict access since SDK response objects vary."""
-    def _get(obj, key):
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            return obj.get(key)
-        return getattr(obj, key, None)
-
-    sources = []
-    try:
-        message = response.choices[0].message
-        for tool in (_get(message, "executed_tools") or []):
-            search_results = _get(tool, "search_results")
-            for r in (_get(search_results, "results") or []):
-                url = _get(r, "url")
-                title = _get(r, "title") or url
-                if url and (title, url) not in sources:
-                    sources.append((title, url))
-    except Exception as e:
-        log.warning(f"Could not extract Groq search sources: {e}")
-    return sources
-
-
-def _is_request_too_large(exc):
-    """True for Groq's 413 'Request Entity Too Large' -- a payload-size
-    failure, not a rate limit, so retrying the same request can't help."""
-    msg = str(exc)
-    return "413" in msg or "request_too_large" in msg or "Request Entity Too Large" in msg
-
-
-def _is_daily_quota_exceeded(exc):
-    """True for a Groq 429 that's specifically a daily (TPD) limit, as
-    opposed to the much shorter per-minute (TPM) limit -- TPD only resets
-    after potentially over an hour, so retrying it wastes time."""
-    msg = str(exc)
-    return "tokens per day" in msg or "TPD" in msg
-
-
-def _parse_groq_retry_seconds(exc):
-    """Groq's 429 body includes a 'Please try again in 7.342s' hint."""
-    match = re.search(r"try again in ([\d.]+)s", str(exc))
-    if match:
-        try:
-            return float(match.group(1)) + 0.5
-        except ValueError:
-            return None
-    return None
-
-
 def _strip_code_fences(text):
     """Models occasionally wrap the requested JSON in ```json ... ``` even
     when told not to -- strip that off so it parses cleanly."""
@@ -492,120 +348,6 @@ def _parse_ai_stocks_story_json(text, stock_names):
     return result, portfolio_summary
 
 
-def _try_groq_compound_model_for_stories(prompt, model_name, stock_count, max_attempts=2):
-    max_tokens = min(4200, max(850, stock_count * 70 + 150))
-    for attempt in range(max_attempts):
-        try:
-            response = groq_client.chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=max_tokens,
-            )
-            text = response.choices[0].message.content.strip()
-            sources = _extract_groq_sources(response)
-            return text, sources, True  # True = had live web search available
-        except Exception as e:
-            log.error(
-                f"Groq ({model_name}) AI Stocks Story generation failed "
-                f"(attempt {attempt + 1}/{max_attempts}): {e}"
-            )
-            if _is_request_too_large(e):
-                log.error(f"Request too large for {model_name} -- skipping further retries.")
-                return None
-            if _is_daily_quota_exceeded(e):
-                log.error(f"Groq daily token quota exhausted for {model_name} -- skipping remaining retries.")
-                return None
-            if attempt < max_attempts - 1:
-                wait_s = _parse_groq_retry_seconds(e) or 10
-                log.info(f"Retrying {model_name} in {wait_s:.1f}s...")
-                time.sleep(wait_s)
-    return None
-
-
-def _try_tavily_plus_groq_for_stories(prompt, stock_count):
-    if not os.getenv("TAVILY_API_KEY") or groq_client is None:
-        return None
-    max_tokens = min(4200, max(850, stock_count * 70 + 150))
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.4,
-            max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content.strip(), True
-    except Exception as e:
-        log.error(f"Groq synthesis over Tavily context failed for AI Stocks Story: {e}")
-        return None
-
-
-def _try_gemini_grounded_for_stories(prompt):
-    """
-    Genuine live-search fallback: Gemini's free tier supports real Google
-    Search grounding (a separate free-tier quota from both Groq and
-    Tavily). Returns (text, sources, True) on success, or None.
-    """
-    global gemini_client
-    if gemini_client is None:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key or genai is None:
-            return None
-        try:
-            gemini_client = genai.Client(api_key=api_key)
-        except Exception as e:
-            log.error(f"Could not lazily initialize Gemini client for AI Stocks Story: {e}")
-            return None
-    try:
-        from google.genai import types
-        grounding_tool = types.Tool(google_search=types.GoogleSearch())
-        response = gemini_client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=[grounding_tool]),
-        )
-        sources = []
-        try:
-            for candidate in response.candidates:
-                gm = getattr(candidate, "grounding_metadata", None)
-                for chunk in (getattr(gm, "grounding_chunks", None) or []):
-                    web = getattr(chunk, "web", None)
-                    if web and web.uri and (web.title, web.uri) not in sources:
-                        sources.append((web.title or web.uri, web.uri))
-        except Exception as e:
-            log.warning(f"Could not extract Gemini grounding sources: {e}")
-        used_live = bool(sources)
-        return response.text.strip(), sources, used_live
-    except Exception as e:
-        log.error(f"Gemini grounded AI Stocks Story generation failed: {e}")
-        return None
-
-
-def _generate_local_story(prompt):
-    """Runs the combined-stories prompt through the local Qwen2.5-1.5B
-    pipeline. Returns the generated text, or None if unavailable/failed."""
-    if llm_pipeline is None:
-        return None
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = llm_pipeline.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        with model_lock:
-            outputs = llm_pipeline(
-                formatted_prompt,
-                max_new_tokens=1200,
-                do_sample=True,
-                temperature=0.4,
-                top_k=50,
-                top_p=0.95,
-            )
-        generated_text = outputs[0]["generated_text"]
-        return generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-    except Exception as e:
-        log.error(f"Local AI Stocks Story generation failed: {e}")
-        return None
-
 
 def generate_ai_stocks_story(stock_names):
     """
@@ -626,106 +368,45 @@ def generate_ai_stocks_story(stock_names):
         a newspaper-digest-style summary covering all stocks together, or
         a locally-built generic fallback in the same shape if every AI
         tier failed or omitted it
+
+    Uses llm_backend.generate_analysis() for the actual model chain (see
+    llm_backend.py for the full tier order) -- this function only owns
+    prompt construction, the Tavily context gatherer, JSON parsing, and the
+    token-budget formula specific to a multi-stock combined call.
     """
     if not stock_names:
         return {}, [], False, None
 
     today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
     stock_count = len(stock_names)
-
-    backend = init_llm_generator()
-    log.info(f"AI Stocks Story using LLM backend: {backend}")
+    # Scales with how many stocks are in one combined call -- capped by
+    # llm_backend.MAX_TOKENS_CEILING regardless of what's computed here.
+    max_tokens = min(4200, max(850, stock_count * 70 + 150))
 
     bare_prompt = _build_ai_stocks_story_prompt(stock_names, "", today_str)
 
-    if backend == "groq":
-        # Tier 1/2: groq/compound (and the lighter compound-mini) can
-        # search the live web on their own -- no separate context needed.
-        result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound", stock_count, max_attempts=2)
-        if result is not None:
-            text, sources, live = result
-            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-            if stories:
-                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
+    def _gather_context():
+        return _gather_ai_stocks_story_context(stock_names, today_str)
 
-        log.info("groq/compound unavailable for AI Stocks Story -- trying groq/compound-mini...")
-        result = _try_groq_compound_model_for_stories(bare_prompt, "groq/compound-mini", stock_count, max_attempts=2)
-        if result is not None:
-            text, sources, live = result
-            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-            if stories:
-                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
+    def _build_grounded(context_text):
+        return _build_ai_stocks_story_prompt(stock_names, context_text, today_str)
 
-        # Tier 3: fetch live snippets via Tavily directly (own free quota,
-        # one query per stock, run in parallel), then hand them to a
-        # plain, non-orchestrating Groq call.
-        context_text, tavily_sources = _gather_ai_stocks_story_context(stock_names, today_str)
-        if context_text:
-            grounded_prompt = _build_ai_stocks_story_prompt(stock_names, context_text, today_str)
-            result = _try_tavily_plus_groq_for_stories(grounded_prompt, stock_count)
-            if result is not None:
-                text, live = result
-                stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-                if stories:
-                    return stories, tavily_sources, live, summary or _fallback_portfolio_summary(stock_names)
+    def _validate(text):
+        stories, _summary = _parse_ai_stocks_story_json(text, stock_names)
+        return bool(stories)
 
-        # Tier 4: Gemini + Google Search grounding, a separate free quota.
-        if gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None):
-            grounded = _try_gemini_grounded_for_stories(bare_prompt)
-            if grounded is not None:
-                text, sources, live = grounded
-                stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-                if stories:
-                    return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
-
-        # Tier 5: plain (non-search) Groq -- still one call for every
-        # stock, just without live grounding.
-        try:
-            max_tokens = min(4200, max(850, stock_count * 70 + 150))
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": bare_prompt}],
-                temperature=0.4,
-                max_tokens=max_tokens,
-            )
-            text = response.choices[0].message.content.strip()
-            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-            if stories:
-                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
-        except Exception as e:
-            log.error(f"Groq fallback (no search) AI Stocks Story generation failed: {e}")
-            if _is_daily_quota_exceeded(e):
-                log.error(
-                    "Groq's daily token quota is exhausted for this org. "
-                    "Falling back to the local model instead of retrying Groq."
-                )
-
-    elif backend == "gemini" or gemini_client is not None:
-        grounded = _try_gemini_grounded_for_stories(bare_prompt)
-        if grounded is not None:
-            text, sources, live = grounded
-            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-            if stories:
-                return stories, sources, live, summary or _fallback_portfolio_summary(stock_names)
-        try:
-            response = gemini_client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=bare_prompt,
-            )
-            stories, summary = _parse_ai_stocks_story_json(response.text.strip(), stock_names)
-            if stories:
-                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
-        except Exception as e:
-            log.error(f"Gemini AI Stocks Story generation failed: {e}")
-
-    # Last resort: local model -- still one combined call, not one per stock.
-    local_backend = init_llm_generator(force_local=True)
-    if local_backend == "local" and llm_pipeline is not None:
-        text = _generate_local_story(bare_prompt)
-        if text:
-            stories, summary = _parse_ai_stocks_story_json(text, stock_names)
-            if stories:
-                return stories, [], False, summary or _fallback_portfolio_summary(stock_names)
+    text, sources, used_live = llm_backend.generate_analysis(
+        bare_prompt,
+        max_tokens=max_tokens,
+        gather_context_fn=_gather_context,
+        build_grounded_prompt=_build_grounded,
+        validate_fn=_validate,
+        log_label="AI Stocks Story",
+    )
+    if text:
+        stories, summary = _parse_ai_stocks_story_json(text, stock_names)
+        if stories:
+            return stories, sources, used_live, summary or _fallback_portfolio_summary(stock_names)
 
     return {}, [], False, None
 
