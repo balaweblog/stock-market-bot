@@ -1166,7 +1166,18 @@ def compute_strategy_payoff(legs_text, horizon_snap, lot_size=NIFTY_LOT_SIZE):
 
     slope_left = payoff_points(far_below + 1) - payoff_points(far_below)
     slope_right = payoff_points(far_above) - payoff_points(far_above - 1)
-    unbounded_risk = slope_left < -0.01 or slope_right < -0.01
+    # Bug fix: the right tail (S -> +inf, relevant to calls) has genuine unbounded
+    # risk when payoff keeps FALLING as S rises, i.e. slope_right < 0 -- that part
+    # was correct. But the left tail (S -> 0, relevant to puts) has genuine
+    # unbounded/naked risk when payoff keeps FALLING as S drops, which in terms of
+    # this slope (measured in the increasing-S direction) means slope_left must be
+    # POSITIVE, not negative. The previous `slope_left < -0.01` test had the sign
+    # backwards for puts: it flagged net-long/defined-risk put structures (where
+    # payoff RISES on further downside, slope_left negative) as "undefined risk",
+    # while a genuinely naked short put (slope_left positive) would slip through
+    # unflagged. Verified against naked-short-put, naked-short-call, and standard
+    # 2-leg spread cases before landing this fix.
+    unbounded_risk = slope_left > 0.01 or slope_right < -0.01
 
     max_profit_pts = max(sample_ys)
     max_loss_pts = -min(sample_ys)
@@ -1520,8 +1531,11 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=
 
 
 def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
-    horizon_dict["bias_reason"] = _scrub_pcr_mischaracterization(
-        _strip_cap_claims(horizon_dict.get("bias_reason")),
+    horizon_dict["bias_reason"] = _scrub_pcr_direction_claim(
+        _scrub_pcr_mischaracterization(
+            _strip_cap_claims(horizon_dict.get("bias_reason")),
+            (horizon_snap or {}).get("pcr_oi"),
+        ),
         (horizon_snap or {}).get("pcr_oi"),
     )
     horizon_dict["bias"] = _scrub_bias_pcr_conflict(
@@ -1952,6 +1966,21 @@ def build_prompt(live_data=None):
 2. Nifty Monthly -- (current monthly expiry)
 3. Nifty Quarterly -- (nearest quarterly expiry on the Mar/Jun/Sep/Dec cycle)
 
+STRUCTURE CONSTRAINT -- for each horizon, "strategy_name" MUST be exactly one of
+these six, and "legs" MUST contain EXACTLY the legs that structure implies --
+nothing added, nothing renamed, no "with increased leverage" or other custom
+variants:
+  - Bull Call Spread (2 legs: Buy lower-strike Call, Sell higher-strike Call)
+  - Bear Call Spread (2 legs: Sell lower-strike Call, Buy higher-strike Call)
+  - Bull Put Spread  (2 legs: Sell higher-strike Put, Buy lower-strike Put)
+  - Bear Put Spread  (2 legs: Buy higher-strike Put, Sell lower-strike Put)
+  - Iron Condor      (4 legs: Buy far Put, Sell near Put, Sell near Call, Buy far Call)
+  - Iron Butterfly   (4 legs: Buy far Put, Sell ATM Put, Sell ATM Call, Buy far Call)
+Every one of these six is a DEFINED-RISK, capped-loss structure by construction.
+Do not invent ratio spreads, backspreads, naked legs, or any structure with an
+extra leg beyond what's listed above -- those either carry undefined risk or
+cannot be verified by this pipeline, and will be rejected outright.
+
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else:
 
 {{
@@ -1961,8 +1990,8 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "expiry_date": "The actual expiry date for this horizon, copied EXACTLY as shown in the LIVE DATA FEED above (e.g. '24 Jul 2026').",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data you found.",
-      "strategy_name": "e.g. 'Bear Call Spread', 'Bull Put Spread', or 'Iron Condor'",
+      "bias_reason": "One or two sentences grounded in the live data you found. If you mention PCR/OI dominance, remember the standard convention: heavy CALL open interest signals overhead resistance (bearish), heavy PUT open interest signals underlying support (bullish) -- the opposite of reading heavy call activity as bullish.",
+      "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
       "legs": "",
       "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
       "confidence": "High",
@@ -2223,6 +2252,52 @@ def _scrub_pcr_mischaracterization(bias_reason, pcr):
     for s in sentences:
         if "pcr" in s.lower() and _PCR_EQUAL_CLAIM_RE.search(s):
             fixed.append(f"PCR(OI) {pcr:g} indicates {band.lower()}.")
+        else:
+            fixed.append(s)
+    return " ".join(fixed).strip()
+
+
+_PCR_CALL_DOMINANCE_BULLISH_RE = re.compile(
+    r"call[^.!?]{0,20}dominan\w*[^.!?]*?(?:upward|upside|bullish|support)",
+    re.IGNORECASE,
+)
+_PCR_PUT_DOMINANCE_BEARISH_RE = re.compile(
+    r"put[^.!?]{0,20}dominan\w*[^.!?]*?(?:downward|downside|bearish|resistance)",
+    re.IGNORECASE,
+)
+
+
+def _scrub_pcr_direction_claim(bias_reason, pcr):
+    """
+    BUG FIX: the model would sometimes write a bias_reason sentence like
+    "PCR is 0.83 (<1) indicating call-side dominance ... suggesting upward
+    pressure" -- this has the OI-analysis causality backwards. This file's
+    own classify_pcr()/_pcr_implied_direction() (used elsewhere to flag
+    bias/PCR conflicts) encode the standard convention: heavy CALL open
+    interest is a resistance/bearish signal (call writers are betting price
+    stays below that strike), heavy PUT open interest is a support/bullish
+    signal (put writers are betting price stays above that strike) -- the
+    OPPOSITE of the naive "more calls being traded = more bullish
+    speculation" reading. _scrub_bias_pcr_conflict only catches the case
+    where the model's bias LABEL contradicts a decisive PCR reading; it
+    never catches a directionally-backwards CAUSAL CLAIM inside the
+    rationale text itself, which is what actually shipped in this report
+    for a PCR of 0.83 (itself within the neutral 0.7-1.2 band, so not even
+    a decisive reading either way). This scrubber replaces such backwards
+    claims with an accurate, convention-consistent description.
+    """
+    if not bias_reason or pcr is None:
+        return bias_reason
+    band = classify_pcr(pcr)
+    sentences = re.split(r"(?<=[.!?])\s+", bias_reason.strip())
+    fixed = []
+    for s in sentences:
+        if _PCR_CALL_DOMINANCE_BULLISH_RE.search(s) or _PCR_PUT_DOMINANCE_BEARISH_RE.search(s):
+            fixed.append(
+                f"PCR (OI) is {pcr:g} -- {band}. (By OI-analysis convention, heavy call OI "
+                f"signals overhead resistance and heavy put OI signals underlying support -- "
+                f"the opposite of reading heavy call OI as bullish.)"
+            )
         else:
             fixed.append(s)
     return " ".join(fixed).strip()
@@ -3441,7 +3516,27 @@ def run():
             strat_lower = strategy_name.lower()
             bias_lower = bias.lower()
 
-            if "bear call" in strat_lower or ("bear" in bias_lower and "call" in strat_lower):
+            # BUG FIX: select_best_strikes() only implements the three CREDIT/
+            # neutral structures (Bear Call Spread, Bull Put Spread, Iron
+            # Condor) -- it has no debit-spread optimizer. The previous dispatch
+            # never checked for "bull call" or "bear put" in the model's own
+            # strategy name, so a model-proposed Bull Call Spread (bias
+            # "Bullish") fell through to the bias-only branch and got mapped to
+            # "Bull Put Spread" -- a structurally different trade (short puts
+            # below spot instead of a long call debit spread above spot) that,
+            # if select_best_strikes found a valid one, would silently
+            # overwrite strategy_name/legs while bias_reason/strike_rationale
+            # still read as written for the original call spread. Symmetric bug
+            # for "Bear Put Spread" -> "Bear Call Spread". Since there's no safe
+            # deterministic substitute for a debit spread, explicitly detect
+            # those names and skip optimization -- keep the model's own legs,
+            # which still get fully verified against live/EOD premiums (max
+            # loss/profit, POP, EV, etc.) by apply_verified_payoff downstream.
+            if "bull call" in strat_lower or ("bull" in bias_lower and "call" in strat_lower):
+                target_strat = None  # debit spread -- no deterministic optimizer available
+            elif "bear put" in strat_lower or ("bear" in bias_lower and "put" in strat_lower):
+                target_strat = None  # debit spread -- no deterministic optimizer available
+            elif "bear call" in strat_lower or ("bear" in bias_lower and "call" in strat_lower):
                 target_strat = "Bear Call Spread"
             elif "bull put" in strat_lower or ("bull" in bias_lower and "put" in strat_lower):
                 target_strat = "Bull Put Spread"
@@ -3454,10 +3549,33 @@ def run():
             else:
                 target_strat = "Iron Condor"
 
+            if target_strat is None:
+                stockpredictor.log.info(
+                    f"Deterministic strike selection for {horizon_name}: skipped -- "
+                    f"'{strategy_name}' is a debit spread and select_best_strikes() has no "
+                    f"debit-spread optimizer; keeping the model's own legs for verification."
+                )
+                continue
+
             res = select_best_strikes(snap, spot, bias, target_strat)
             if res.get("ok"):
                 best = res["best_trade"]
                 st = res["strategy_type"]
+                # Make any substitution visible in the report instead of silent:
+                # the model's original strategy_name/legs are being replaced by
+                # a deterministically-optimized structure, which can be a
+                # different structure family than what bias_reason/
+                # strike_rationale were written to justify.
+                if strat_lower and st.lower() not in strat_lower:
+                    substitution_note = (
+                        f"Deterministic strike selection replaced the model's proposed "
+                        f"'{strategy_name}' with an optimized {st} that clears the live "
+                        f"R:R/credit-width gates -- verify this still matches your intended thesis."
+                    )
+                    h["strike_rationale"] = (
+                        f"{h.get('strike_rationale', '')} ({substitution_note})".strip()
+                        if h.get("strike_rationale") else substitution_note
+                    )
                 h["strategy_name"] = st
                 if st == "Bear Call Spread":
                     h["legs"] = f"Sell {best['short_strike']:g} CE, Buy {best['long_strike']:g} CE"
