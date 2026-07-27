@@ -80,6 +80,40 @@ _env_int = llm_backend._env_int
 
 MAX_GENERATION_ATTEMPTS = _env_int("MAX_GENERATION_ATTEMPTS", 3)
 
+
+def _env_float(name, default):
+    """Same idea as _env_int, but for a float threshold (risk:reward, RSI,
+    debt-to-equity %, ROE %, growth %) -- falls back to `default` (with a
+    warning) on anything unset/empty/unparseable.
+
+    Moved up here (was previously defined further down, after
+    REGIME_SOFTEN_MAX_PCT's module-level call to it) -- that ordering was a
+    latent NameError waiting to happen: Python executes top-level module
+    code in order, so a function used at import time must be DEFINED above
+    its first call, not just present somewhere later in the file. It never
+    surfaced locally because whichever module imports swing_trade_advisor
+    first usually does so after some other import already pulled in a
+    same-named helper into globals() by coincidence in dev, but a clean
+    process (e.g. optionstrategy.py as the actual first importer in CI)
+    hits it every time."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        print(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
+        return default
+
+
+def _fmt_num(x):
+    """Formats a threshold for display in prompts/messages without a
+    trailing '.0' when it's a whole number (e.g. 20.0 -> '20', 17.5 -> '17.5').
+    Moved up alongside _env_float for the same reason -- see that
+    docstring."""
+    return f"{x:g}"
+
+
 # -----------------------------
 # Deterministic fundamentals screen (replaces LLM-driven Stage-1 discovery)
 # -----------------------------
@@ -133,26 +167,6 @@ REGIME_SOFTEN_MAX_PCT = _env_float("REGIME_SOFTEN_MAX_PCT", 15.0)
 # at the start of every run, ahead of the normal sector-rotation scan.
 WATCHLIST_LOG = os.getenv("WATCHLIST_LOG", "swing_trade_watchlist.csv")
 WATCHLIST_MAX_AGE_DAYS = _env_int("WATCHLIST_MAX_AGE_DAYS", 42)  # ~6 weeks, then drop stale entries
-
-
-def _env_float(name, default):
-    """Same idea as _env_int, but for a float threshold (risk:reward, RSI,
-    debt-to-equity %, ROE %, growth %) -- falls back to `default` (with a
-    warning) on anything unset/empty/unparseable."""
-    raw = os.getenv(name)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(raw.strip())
-    except ValueError:
-        print(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
-        return default
-
-
-def _fmt_num(x):
-    """Formats a threshold for display in prompts/messages without a
-    trailing '.0' when it's a whole number (e.g. 20.0 -> '20', 17.5 -> '17.5')."""
-    return f"{x:g}"
 
 
 # -----------------------------
@@ -681,10 +695,23 @@ def _rewrite_watchlist(rows, log_path=WATCHLIST_LOG):
 # -----------------------------
 # Sector rotation across attempts
 # -----------------------------
-# Each retry attempt searches a fresh slice of sectors it hasn't already
+# Each retry attempt covers a fresh slice of sectors it hasn't already
 # covered this run, instead of re-running a broad search over the same
 # ground and hoping for different names. SECTORS_PER_ATTEMPT controls how
 # many sectors go into one Stage-1 fundamentals-screen call.
+#
+# NOTE for USE_DETERMINISTIC_SCREEN=true (the default): the original
+# reason for rotating ("hope the LLM finds different names this time") no
+# longer applies -- the deterministic screen isn't stochastic, so re-
+# checking the same sector slice would always produce the same result.
+# Rotation still earns its keep here for a different reason: it bounds how
+# many tickers' fundamentals get fetched (network calls) before giving up,
+# by only pulling in a new slice of swing_trade_universe.py's ~208-ticker
+# seed list per attempt rather than checking the entire universe on every
+# single attempt regardless of whether an earlier attempt already found a
+# qualifying stock. Raising SECTORS_PER_ATTEMPT trades "fewer attempts
+# needed to see the whole universe" for "more yfinance calls up front even
+# when attempt 1 would have succeeded on its own."
 SECTORS = [
     "IT & Technology", "Pharma & Healthcare", "Banking & NBFC",
     "Capital Goods & Infrastructure", "Auto & Auto Ancillaries",
@@ -814,11 +841,25 @@ SOURCE_QUALITY_NOTE = (
 
 def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_note):
     """
-    STAGE 1: fundamentals-only screen, scoped to a rotating slice of sectors
-    (see SECTORS / _sectors_for_attempt) so each attempt this run searches
-    genuinely new ground instead of re-covering the same sectors. Deliberately
-    does NOT ask for technicals/entry-exit/risk-reward yet -- that's Stage 2,
-    run only against whichever candidates survive independent fundamentals
+    STAGE 1 -- LLM-SEARCH FALLBACK PATH ONLY. Only called when
+    USE_DETERMINISTIC_SCREEN=false; with the default (true), Stage 1 is
+    _deterministic_fundamentals_screen instead, which checks every ticker
+    in swing_trade_universe.py's seed list (208 tickers across 14 sectors
+    as of the last audit -- see that file's own docstring) with no
+    sampling cap and no LLM call. This function and its "search for 8-12
+    companies" / "list up to 20 candidates" guidance below describe the
+    OLD behavior and are dead code in the default configuration -- they
+    still matter only if you explicitly set USE_DETERMINISTIC_SCREEN=false
+    (e.g. to compare the two approaches, or if the seed universe hasn't
+    been kept current). Don't read the "8-12 / up to 20" language below as
+    a description of how many candidates a normal run actually checks --
+    a normal run checks the whole seed list for the sector slice.
+
+    Scoped to a rotating slice of sectors (see SECTORS / _sectors_for_attempt)
+    so each attempt this run searches genuinely new ground instead of
+    re-covering the same sectors. Deliberately does NOT ask for
+    technicals/entry-exit/risk-reward yet -- that's Stage 2, run only
+    against whichever candidates survive independent fundamentals
     verification.
     """
     sector_list = ", ".join(sectors)
