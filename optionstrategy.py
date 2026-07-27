@@ -1287,6 +1287,71 @@ def _scrub_false_band_claim(rationale, any_leg_inside_band):
     return rationale
 
 
+_STRIKE_MENTION_RE = re.compile(
+    r"\b(?:(short|long)\s+)?(\d{4,6}(?:\.\d+)?)\s*(call|put|ce|pe)\b",
+    re.IGNORECASE,
+)
+
+
+def _scrub_stale_strike_claims(rationale, priced_legs):
+    """
+    BUG FIX: the model's freeform strike_rationale sentence is written
+    independently of the 'legs' field, and can name a strike that doesn't
+    match what's actually in priced_legs -- e.g. rationale says "the short
+    23500 put" while the real (verified, tradeable) short leg is 22700 PE.
+    This happens whenever the model's own prose and its own legs disagree,
+    and separately whenever deterministic strike selection (select_best_
+    strikes) or the repair pass swaps in different strikes than the model
+    originally wrote about. A rationale naming the wrong strike is worse
+    than no rationale -- a trader skimming the report could mistake the
+    quoted number for the strike to actually sell/buy.
+
+    BUG FIX: this used to only check whether the mentioned strike number
+    existed *somewhere* among the real legs, and only scrubbed when *every*
+    mentioned strike was absent. Two failure modes slipped through as a
+    result: (1) a sentence calling a real strike "the short X" when X is
+    actually the long leg (the number passes the existence check even
+    though the claimed role is wrong), and (2) a sentence mixing one stale
+    strike with other, coincidentally-correct strikes (e.g. injected by a
+    substitution note appended before this scrub runs) -- since not *all*
+    mentions were wrong, nothing got scrubbed even though one of them was
+    actively misleading. Now: each mention is checked against the real
+    (strike, option-type) pair for a match, and if the mention names a
+    short/long role, that role must match the real leg's actual action.
+    A single bad mention is enough to scrub the whole sentence.
+    """
+    if not rationale or not priced_legs:
+        return rationale
+    mentioned = _STRIKE_MENTION_RE.findall(rationale)
+    if not mentioned:
+        return rationale
+
+    real_action_by_strike_type = {}
+    for leg in priced_legs:
+        real_action_by_strike_type[(leg["strike"], leg["type"].upper())] = leg["action"]
+
+    def _mention_is_wrong(role, num, opt_word):
+        strike = float(num)
+        opt_type = "CE" if opt_word.lower() in ("call", "ce") else "PE"
+        action = real_action_by_strike_type.get((strike, opt_type))
+        if action is None:
+            return True  # strike/type combo isn't in the real legs at all
+        if role and role.lower() == "short" and action != "Sell":
+            return True  # claimed short, but that strike is actually the long leg
+        if role and role.lower() == "long" and action != "Buy":
+            return True  # claimed long, but that strike is actually the short leg
+        return False
+
+    if any(_mention_is_wrong(role, num, opt_word) for role, num, opt_word in mentioned):
+        return (
+            "Selected primarily on OI/liquidity/expected-move positioning "
+            "-- see the verified short-strike detail below (the model's "
+            "original strike-number claim here didn't match the actual "
+            "priced legs and was dropped to avoid a misleading strike)"
+        )
+    return rationale
+
+
 def build_strike_rationale_addendum(priced_legs, horizon_snap, spot):
     if not horizon_snap:
         return "", False
@@ -1618,10 +1683,23 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
     if "_raw_strike_rationale" not in horizon_dict:
         horizon_dict["_raw_strike_rationale"] = (horizon_dict.get("strike_rationale") or "").strip()
     existing = _scrub_false_band_claim(horizon_dict["_raw_strike_rationale"], any_leg_inside_band)
-    if rationale_addendum:
-        horizon_dict["strike_rationale"] = (
-            f"{existing} ({rationale_addendum})" if existing else rationale_addendum
-        )
+    existing = _scrub_stale_strike_claims(existing, priced_legs)
+    # BUG FIX: run() used to bake any deterministic-strike-selection
+    # substitution_note directly into horizon_dict["strike_rationale"]
+    # (concatenated onto the model's original, still-unscrubbed prose)
+    # *before* this function ever ran. Since "_raw_strike_rationale" is
+    # only cached once, that first cache captured the corrupted text --
+    # stale strike numbers sitting right next to the substitution note's
+    # correct ones -- and _scrub_stale_strike_claims saw some correct
+    # numbers in the sentence and left the stale one in place. The
+    # substitution note is now stashed separately (h["_substitution_note"])
+    # and only appended here, after scrubbing has already cleaned the
+    # model's original text -- the same pattern rationale_addendum uses.
+    substitution_note = horizon_dict.get("_substitution_note")
+    suffixes = [s for s in (rationale_addendum, substitution_note) if s]
+    if suffixes:
+        suffix_text = " ".join(f"({s})" for s in suffixes)
+        horizon_dict["strike_rationale"] = f"{existing} {suffix_text}" if existing else " ".join(suffixes)
     else:
         horizon_dict["strike_rationale"] = existing
 
@@ -3319,6 +3397,20 @@ def repair_rejected_legs(horizons, live_data):
             h["legs"] = fix["legs"]
             if fix.get("strategy_name"):
                 h["strategy_name"] = fix["strategy_name"]
+            # BUG FIX: apply_verified_payoff only ever populates
+            # "_raw_strike_rationale" once (`if "_raw_strike_rationale"
+            # not in horizon_dict`), caching whatever strike_rationale
+            # prose existed from the FIRST pass -- i.e. the version that
+            # described the now-rejected legs we just overwrote above.
+            # Left in place, the repaired horizon would reverify with new
+            # strikes but keep displaying a rationale sentence written
+            # about the old (rejected, structurally different) strikes.
+            # Clear both so the repaired trade gets an accurate rationale
+            # derived from its actual new legs instead of a stale
+            # description of a trade that no longer exists.
+            h.pop("strike_rationale", None)
+            h.pop("_raw_strike_rationale", None)
+            h.pop("_substitution_note", None)
 
     reverify_horizons(horizons, live_data, only_names=set(fixed_by_name.keys()))
     still_bad = [h.get("horizon") for h in horizons if h.get("horizon") in fixed_by_name and _horizon_rejected(h)]
@@ -3588,10 +3680,44 @@ def run():
                         f"'{strategy_name}' with an optimized {st} that clears the live "
                         f"R:R/credit-width gates -- verify this still matches your intended thesis."
                     )
-                    h["strike_rationale"] = (
-                        f"{h.get('strike_rationale', '')} ({substitution_note})".strip()
-                        if h.get("strike_rationale") else substitution_note
+                else:
+                    # Same strategy family, but the optimizer may still have picked
+                    # different strikes than the model's original (possibly
+                    # hallucinated) guess. h["legs"] is about to be overwritten below,
+                    # so any strike numbers mentioned in the model's existing
+                    # strike_rationale text can go stale/wrong relative to the real
+                    # trade. Always surface the actual chosen strikes here rather
+                    # than only when the structure family itself changed.
+                    if st == "Bear Call Spread":
+                        chosen_desc = f"short {best['short_strike']:g} CE / long {best['long_strike']:g} CE"
+                    elif st == "Bull Put Spread":
+                        chosen_desc = f"short {best['short_strike']:g} PE / long {best['long_strike']:g} PE"
+                    elif st == "Iron Condor":
+                        chosen_desc = (
+                            f"short {best['short_put']:g} PE/{best['short_call']:g} CE, "
+                            f"long {best['long_put']:g} PE/{best['long_call']:g} CE"
+                        )
+                    else:
+                        chosen_desc = None
+                    substitution_note = (
+                        f"Deterministic strike selection chose {chosen_desc} (verified against "
+                        f"live/EOD premiums) -- this may differ from strike(s) mentioned above if "
+                        f"the model's original text guessed different levels."
+                        if chosen_desc else None
                     )
+                if substitution_note:
+                    # BUG FIX: this used to concatenate directly onto
+                    # h["strike_rationale"] right here -- before
+                    # apply_verified_payoff/_scrub_stale_strike_claims ever
+                    # runs on it. That meant the *first* apply_verified_payoff
+                    # call cached this already-corrupted text as
+                    # "_raw_strike_rationale" (stale model strikes sitting
+                    # next to this note's correct ones), and the scrub saw
+                    # some correct numbers in the sentence and let the stale
+                    # one survive. Stash it separately instead; apply_verified_
+                    # payoff appends it after scrubbing has cleaned the
+                    # model's original prose against the real, final legs.
+                    h["_substitution_note"] = substitution_note
                 h["strategy_name"] = st
                 if st == "Bear Call Spread":
                     h["legs"] = f"Sell {best['short_strike']:g} CE, Buy {best['long_strike']:g} CE"
