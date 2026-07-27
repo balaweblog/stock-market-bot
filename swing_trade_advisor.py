@@ -55,6 +55,7 @@ import swing_trade_risk as risk
 import swing_trade_regime as regime
 import swing_trade_scoring as scoring
 import swing_trade_outcomes as outcomes
+import swing_trade_universe as universe  # static ticker seed list for the deterministic screen (see below)
 
 # -----------------------------
 # Qualifying-stock gate
@@ -78,6 +79,60 @@ REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower()
 _env_int = llm_backend._env_int
 
 MAX_GENERATION_ATTEMPTS = _env_int("MAX_GENERATION_ATTEMPTS", 3)
+
+# -----------------------------
+# Deterministic fundamentals screen (replaces LLM-driven Stage-1 discovery)
+# -----------------------------
+# Previously, Stage 1 asked an LLM to "search" for 8-12 candidate names per
+# sector meeting the growth bar, and only THEN independently re-checked
+# whatever it found (_prefilter_by_fundamentals). That made candidate
+# DISCOVERY -- unlike every other stage of this pipeline -- entirely
+# dependent on the model's web search actually surfacing the right small/
+# mid-cap names, which is slow, token-expensive, and produces a lot of
+# "rejected: nodata" candidates when the model guesses/misremembers a
+# ticker. _fetch_fundamentals() already fetches real data deterministically
+# (used today only to VERIFY the model's claims) -- when true, this flag
+# uses it to screen swing_trade_universe.py's static ticker list directly,
+# so Stage 1 becomes a real, complete, zero-LLM-token scan instead of a
+# sample-and-hope search. Stage 2 (sentiment/catalyst/trade-plan, which
+# genuinely needs live web search) is unchanged either way.
+# Set to "false" to restore the old LLM-search Stage 1 (e.g. if you don't
+# trust/haven't audited swing_trade_universe.py's ticker list yet, or want
+# to compare the two approaches side by side).
+USE_DETERMINISTIC_SCREEN = os.getenv("USE_DETERMINISTIC_SCREEN", "true").lower() == "true"
+
+# -----------------------------
+# Regime-aware fundamentals softening -- bounded, transparent, this-run-only
+# -----------------------------
+# A fixed 20%/20% YoY growth bar is calibrated for an average market. In a
+# genuinely weak/choppy tape (see swing_trade_regime.py's classification)
+# the honest answer some weeks really is "nothing qualifies" -- but a bar
+# that NEVER flexes also means the strategy simply stops producing any
+# signal at all during the exact stretches (broad-based small/mid-cap
+# weakness) this run is likeliest to hit. When enabled, this softens
+# MIN_GROWTH_YOY_PCT by a small, capped percentage for THIS RUN ONLY when
+# regime.check_market_regime()'s classification looks weak/mixed -- never
+# more than REGIME_SOFTEN_MAX_PCT below the configured value, and always
+# disclosed in the email (see _regime_softening_html) so it's never a
+# silent bar-lowering. This is independent of, and separate from,
+# AUTO_ADJUST_THRESHOLDS (which is history-driven and persists across
+# runs) -- this one is regime-driven and resets every run.
+REGIME_SOFTEN_GROWTH_BAR = os.getenv("REGIME_SOFTEN_GROWTH_BAR", "false").lower() == "true"
+REGIME_SOFTEN_MAX_PCT = _env_float("REGIME_SOFTEN_MAX_PCT", 15.0)
+
+# -----------------------------
+# Cross-run near-miss watchlist
+# -----------------------------
+# A stock that fully clears fundamentals but fails ONLY on a technical
+# filter (e.g. RSI still falling, no MACD crossover yet) is exactly the
+# kind of candidate worth re-checking next week rather than re-discovering
+# from scratch -- growth doesn't change week to week, but a technical setup
+# can complete within days. WATCHLIST_LOG persists these across runs;
+# _load_and_recheck_watchlist() re-verifies each entry's CURRENT technicals
+# (and re-confirms fundamentals still hold, since a quarter can roll over)
+# at the start of every run, ahead of the normal sector-rotation scan.
+WATCHLIST_LOG = os.getenv("WATCHLIST_LOG", "swing_trade_watchlist.csv")
+WATCHLIST_MAX_AGE_DAYS = _env_int("WATCHLIST_MAX_AGE_DAYS", 42)  # ~6 weeks, then drop stale entries
 
 
 def _env_float(name, default):
@@ -417,6 +472,210 @@ def _adjustments_html(applied):
         f"{rows}"
         "</div>"
     )
+
+
+def _regime_soften_growth_bar(regime_detail):
+    """
+    Bounded, transparent, THIS-RUN-ONLY softening of MIN_GROWTH_YOY_PCT when
+    the broad market looks weak/mixed -- see REGIME_SOFTEN_GROWTH_BAR's
+    docstring above for the rationale. Mutates the module-level
+    MIN_GROWTH_YOY_PCT global (same pattern _apply_auto_adjustments already
+    uses) so every downstream prompt/verifier picks up the softened value
+    automatically. Returns (old_value, new_value, reason) or None if nothing
+    changed (flag off, regime looks fine, or regime_detail doesn't expose a
+    classification this function recognizes).
+
+    Deliberately conservative: this NEVER tightens, never exceeds
+    REGIME_SOFTEN_MAX_PCT below the value configured at process start, and
+    only fires on a small set of explicitly weak/mixed classifications --
+    an unrecognized or missing classification is treated as "don't touch
+    it" rather than guessed at.
+    """
+    global MIN_GROWTH_YOY_PCT
+    if not REGIME_SOFTEN_GROWTH_BAR:
+        return None
+
+    classification = str((regime_detail or {}).get("classification") or "").strip().lower()
+    # swing_trade_regime.check_market_regime() only ever classifies as
+    # "bullish", "caution" (mixed breadth -- above one of 20w/50w SMA but
+    # not both), "bearish", or "unknown" (index data unavailable). Softening
+    # only makes sense for the two weak-but-not-gated-out states; "unknown"
+    # is deliberately left alone (no trend read at all, nothing to react
+    # to) and "bullish" obviously doesn't need softening. Note that if
+    # REQUIRE_MARKET_REGIME_FILTER is on (the default) and
+    # MARKET_REGIME_ALLOW_CAUTION is off (also the default), a "caution"
+    # classification never reaches this function at all -- the regime gate
+    # above already returns early on it. This only fires once a run has
+    # actually been allowed to proceed under a weak regime.
+    weak_classifications = {"caution", "bearish"}
+    if not any(w in classification for w in weak_classifications):
+        return None
+
+    original = MIN_GROWTH_YOY_PCT
+    floor = original * (1 - REGIME_SOFTEN_MAX_PCT / 100.0)
+    new_value = round(max(floor, original * 0.925), 2)  # one fixed, small step -- not a search for "whatever passes"
+    if new_value >= original:
+        return None
+
+    MIN_GROWTH_YOY_PCT = new_value
+    reason = (
+        f"market regime classified '{classification}' this run -- growth bar "
+        f"softened by up to {_fmt_num(REGIME_SOFTEN_MAX_PCT)}% (capped) rather "
+        "than leaving the strategy structurally unable to produce a signal "
+        "during broad small/mid-cap weakness"
+    )
+    return (original, new_value, reason)
+
+
+def _regime_softening_html(softening):
+    """Small disclosure box, same visual language as _adjustments_html, so a
+    regime-driven bar change is exactly as visible as a history-driven one --
+    never a silent loosening."""
+    if not softening:
+        return ""
+    old, new, reason = softening
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    return (
+        f'<div style="font-family:{sans};font-size:12px;color:#5C4A1E;line-height:1.6;'
+        f'padding:12px 16px;background:#FBF3DC;border-radius:4px;border:1px solid #E9DCB0;'
+        f'margin-bottom:14px;">'
+        f'<strong>MIN_GROWTH_YOY_PCT softened this run</strong>: {old} &rarr; {new} '
+        f'<span style="color:#8A8F9C;">({html.escape(reason)})</span></div>'
+    )
+
+
+# -----------------------------
+# Cross-run near-miss watchlist
+# -----------------------------
+def _is_technical_only_near_miss(rejected_stock):
+    """
+    True if a rejected candidate's ONLY 'hard' contradictions are technical
+    (uptrend/RSI/MACD) -- i.e. fundamentals fully passed. These are exactly
+    the candidates worth re-checking next run rather than re-discovering:
+    growth doesn't change week to week, but a technical setup (a crossover,
+    a pullback completing) can flip within days.
+    """
+    notes = rejected_stock.get("_verification_notes") or []
+    hard = [n for n, sev in notes if sev == "hard"]
+    if not hard:
+        return False
+    fundamentals_markers = ("Debt-to-equity", "ROE is", "Revenue growth YoY", "Net profit growth YoY")
+    return not any(any(m in n for m in fundamentals_markers) for n in hard)
+
+
+def _log_watchlist(rejected, today_str_iso, log_path=WATCHLIST_LOG):
+    """
+    Best-effort, silent-on-failure (same contract as _log_rejection_history):
+    appends technical-only near-misses to a small CSV so they can be
+    re-checked at the start of the NEXT run instead of only living in this
+    run's rejection list.
+    """
+    try:
+        rows = []
+        for s in rejected:
+            ticker = (s.get("ticker") or "").strip()
+            if not ticker or not _is_technical_only_near_miss(s):
+                continue
+            rows.append({
+                "date_added": today_str_iso,
+                "ticker": ticker,
+                "name": s.get("name") or ticker,
+                "sector": s.get("sector") or "",
+            })
+        if not rows:
+            return
+        path = Path(log_path)
+        write_header = not path.exists()
+        with path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["date_added", "ticker", "name", "sector"])
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        stockpredictor.log.warning(f"Could not write watchlist log: {e}")
+
+
+def _load_and_recheck_watchlist(log_path=WATCHLIST_LOG, max_age_days=WATCHLIST_MAX_AGE_DAYS):
+    """
+    Reads the persisted watchlist, drops stale entries (older than
+    max_age_days) and duplicate tickers, and re-verifies each survivor's
+    CURRENT fundamentals + technicals against real data right now.
+
+    Returns (fundamentally_qualified, rewritten_rows) where
+    fundamentally_qualified is a Stage-1-shaped candidate list ready to feed
+    straight into build_technical_prompt (exactly like a fresh sector-scan
+    result), and rewritten_rows is what should be written back to the CSV
+    (stale/no-longer-fundamentally-qualified/now-fully-qualified entries
+    removed; still-technicals-only-near-miss entries kept for next time).
+
+    Never raises: a missing/corrupt log is treated as "empty watchlist",
+    consistent with the rest of this file's best-effort logging.
+    """
+    path = Path(log_path)
+    if not path.exists():
+        return [], []
+
+    try:
+        with path.open(newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        stockpredictor.log.warning(f"Could not read watchlist log '{log_path}': {e}")
+        return [], []
+
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    qualified = []
+    keep_rows = []
+    seen = set()
+    for row in rows:
+        ticker = (row.get("ticker") or "").strip()
+        if not ticker or ticker in seen:
+            continue
+        seen.add(ticker)
+        try:
+            added = datetime.strptime(row["date_added"], "%Y-%m-%d").date()
+            if (today - added).days > max_age_days:
+                continue  # stale -- drop silently, it's had its chance
+        except (KeyError, ValueError):
+            pass  # malformed date -- keep checking it rather than losing it
+
+        stub = {"name": row.get("name") or ticker, "ticker": ticker, "sector": row.get("sector") or ""}
+        fund_notes = _verify_fundamentals(stub)
+        if any(sev in ("hard", "nodata") for _, sev in fund_notes):
+            continue  # no longer fundamentally qualified (or ticker gone bad) -- drop
+
+        tech_notes = _verify_technicals(stub)
+        if any(sev == "hard" for _, sev in tech_notes):
+            keep_rows.append(row)  # still a technical near-miss -- keep watching
+            continue
+
+        # Now clears BOTH fundamentals and technicals -- feed straight into
+        # Stage 2 as a real candidate, and drop it from the watchlist (it's
+        # graduated, not still "watching").
+        data = _fetch_fundamentals(ticker) or {}
+        qualified.append({
+            "name": stub["name"],
+            "ticker": ticker,
+            "sector": stub["sector"],
+            "market_cap_bucket": "?",
+            "revenue_growth_yoy_pct": data.get("revenue_growth_yoy"),
+            "profit_growth_yoy_pct": data.get("profit_growth_yoy"),
+            "why": "Graduated from the near-miss watchlist -- technical setup has now completed.",
+        })
+
+    return qualified, keep_rows
+
+
+def _rewrite_watchlist(rows, log_path=WATCHLIST_LOG):
+    """Overwrites the watchlist CSV with exactly `rows` (already filtered by
+    _load_and_recheck_watchlist) -- best-effort, silent-on-failure."""
+    try:
+        path = Path(log_path)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["date_added", "ticker", "name", "sector"])
+            writer.writeheader()
+            writer.writerows(rows)
+    except Exception as e:
+        stockpredictor.log.warning(f"Could not rewrite watchlist log: {e}")
 
 
 # -----------------------------
@@ -1368,6 +1627,59 @@ def _prefilter_by_fundamentals(candidates):
     return qualified, rejected
 
 
+def _deterministic_fundamentals_screen(sectors, exclude_tickers):
+    """
+    Stage-1 replacement for USE_DETERMINISTIC_SCREEN=true: iterates
+    swing_trade_universe.py's static ticker list for the given sectors and
+    checks EACH one against real data via the exact same _verify_fundamentals
+    the old LLM-discovered candidates were checked against -- no LLM call,
+    no "did the model actually find good candidates" uncertainty, and no
+    sample-of-8-12-per-sector limit (the whole seed list gets checked).
+
+    Returns (qualified_candidates, rejected) in the same shapes
+    _prefilter_by_fundamentals produces, so run() can feed the result
+    straight into Stage 2 (build_technical_prompt) unchanged.
+
+    qualified_candidates carry a "why" field describing the real numbers
+    found, instead of an LLM's freeform one-sentence claim -- there's no
+    model output to summarize here, this candidate qualified purely on
+    fetched data.
+    """
+    qualified, rejected = [], []
+    seen_this_call = set()
+    for name, ticker, sector, bucket in universe.tickers_for_sectors(sectors):
+        ticker_u = ticker.strip().upper()
+        if ticker_u in exclude_tickers or ticker_u in seen_this_call:
+            continue
+        seen_this_call.add(ticker_u)
+
+        stub = {"name": name, "ticker": ticker, "sector": sector, "market_cap_bucket": bucket}
+        notes = _verify_fundamentals(stub)
+        blocking = [n for n, sev in notes if sev in ("hard", "nodata")]
+
+        if blocking:
+            record = dict(stub)
+            record["_verification_notes"] = notes
+            rejected.append(record)
+            continue
+
+        data = _fetch_fundamentals(ticker) or {}
+        qualified.append({
+            "name": name,
+            "ticker": ticker,
+            "sector": sector,
+            "market_cap_bucket": bucket,
+            "revenue_growth_yoy_pct": data.get("revenue_growth_yoy"),
+            "profit_growth_yoy_pct": data.get("profit_growth_yoy"),
+            "why": (
+                f"Deterministic screen: revenue +{data.get('revenue_growth_yoy')}% / "
+                f"profit +{data.get('profit_growth_yoy')}% YoY (fetched directly, not "
+                "model-reported)."
+            ),
+        })
+    return qualified, rejected
+
+
 def _verify_sanity_bounds(stock):
     """Returns a list of (note_text, severity) tuples -- see _verify_risk_reward."""
     notes = []
@@ -1932,6 +2244,19 @@ def run():
         send_swing_trade_email(email_html)
         return
 
+    regime_softening = _regime_soften_growth_bar(regime_detail)
+    if regime_softening:
+        stockpredictor.log.info(
+            f"Regime-driven softening this run: MIN_GROWTH_YOY_PCT "
+            f"{regime_softening[0]} -> {regime_softening[1]} ({regime_softening[2]})"
+        )
+
+    watchlist_graduates, watchlist_keep_rows = _load_and_recheck_watchlist()
+    if watchlist_graduates:
+        seen_tickers.update(
+            (c.get("ticker") or "").strip().upper() for c in watchlist_graduates if c.get("ticker")
+        )
+
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         sectors = _sectors_for_attempt(attempt - 1)
         stockpredictor.log.info(
@@ -1939,62 +2264,95 @@ def run():
             f"screen) in sectors: {', '.join(sectors)}"
         )
 
-        growth_prompt = build_growth_screen_prompt(sectors, seen_tickers, today_str, lookback_note)
-        # Larger budget than the default: this call has to search several
-        # sectors, check 8-12 companies, and enumerate up to 20 candidates --
-        # 1200 tokens was silently truncating that down to 1-2 stocks checked.
-        # validate_fn requires the reply to actually parse as the expected
-        # {"candidates": [...]} shape -- without this, a tier that ignores
-        # the "ONLY raw JSON" instruction and returns commentary text still
-        # counts as a chain "success", and the whole attempt gets treated as
-        # zero candidates instead of falling through to a tier that might
-        # have returned usable JSON.
-        growth_analysis, growth_sources, growth_live = generate_analysis(
-            growth_prompt, max_tokens=3000,
-            validate_fn=lambda t: _parse_candidates_json(t) is not None,
-        )
-
-        if not growth_analysis:
-            stockpredictor.log.error(
-                "No LLM backend produced Stage 1 output (no GROQ_API_KEY/"
-                "GOOGLE_API_KEY set and local model unavailable/failed). "
-                "Aborting without sending an email."
+        if USE_DETERMINISTIC_SCREEN:
+            # Real, complete, zero-LLM-token screen of the static universe
+            # for these sectors (see _deterministic_fundamentals_screen) --
+            # no "did the model's search find anything" uncertainty, and no
+            # 8-12-per-sector sampling limit.
+            stockpredictor.log.info(
+                f"Attempt {attempt}: deterministic fundamentals screen "
+                f"(no LLM call) across {', '.join(sectors)}."
             )
-            sys.exit(1)
-        _require_live_or_abort(growth_live, "Stage 1 (fundamentals screen)")
-
-        for s in growth_sources:
-            if s not in sources:
-                sources.append(s)
-        used_live_search = used_live_search or growth_live
-
-        candidates = _parse_candidates_json(growth_analysis)
-        if candidates is None:
-            stockpredictor.log.warning(
-                f"Attempt {attempt}: Stage 1 output could not be parsed as "
-                "candidate JSON -- treating as zero candidates for this attempt."
+            fundamentally_qualified, rejected_fund = _deterministic_fundamentals_screen(sectors, seen_tickers)
+            all_rejected.extend(rejected_fund)
+            seen_tickers.update(
+                (c.get("ticker") or "").strip().upper() for c in rejected_fund if c.get("ticker")
             )
-            candidates = []
+            seen_tickers.update(
+                (c.get("ticker") or "").strip().upper() for c in fundamentally_qualified if c.get("ticker")
+            )
+        else:
+            growth_prompt = build_growth_screen_prompt(sectors, seen_tickers, today_str, lookback_note)
+            # Larger budget than the default: this call has to search several
+            # sectors, check 8-12 companies, and enumerate up to 20 candidates --
+            # 1200 tokens was silently truncating that down to 1-2 stocks checked.
+            # validate_fn requires the reply to actually parse as the expected
+            # {"candidates": [...]} shape -- without this, a tier that ignores
+            # the "ONLY raw JSON" instruction and returns commentary text still
+            # counts as a chain "success", and the whole attempt gets treated as
+            # zero candidates instead of falling through to a tier that might
+            # have returned usable JSON.
+            growth_analysis, growth_sources, growth_live = generate_analysis(
+                growth_prompt, max_tokens=3000,
+                validate_fn=lambda t: _parse_candidates_json(t) is not None,
+            )
 
-        candidates = [
-            c for c in candidates
-            if (c.get("ticker") or "").strip().upper() not in seen_tickers
-        ]
-        if not candidates:
-            stockpredictor.log.info(f"Attempt {attempt}: no new candidates found in {', '.join(sectors)}.")
-            continue
+            if not growth_analysis:
+                stockpredictor.log.error(
+                    "No LLM backend produced Stage 1 output (no GROQ_API_KEY/"
+                    "GOOGLE_API_KEY set and local model unavailable/failed). "
+                    "Aborting without sending an email."
+                )
+                sys.exit(1)
+            _require_live_or_abort(growth_live, "Stage 1 (fundamentals screen)")
 
-        fundamentally_qualified, rejected_fund = _prefilter_by_fundamentals(candidates)
-        all_rejected.extend(rejected_fund)
-        seen_tickers.update(
-            (c.get("ticker") or "").strip().upper() for c in rejected_fund if c.get("ticker")
-        )
+            for s in growth_sources:
+                if s not in sources:
+                    sources.append(s)
+            used_live_search = used_live_search or growth_live
+
+            candidates = _parse_candidates_json(growth_analysis)
+            if candidates is None:
+                stockpredictor.log.warning(
+                    f"Attempt {attempt}: Stage 1 output could not be parsed as "
+                    "candidate JSON -- treating as zero candidates for this attempt."
+                )
+                candidates = []
+
+            candidates = [
+                c for c in candidates
+                if (c.get("ticker") or "").strip().upper() not in seen_tickers
+            ]
+            if not candidates:
+                stockpredictor.log.info(f"Attempt {attempt}: no new candidates found in {', '.join(sectors)}.")
+                fundamentally_qualified, rejected_fund = [], []
+            else:
+                fundamentally_qualified, rejected_fund = _prefilter_by_fundamentals(candidates)
+                all_rejected.extend(rejected_fund)
+                seen_tickers.update(
+                    (c.get("ticker") or "").strip().upper() for c in rejected_fund if c.get("ticker")
+                )
+
+        # Watchlist graduates (near-misses from a PREVIOUS run that now also
+        # clear technicals) get first shot at this run's single Stage 2 call
+        # rather than waiting for their own attempt -- fold them in once,
+        # on the first attempt, rather than duplicating the whole Stage 2
+        # block for them separately.
+        if attempt == 1 and watchlist_graduates:
+            stockpredictor.log.info(
+                f"{len(watchlist_graduates)} watchlist candidate(s) now clear both "
+                "fundamentals and technicals -- adding to this attempt's Stage 2 batch: "
+                + ", ".join(c.get("name") or c.get("ticker") or "?" for c in watchlist_graduates)
+            )
+            fundamentally_qualified = list(fundamentally_qualified) + watchlist_graduates
+            seen_tickers.update(
+                (c.get("ticker") or "").strip().upper() for c in watchlist_graduates if c.get("ticker")
+            )
 
         if not fundamentally_qualified:
             stockpredictor.log.info(
-                f"Attempt {attempt}: {len(rejected_fund)} candidate(s) from "
-                f"{', '.join(sectors)} failed independent fundamentals "
-                "verification -- none reached Stage 2."
+                f"Attempt {attempt}: no candidate from {', '.join(sectors)} "
+                "passed independent fundamentals verification -- none reached Stage 2."
             )
             continue
 
@@ -2078,6 +2436,24 @@ def run():
     # pick, if other candidates that run missed it by a hair.
     _log_rejection_history(all_rejected, today_str)
 
+    # Persist the near-miss watchlist: keep whatever survived recheck at the
+    # top of this run (still-watching entries, minus graduates/stale/no-
+    # longer-fundamentally-qualified ones _load_and_recheck_watchlist already
+    # dropped), plus any NEW technical-only near-misses from this run's own
+    # rejections. Rewritten wholesale rather than appended, since the recheck
+    # step already decided which old rows survive.
+    today_iso = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+    new_near_miss_rows = [
+        {"date_added": today_iso, "ticker": (s.get("ticker") or "").strip(),
+         "name": s.get("name") or (s.get("ticker") or "").strip(), "sector": s.get("sector") or ""}
+        for s in all_rejected
+        if (s.get("ticker") or "").strip() and _is_technical_only_near_miss(s)
+    ]
+    merged_by_ticker = {row["ticker"]: row for row in watchlist_keep_rows}
+    for row in new_near_miss_rows:
+        merged_by_ticker.setdefault(row["ticker"], row)  # keep the older date_added if already watching
+    _rewrite_watchlist(list(merged_by_ticker.values()))
+
     if analysis_html is None:
         stockpredictor.log.warning(
             f"All {MAX_GENERATION_ATTEMPTS} attempt(s) failed to produce a stock "
@@ -2087,7 +2463,8 @@ def run():
         analysis_html = _no_qualifying_stock_html(all_rejected)
 
     analysis_html = (analysis_html or "") + regime.regime_note_html(regime_detail)
-    email_html = build_email_html(analysis_html, today_str, sources, used_live_search, _adjustments_html(applied_adjustments))
+    disclosures_html = _adjustments_html(applied_adjustments) + _regime_softening_html(regime_softening)
+    email_html = build_email_html(analysis_html, today_str, sources, used_live_search, disclosures_html)
 
     # Outcome-tracking feedback loop (review item 7): log every stock this
     # run actually emailed so swing_trade_outcomes.py can later check real
