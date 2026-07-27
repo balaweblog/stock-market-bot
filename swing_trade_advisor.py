@@ -151,7 +151,7 @@ USE_DETERMINISTIC_SCREEN = os.getenv("USE_DETERMINISTIC_SCREEN", "true").lower()
 # silent bar-lowering. This is independent of, and separate from,
 # AUTO_ADJUST_THRESHOLDS (which is history-driven and persists across
 # runs) -- this one is regime-driven and resets every run.
-REGIME_SOFTEN_GROWTH_BAR = os.getenv("REGIME_SOFTEN_GROWTH_BAR", "false").lower() == "true"
+REGIME_SOFTEN_GROWTH_BAR = os.getenv("REGIME_SOFTEN_GROWTH_BAR", "true").lower() == "true"
 REGIME_SOFTEN_MAX_PCT = _env_float("REGIME_SOFTEN_MAX_PCT", 15.0)
 
 # -----------------------------
@@ -719,7 +719,7 @@ SECTORS = [
     "Metals & Mining", "Realty & Construction", "Energy & Power",
     "Textiles & Apparel", "Cement", "Telecom",
 ]
-SECTORS_PER_ATTEMPT = _env_int("SECTORS_PER_ATTEMPT", 6)
+SECTORS_PER_ATTEMPT = _env_int("SECTORS_PER_ATTEMPT", 14)
 
 
 def _sectors_for_attempt(attempt_idx):
