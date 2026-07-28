@@ -203,6 +203,28 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
         credit_width_pct = (premium / width) * 100
         return max_profit, max_loss, rr_ratio, credit_width_pct
 
+    def evaluate_debit_spread(premium, width):
+        # Mirror of evaluate_spread() above, but for a DEBIT vertical: the
+        # premium is paid, not received, so it IS the max loss (capped,
+        # defined risk) and (width - premium) is the max profit -- the
+        # inverse of the credit-spread relationship. "credit_width_pct" is
+        # reused/reported here as the debit's share of the width (same
+        # MIN_CREDIT_WIDTH_PCT env knob gates it, just inverted: a debit
+        # spread should pay LESS than (100 - MIN_CREDIT_WIDTH_PCT)% of the
+        # width, the mirror image of a credit spread collecting AT LEAST
+        # MIN_CREDIT_WIDTH_PCT% of it).
+        if width <= 0:
+            return None
+        max_loss = premium
+        if max_loss <= 0:
+            return None
+        max_profit = width - premium
+        if max_profit <= 0:
+            return None
+        rr_ratio = max_profit / max_loss
+        debit_width_pct = (premium / width) * 100
+        return max_profit, max_loss, rr_ratio, debit_width_pct
+
     # 1. Evaluate Credit Verticals (Bear Call / Bull Put)
     if strategy_type in ["Bear Call Spread", "Bull Put Spread"]:
         strikes = calls if strategy_type == "Bear Call Spread" else puts
@@ -278,6 +300,69 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                                 "credit_width_pct": credit_width_pct,
                                 "premium": premium
                             })
+
+    # 3. Evaluate Debit Verticals (Bull Call / Bear Put)
+    # BUG FIX: previously select_best_strikes() only implemented the three
+    # credit/neutral structures above, so a Bull Call or Bear Put Spread
+    # skipped deterministic optimization entirely and fell back to
+    # whatever strikes the LLM guessed (only run through apply_verified_
+    # payoff for payoff math afterwards, never through the strike-quality
+    # optimizer the other three structures get). This scans the real
+    # chain the same way, just with the debit/credit relationship
+    # inverted -- see evaluate_debit_spread() above.
+    elif strategy_type in ["Bull Call Spread", "Bear Put Spread"]:
+        is_bull_call = strategy_type == "Bull Call Spread"
+        opt_type = "CE" if is_bull_call else "PE"
+        ltp_map = call_ltp if is_bull_call else put_ltp
+
+        # Debit spreads legitimately buy a strike on either side of spot
+        # (ATM/ITM for real delta exposure), unlike the strictly-OTM
+        # `calls`/`puts` lists built above for the credit verticals -- so
+        # scan a fresh, liquidity-filtered, full-chain strike list here
+        # instead of reusing those. Ordered so `long_strike` (the leg
+        # actually bought) is always the nearer/more-expensive strike and
+        # `short_strike` (the leg sold to fund it) is always farther out,
+        # matching how the pair is priced below.
+        all_strikes = sorted(
+            (s for s in ltp_map.keys() if _liquid(s, opt_type)),
+            reverse=not is_bull_call,
+        )
+
+        for i, long_strike in enumerate(all_strikes):
+            # Mirror of constraint #2 on the credit verticals: don't buy a
+            # long leg that's already past the expected-move band on the
+            # wrong side -- that's paying up for a strike the underlying
+            # isn't expected to reach by expiry, not a genuine entry.
+            if is_bull_call and long_strike > band_hi:
+                continue
+            if not is_bull_call and long_strike < band_lo:
+                continue
+
+            for short_strike in all_strikes[i + 1:]:
+                width = abs(short_strike - long_strike)
+                if long_strike not in ltp_map or short_strike not in ltp_map:
+                    continue
+                premium = ltp_map[long_strike] - ltp_map[short_strike]
+
+                if premium <= 0:
+                    continue
+
+                stats = evaluate_debit_spread(premium, width)
+                if not stats:
+                    continue
+                max_profit, max_loss, rr_ratio, debit_width_pct = stats
+
+                # Apply Strict Gates (see evaluate_debit_spread() docstring
+                # for why the credit-width gate is inverted here).
+                if rr_ratio >= MIN_REWARD_RISK_RATIO and debit_width_pct <= (100 - MIN_CREDIT_WIDTH_PCT):
+                    valid_structures.append({
+                        "long_strike": long_strike,
+                        "short_strike": short_strike,
+                        "rr_ratio": rr_ratio,
+                        "credit_width_pct": debit_width_pct,
+                        "premium": premium,
+                        "width": width,
+                    })
 
     if not valid_structures:
         liquidity_hint = (
@@ -1610,7 +1695,7 @@ def _clamp01_100(x):
     return max(0, min(100, x))
 
 
-def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop_pct, reward_risk_ratio, conf_pct, is_eod):
+def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop_pct, reward_risk_ratio, conf_pct, is_eod, sources=None):
     components = {}
 
     if ev_inr is not None and max_loss:
@@ -1680,11 +1765,45 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
         score = 40
         penalty_notes.append("POP < 20% caps score at 40")
 
+    # BUG FIX: _categorize_source() tags today's news sources into an
+    # "Event Calendar" bucket (RBI/FOMC/budget/election keywords) purely
+    # for the display table in render_market_data_inputs_html() -- an
+    # RBI-policy or FOMC headline in today's sources previously had zero
+    # effect on either the confidence check-list or this score. A live
+    # event-calendar hit is a real risk factor for a risk-defined options
+    # structure (a policy surprise can gap the underlying through both
+    # short strikes), so it now knocks points off here too, independent of
+    # whatever compute_confidence already deducted for it.
+    event_sources = [s for s in (sources or []) if _categorize_source(s) == "Event Calendar"]
+    if event_sources and score > 0:
+        score = max(0, score - 10)
+        penalty_notes.append(
+            f"{len(event_sources)} event-calendar headline(s) in today's sources "
+            f"(RBI/FOMC/budget/election) -- score reduced 10 pts; verify this "
+            f"horizon's expiry doesn't span the event before sizing"
+        )
+
     return score, components, penalty_notes
 
 
-def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None):
+def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None, sources=None):
     checks = []
+
+    # BUG FIX: an "Event Calendar" source hit (RBI/FOMC/budget/election --
+    # see _categorize_source()/_CATEGORY_KEYWORDS) used to be display-only,
+    # surfaced in the Market Data Inputs table but never fed into any of
+    # the checks below. Treat it like the other risk checks in this
+    # function: a hit counts against confidence, since a scheduled macro
+    # event inside the expiry window is exactly the kind of gap risk a
+    # risk-defined spread's static OI/VIX/max-pain checks can't see.
+    event_sources = [s for s in (sources or []) if _categorize_source(s) == "Event Calendar"]
+    if event_sources:
+        checks.append((
+            False,
+            f"{len(event_sources)} event-calendar headline(s) in today's sources "
+            f"(RBI/FOMC/budget/election) -- confirm none fall inside this horizon's "
+            f"expiry window before sizing",
+        ))
 
     top_call_oi = horizon_snap.get("top_call_oi") or []
     top_put_oi = horizon_snap.get("top_put_oi") or []
@@ -1810,7 +1929,7 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=
     return label, pct, checks
 
 
-def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
+def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sources=None):
     horizon_dict["bias_reason"] = _scrub_pcr_direction_claim(
         _scrub_pcr_mischaracterization(
             _strip_cap_claims(horizon_dict.get("bias_reason")),
@@ -2230,14 +2349,14 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         horizon_dict["capital_efficiency"] = "n/a"
 
     conf_label, conf_pct, conf_checks = compute_confidence(
-        priced_legs, horizon_snap, result["breakevens"], is_eod, vix, spot
+        priced_legs, horizon_snap, result["breakevens"], is_eod, vix, spot, sources
     )
     horizon_dict["confidence"] = conf_label
     horizon_dict["confidence_pct"] = conf_pct
     horizon_dict["confidence_reasons"] = conf_checks
 
     tq_score, tq_breakdown, tq_penalty_notes = compute_trade_quality_score(
-        priced_legs, horizon_snap, ev_inr, max_loss, pop, reward_risk_ratio, conf_pct, is_eod
+        priced_legs, horizon_snap, ev_inr, max_loss, pop, reward_risk_ratio, conf_pct, is_eod, sources
     )
     horizon_dict["_trade_quality_score"] = tq_score
     horizon_dict["trade_quality_breakdown"] = " · ".join(
@@ -3489,7 +3608,7 @@ def send_option_strategy_email(html_body):
     return False
 
 
-def finalize_horizons(horizons, live_data):
+def finalize_horizons(horizons, live_data, sources=None):
     by_name = {str(h.get("horizon") or "").strip(): h for h in horizons}
 
     if "Weekly" in by_name:
@@ -3500,7 +3619,7 @@ def finalize_horizons(horizons, live_data):
         if h.get("_verified_max_loss_inr") is not None:
             continue
         snap = (live_data.get("horizons") or {}).get(name, {})
-        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
+        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"), sources)
 
     for h in by_name.values():
         v = h.get("_verified_max_loss_inr", 0.0)
@@ -3543,13 +3662,13 @@ def _aggregate_risk_from_verified(horizons):
     return aggregate_pct, over_cap
 
 
-def reverify_horizons(horizons, live_data, only_names=None):
+def reverify_horizons(horizons, live_data, only_names=None, sources=None):
     for h in horizons:
         name = h.get("horizon")
         if only_names is not None and name not in only_names:
             continue
         snap = (live_data.get("horizons") or {}).get(name, {})
-        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"))
+        apply_verified_payoff(h, snap, live_data.get("spot"), live_data.get("vix"), sources)
 
     total_at_risk = 0.0
     for h in horizons:
@@ -3587,7 +3706,7 @@ Respond with ONLY raw JSON:
 """
 
 
-def repair_rejected_legs(horizons, live_data):
+def repair_rejected_legs(horizons, live_data, sources=None):
     rejected = [h for h in horizons if _horizon_rejected(h)]
     if not rejected:
         return horizons
@@ -3639,7 +3758,7 @@ def repair_rejected_legs(horizons, live_data):
             h.pop("_raw_strike_rationale", None)
             h.pop("_substitution_note", None)
 
-    reverify_horizons(horizons, live_data, only_names=set(fixed_by_name.keys()))
+    reverify_horizons(horizons, live_data, only_names=set(fixed_by_name.keys()), sources=sources)
     still_bad = [h.get("horizon") for h in horizons if h.get("horizon") in fixed_by_name and _horizon_rejected(h)]
     if still_bad:
         stockpredictor.log.warning(f"Repair pass attempted but still rejected after retry: {', '.join(still_bad)}")
@@ -3851,26 +3970,20 @@ def run():
             strat_lower = strategy_name.lower()
             bias_lower = bias.lower()
 
-            # BUG FIX: select_best_strikes() only implements the three CREDIT/
-            # neutral structures (Bear Call Spread, Bull Put Spread, Iron
-            # Condor) -- it has no debit-spread optimizer. The previous dispatch
-            # never checked for "bull call" or "bear put" in the model's own
-            # strategy name, so a model-proposed Bull Call Spread (bias
-            # "Bullish") fell through to the bias-only branch and got mapped to
-            # "Bull Put Spread" -- a structurally different trade (short puts
-            # below spot instead of a long call debit spread above spot) that,
-            # if select_best_strikes found a valid one, would silently
-            # overwrite strategy_name/legs while bias_reason/strike_rationale
-            # still read as written for the original call spread. Symmetric bug
-            # for "Bear Put Spread" -> "Bear Call Spread". Since there's no safe
-            # deterministic substitute for a debit spread, explicitly detect
-            # those names and skip optimization -- keep the model's own legs,
-            # which still get fully verified against live/EOD premiums (max
-            # loss/profit, POP, EV, etc.) by apply_verified_payoff downstream.
+            # BUG FIX: select_best_strikes() used to only implement the three
+            # CREDIT/neutral structures (Bear Call Spread, Bull Put Spread,
+            # Iron Condor) -- it had no debit-spread optimizer, so a model-
+            # proposed Bull Call or Bear Put Spread was previously either
+            # skipped outright, or (worse, before that fix) silently
+            # remapped to the wrong-direction credit structure by the
+            # bias-only fallback branch below. select_best_strikes() now
+            # implements Bull Call / Bear Put too (see its "3. Evaluate
+            # Debit Verticals" branch), so route them there like the other
+            # three instead of bypassing deterministic optimization.
             if "bull call" in strat_lower or ("bull" in bias_lower and "call" in strat_lower):
-                target_strat = None  # debit spread -- no deterministic optimizer available
+                target_strat = "Bull Call Spread"
             elif "bear put" in strat_lower or ("bear" in bias_lower and "put" in strat_lower):
-                target_strat = None  # debit spread -- no deterministic optimizer available
+                target_strat = "Bear Put Spread"
             elif "bear call" in strat_lower or ("bear" in bias_lower and "call" in strat_lower):
                 target_strat = "Bear Call Spread"
             elif "bull put" in strat_lower or ("bull" in bias_lower and "put" in strat_lower):
@@ -3883,14 +3996,6 @@ def run():
                 target_strat = "Bull Put Spread"
             else:
                 target_strat = "Iron Condor"
-
-            if target_strat is None:
-                stockpredictor.log.info(
-                    f"Deterministic strike selection for {horizon_name}: skipped -- "
-                    f"'{strategy_name}' is a debit spread and select_best_strikes() has no "
-                    f"debit-spread optimizer; keeping the model's own legs for verification."
-                )
-                continue
 
             res = select_best_strikes(snap, spot, bias, target_strat)
             if res.get("ok"):
@@ -3919,6 +4024,10 @@ def run():
                         chosen_desc = f"short {best['short_strike']:g} CE / long {best['long_strike']:g} CE"
                     elif st == "Bull Put Spread":
                         chosen_desc = f"short {best['short_strike']:g} PE / long {best['long_strike']:g} PE"
+                    elif st == "Bull Call Spread":
+                        chosen_desc = f"long {best['long_strike']:g} CE / short {best['short_strike']:g} CE"
+                    elif st == "Bear Put Spread":
+                        chosen_desc = f"long {best['long_strike']:g} PE / short {best['short_strike']:g} PE"
                     elif st == "Iron Condor":
                         chosen_desc = (
                             f"short {best['short_put']:g} PE/{best['short_call']:g} CE, "
@@ -3950,13 +4059,17 @@ def run():
                     h["legs"] = f"Sell {best['short_strike']:g} CE, Buy {best['long_strike']:g} CE"
                 elif st == "Bull Put Spread":
                     h["legs"] = f"Sell {best['short_strike']:g} PE, Buy {best['long_strike']:g} PE"
+                elif st == "Bull Call Spread":
+                    h["legs"] = f"Buy {best['long_strike']:g} CE, Sell {best['short_strike']:g} CE"
+                elif st == "Bear Put Spread":
+                    h["legs"] = f"Buy {best['long_strike']:g} PE, Sell {best['short_strike']:g} PE"
                 elif st == "Iron Condor":
                     h["legs"] = f"Buy {best['long_put']:g} PE, Sell {best['short_put']:g} PE, Sell {best['short_call']:g} CE, Buy {best['long_call']:g} CE"
             else:
                 stockpredictor.log.info(f"Deterministic strike selection for {horizon_name} ({target_strat}): {res.get('reason')}")
 
-        horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data)
-        horizons = repair_rejected_legs(horizons, live_data)
+        horizons, aggregate_pct, over_cap = finalize_horizons(horizons, live_data, sources)
+        horizons = repair_rejected_legs(horizons, live_data, sources)
         aggregate_pct, over_cap = _aggregate_risk_from_verified(horizons)
         if over_cap:
             stockpredictor.log.warning(
