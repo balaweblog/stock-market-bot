@@ -85,6 +85,17 @@ CONSIDER_QUALITY_THRESHOLD = float(os.getenv("OPTIONS_CONSIDER_QUALITY_THRESHOLD
 
 REJECT_IC_SHORT_INSIDE_EM = os.getenv("OPTIONS_REJECT_IC_SHORT_INSIDE_EM", "true").lower() == "true"
 
+# How far the ATM-straddle-premium expected move and the IV-based 1-sigma
+# expected move (see compute_expected_move()) can disagree, in relative
+# percent, before that disagreement itself counts against confidence.
+EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_PCT", "25"))
+
+# Max acceptable bid-ask spread on any single leg, as a percent of the
+# leg's mid price. A strike with no two-sided quote at all (one or both
+# sides missing/zero) is always treated as illiquid regardless of this
+# threshold -- see compute_bid_ask_spread_pct().
+MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
+
 HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
@@ -164,8 +175,22 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
     
     valid_structures = []
 
-    calls = sorted([s for s in call_ltp.keys() if s > spot])
-    puts = sorted([s for s in put_ltp.keys() if s < spot], reverse=True)
+    # Real liquidity gate on candidate strikes (see compute_bid_ask_spread_pct /
+    # _leg_liquidity_check): when this horizon's snapshot carries actual
+    # bid/ask data, drop any strike without a genuine two-sided market or
+    # whose spread exceeds MAX_LEG_SPREAD_PCT before ever building a
+    # structure out of it -- previously OI *presence* was the only proxy
+    # used, and a structure could be "optimal" on paper while sitting on a
+    # leg nobody could actually trade at a fair price. Skips (doesn't
+    # filter) when there's no quote data for this horizon at all (EOD).
+    has_quote_data = bool((horizon_snap or {}).get("call_bid") or (horizon_snap or {}).get("put_bid"))
+
+    def _liquid(strike, opt_type):
+        ok, _ = _leg_liquidity_check(horizon_snap, strike, opt_type, has_quote_data)
+        return ok
+
+    calls = sorted([s for s in call_ltp.keys() if s > spot and _liquid(s, "CE")])
+    puts = sorted([s for s in put_ltp.keys() if s < spot and _liquid(s, "PE")], reverse=True)
 
     def evaluate_spread(premium, width):
         if width <= 0:
@@ -255,7 +280,17 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                             })
 
     if not valid_structures:
-        return {"ok": False, "reason": f"No {strategy_type} cleared the strict {MIN_CREDIT_WIDTH_PCT}% credit/width and {MIN_REWARD_RISK_RATIO} R:R gates in current market conditions."}
+        liquidity_hint = (
+            " (or every nearby strike failed the real bid-ask liquidity gate)"
+            if has_quote_data else ""
+        )
+        return {
+            "ok": False,
+            "reason": (
+                f"No {strategy_type} cleared the strict {MIN_CREDIT_WIDTH_PCT}% credit/width and "
+                f"{MIN_REWARD_RISK_RATIO} R:R gates in current market conditions{liquidity_hint}."
+            ),
+        }
 
     valid_structures.sort(key=lambda x: (x["rr_ratio"], x["credit_width_pct"]), reverse=True)
     best_trade = valid_structures[0]
@@ -417,6 +452,22 @@ def _extract_expiry_snapshot(rows, expiry_str):
     call_price_chg = {s: c.get("change") for s, c in calls.items() if c.get("change") is not None}
     put_price_chg = {s: p.get("change") for s, p in puts.items() if p.get("change") is not None}
 
+    # Real liquidity data: NSE's option-chain payload carries per-strike
+    # top-of-book bid/ask (field names are inconsistently cased in NSE's
+    # own API -- "bidprice" lowercase, "askPrice" uppercase -- this is not
+    # a typo). A strike with no live two-sided quote comes back as 0 or
+    # missing on one or both sides; only keep strikes where both sides are
+    # a genuine positive price, since that's the only case a spread is
+    # actually meaningful. See compute_bid_ask_spread_pct() / the
+    # liquidity gate in compute_strategy_payoff() and select_best_strikes().
+    def _quote_map(book, side_key):
+        return {s: v for s, o in book.items() if (v := o.get(side_key)) and v > 0}
+
+    call_bid = _quote_map(calls, "bidprice")
+    call_ask = _quote_map(calls, "askPrice")
+    put_bid = _quote_map(puts, "bidprice")
+    put_ask = _quote_map(puts, "askPrice")
+
     return {
         "expiry": expiry_str,
         "pcr_oi": pcr_oi,
@@ -435,6 +486,10 @@ def _extract_expiry_snapshot(rows, expiry_str):
         "put_oi_chg_abs": put_oi_chg_abs,
         "call_price_chg": call_price_chg,
         "put_price_chg": put_price_chg,
+        "call_bid": call_bid,
+        "call_ask": call_ask,
+        "put_bid": put_bid,
+        "put_ask": put_ask,
     }
 
 
@@ -457,18 +512,37 @@ def describe_max_pain(horizon_snap, spot):
     )
 
 
-def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None):
+def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None, call_iv=None, put_iv=None):
     """
-    ATM straddle-implied expected move for one expiry: the sum of the
-    at-the-money call and put premiums (the market's own breakeven-to-
-    breakeven range), NOT a VIX-derived estimate -- this is what
-    select_best_strikes() uses to keep short strikes outside a realistic
-    move, and what the report's "Expected Move (ATM Straddle)" row shows.
+    Two independent expected-move estimates for one expiry, reconciled into
+    a single gating figure instead of left to silently disagree:
+
+      - Straddle-premium EM: ATM call + ATM put last-traded premium (the
+        market's own breakeven-to-breakeven range for this expiry).
+      - IV-based 1-sigma EM: spot * ATM_IV * sqrt(T) -- the standard
+        lognormal 1-sigma move implied by ATM implied volatility, the same
+        method compute_pop()/_pop_diagnostics() use for POP.
+
+    These can genuinely diverge -- thin ATM liquidity distorts the straddle
+    premium, a stale/skewed IV quote distorts the IV estimate -- so this
+    always returns BOTH figures (straddle_move_pts, iv_move_pts) plus a
+    single `expected_move_pts` that is the WIDER of the two, tagged via
+    `expected_move_basis`. Anything gating "is this short strike safely
+    outside the expected move" (select_best_strikes, the Iron Condor
+    short-inside-EM check, compute_confidence's strike-distance check) reads
+    `expected_move_pts` and so automatically becomes the more conservative
+    of the two checks, rather than trusting whichever formula happens to be
+    plugged into that call site. `move_divergence_pct` flags when the two
+    disagree by more than OPTIONS_EM_DIVERGENCE_THRESHOLD_PCT (default 25%)
+    so compute_confidence can penalize an unreliable print instead of
+    quietly picking one.
 
     call_ltp / put_ltp: {strike: last_traded_price} maps for one expiry.
-    vix / expiry are accepted (and passed through by both call sites) for
-    forward compatibility -- e.g. an IV-based fallback when no ATM premium
-    is available -- but aren't required for the straddle-premium method.
+    call_iv / put_iv: {strike: implied_volatility_pct} maps for the same
+    expiry -- pass the live NSE feed's tables; omit (or pass {}) for EOD
+    Bhavcopy data, which has no IV column, and the IV-based estimate is
+    simply skipped, leaving expected_move_pts as the straddle figure alone
+    (unchanged behavior for EOD runs).
 
     Returns None (never raises) if there's no strike with both a call AND
     a put premium to form a straddle from -- callers already handle a None
@@ -488,15 +562,46 @@ def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None):
     if not call_premium or not put_premium:
         return None
 
-    expected_move_pts = call_premium + put_premium
+    straddle_move_pts = call_premium + put_premium
+
+    iv_move_pts = None
+    atm_iv = None
+    if call_iv and put_iv and expiry:
+        ivs = [v for v in (call_iv.get(atm_strike), put_iv.get(atm_strike)) if v]
+        if ivs:
+            atm_iv = sum(ivs) / len(ivs)
+            try:
+                t_years = time_to_expiry_years(_parse_nse_date(expiry))
+                sigma = _iv_to_frac(atm_iv)
+                if sigma and sigma > 0 and t_years > 0:
+                    iv_move_pts = spot * sigma * math.sqrt(t_years)
+            except (ValueError, TypeError):
+                iv_move_pts = None
+
+    move_divergence_pct = None
+    if iv_move_pts and straddle_move_pts:
+        move_divergence_pct = round(
+            abs(straddle_move_pts - iv_move_pts) / min(straddle_move_pts, iv_move_pts) * 100, 1
+        )
+
+    if iv_move_pts and iv_move_pts > straddle_move_pts:
+        expected_move_pts, expected_move_basis = iv_move_pts, "iv"
+    else:
+        expected_move_pts, expected_move_basis = straddle_move_pts, "straddle"
+
     expected_move_pct = round((expected_move_pts / spot) * 100, 2) if spot else None
 
     return {
         "atm_strike": atm_strike,
         "atm_call_premium": call_premium,
         "atm_put_premium": put_premium,
+        "atm_iv": round(atm_iv, 2) if atm_iv else None,
+        "straddle_move_pts": round(straddle_move_pts, 2),
+        "iv_move_pts": round(iv_move_pts, 2) if iv_move_pts else None,
+        "move_divergence_pct": move_divergence_pct,
         "expected_move_pts": round(expected_move_pts, 2),
         "expected_move_pct": expected_move_pct,
+        "expected_move_basis": expected_move_basis,
     }
 
 
@@ -666,6 +771,10 @@ def _extract_bhavcopy_snapshot(rows, symbol, expiry_dt):
         "put_ltp": put_ltp,
         "call_iv": {},
         "put_iv": {},
+        "call_bid": {},
+        "call_ask": {},
+        "put_bid": {},
+        "put_ask": {},
     }
 
 
@@ -712,7 +821,10 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
         for horizon, dt in horizon_dts.items():
             snap = _extract_bhavcopy_snapshot(bhav_rows, symbol, dt)
             snap["source"] = f"EOD Bhavcopy ({bhav_date.strftime('%d-%b-%Y')})"
-            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"])
+            snap["expected_move"] = compute_expected_move(
+                snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"],
+                call_iv=snap["call_iv"], put_iv=snap["put_iv"],
+            )
             data["horizons"][horizon] = snap
 
         notes.append(
@@ -809,7 +921,10 @@ def fetch_live_market_data():
         rows = records.get("data", [])
         for horizon, expiry in horizon_expiries.items():
             snap = _extract_expiry_snapshot(rows, expiry)
-            snap["expected_move"] = compute_expected_move(snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"])
+            snap["expected_move"] = compute_expected_move(
+                snap["call_ltp"], snap["put_ltp"], data["spot"], data.get("vix"), snap["expiry"],
+                call_iv=snap["call_iv"], put_iv=snap["put_iv"],
+            )
             data["horizons"][horizon] = snap
 
         data["status"] = "ok"
@@ -1133,10 +1248,66 @@ def _leg_iv(horizon_snap, strike, opt_type):
     return table.get(strike, table.get(int(strike) if float(strike).is_integer() else strike))
 
 
+def _leg_bid_ask(horizon_snap, strike, opt_type):
+    key = float(strike)
+    lookup_key = int(key) if key.is_integer() else key
+    bid_table = (horizon_snap or {}).get("call_bid" if opt_type == "CE" else "put_bid", {})
+    ask_table = (horizon_snap or {}).get("call_ask" if opt_type == "CE" else "put_ask", {})
+    bid = bid_table.get(strike, bid_table.get(lookup_key))
+    ask = ask_table.get(strike, ask_table.get(lookup_key))
+    return bid, ask
+
+
+def compute_bid_ask_spread_pct(bid, ask):
+    """
+    Relative bid-ask spread as a percent of mid price. Returns None (not a
+    rejection by itself -- caller decides) when either side is missing or
+    non-positive, or when the quote is crossed/locked (ask <= bid), since
+    none of those represent a computable two-sided spread.
+    """
+    if not bid or not ask or bid <= 0 or ask <= 0 or ask <= bid:
+        return None
+    mid = (bid + ask) / 2.0
+    return round((ask - bid) / mid * 100, 2)
+
+
+def _leg_liquidity_check(horizon_snap, strike, opt_type, has_quote_data):
+    """
+    Real liquidity gate for one leg, using actual bid/ask instead of OI
+    presence as a proxy. Returns (ok, reason_or_spread_pct).
+
+    If this horizon's snapshot has no bid/ask data at all (EOD Bhavcopy,
+    or a live fetch where the book fields didn't come through), the gate
+    can't evaluate anything and does NOT reject -- has_quote_data being
+    False means "skip", not "pass"; degrades to premium-only verification,
+    same behavior as before this gate existed. If quote data IS present
+    for this horizon but this specific leg has no two-sided market, that's
+    a real illiquidity signal and the leg is rejected.
+    """
+    if not has_quote_data:
+        return True, None
+    bid, ask = _leg_bid_ask(horizon_snap, strike, opt_type)
+    spread_pct = compute_bid_ask_spread_pct(bid, ask)
+    if spread_pct is None:
+        return False, "no live two-sided quote (missing/zero bid or ask)"
+    if spread_pct > MAX_LEG_SPREAD_PCT:
+        return False, f"bid-ask spread {spread_pct:g}% of mid exceeds the {MAX_LEG_SPREAD_PCT:g}% liquidity gate"
+    return True, spread_pct
+
+
 def compute_strategy_payoff(legs_text, horizon_snap, lot_size=NIFTY_LOT_SIZE):
     legs = parse_legs(legs_text)
     if not legs:
         return {"ok": False, "reason": "Could not parse strikes/legs from the model's output."}
+
+    # Liquidity gate is only "live" (able to reject) when THIS horizon's
+    # snapshot actually carries bid/ask data -- EOD Bhavcopy and any live
+    # fetch that came back without book fields have none of either side,
+    # so the gate skips rather than rejecting on absent data it never had
+    # a chance to evaluate.
+    has_quote_data = bool(
+        (horizon_snap or {}).get("call_bid") or (horizon_snap or {}).get("put_bid")
+    )
 
     priced = []
     for leg in legs:
@@ -1149,7 +1320,19 @@ def compute_strategy_payoff(legs_text, horizon_snap, lot_size=NIFTY_LOT_SIZE):
                     f"-- cannot verify this leg's payoff against real market prices."
                 ),
             }
-        priced.append({**leg, "premium": float(premium)})
+        liquid_ok, liquidity_info = _leg_liquidity_check(
+            horizon_snap, leg["strike"], leg["type"], has_quote_data
+        )
+        if not liquid_ok:
+            return {
+                "ok": False,
+                "reason": (
+                    f"{leg['action']} {leg['strike']:g} {leg['type']} rejected on liquidity: "
+                    f"{liquidity_info} -- this leg is not tradeable at a fair price right now."
+                ),
+            }
+        leg_spread_pct = liquidity_info if isinstance(liquidity_info, (int, float)) else None
+        priced.append({**leg, "premium": float(premium), "spread_pct": leg_spread_pct})
 
     strikes = sorted(set(l["strike"] for l in priced))
 
@@ -1451,7 +1634,14 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
     top_call_oi = (horizon_snap or {}).get("top_call_oi") or []
     top_put_oi = (horizon_snap or {}).get("top_put_oi") or []
     has_oi_data = bool(top_call_oi or top_put_oi)
-    if is_eod:
+    leg_spreads = [l["spread_pct"] for l in (priced_legs or []) if l.get("spread_pct") is not None]
+    if leg_spreads:
+        worst_spread_pct = max(leg_spreads)
+        # 0% spread -> 100; at the MAX_LEG_SPREAD_PCT gate itself -> 30
+        # (a leg wider than that never reaches here -- compute_strategy_payoff
+        # already rejected the whole trade before scoring runs).
+        liq_score = _clamp01_100(100 - (worst_spread_pct / MAX_LEG_SPREAD_PCT) * 70)
+    elif is_eod:
         liq_score = 30
     elif has_oi_data:
         liq_score = 90
@@ -1514,6 +1704,18 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=
     else:
         checks.append((False, "Open-interest data unavailable this run"))
 
+    leg_spreads = [l["spread_pct"] for l in (priced_legs or []) if l.get("spread_pct") is not None]
+    if leg_spreads:
+        worst_spread_pct = max(leg_spreads)
+        tight = worst_spread_pct <= MAX_LEG_SPREAD_PCT / 2
+        checks.append((
+            tight,
+            f"Widest leg spread {worst_spread_pct:g}% of mid -- comfortably inside the "
+            f"{MAX_LEG_SPREAD_PCT:g}% liquidity gate" if tight
+            else f"Widest leg spread {worst_spread_pct:g}% of mid -- close to the "
+                 f"{MAX_LEG_SPREAD_PCT:g}% liquidity gate; expect real slippage vs. mid on entry/exit",
+        ))
+
     max_pain = horizon_snap.get("max_pain")
     if max_pain is not None and breakevens and len(breakevens) >= 2:
         lo, hi = min(breakevens), max(breakevens)
@@ -1536,6 +1738,19 @@ def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=
 
     exp_move = horizon_snap.get("expected_move") or {}
     exp_move_pts = exp_move.get("expected_move_pts")
+    move_divergence_pct = exp_move.get("move_divergence_pct")
+    if move_divergence_pct is not None:
+        agree = move_divergence_pct < EM_DIVERGENCE_THRESHOLD_PCT
+        checks.append((
+            agree,
+            f"Straddle and IV-based expected-move estimates agree within "
+            f"{move_divergence_pct:g}%" if agree
+            else f"Straddle (±{exp_move.get('straddle_move_pts'):g}) and IV-based 1σ "
+                 f"(±{exp_move.get('iv_move_pts'):g}) expected-move estimates diverge by "
+                 f"{move_divergence_pct:g}% -- one is likely distorted by thin ATM liquidity "
+                 f"or a stale/skewed IV quote; using the wider figure for gating",
+        ))
+
     if spot is not None and exp_move_pts and priced_legs:
         farthest = max(priced_legs, key=lambda l: abs(l["strike"] - spot))
         distance = abs(farthest["strike"] - spot)
@@ -1720,12 +1935,13 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
             near_distance_for_filter = abs(nearest_short_for_filter["strike"] - spot)
             if near_distance_for_filter < em_pts:
                 near_multiple_for_filter = near_distance_for_filter / em_pts
+                em_basis_for_filter = "IV-based 1σ" if exp_move_for_filter.get("expected_move_basis") == "iv" else "ATM straddle"
                 reason_text = (
                     f"Short strike {nearest_short_for_filter['strike']:g} is only "
                     f"{near_distance_for_filter:.0f} pts from spot ({near_multiple_for_filter:.2f}x the "
-                    f"±{em_pts:g}-pt 1-sigma expected move) -- an Iron Condor's short strikes must sit "
-                    f"outside the expected-move band by construction; this one contradicts its own "
-                    f"range-bound thesis."
+                    f"±{em_pts:g}-pt expected move, {em_basis_for_filter}-derived) -- an Iron Condor's short "
+                    f"strikes must sit outside the expected-move band by construction; this one contradicts "
+                    f"its own range-bound thesis."
                 )
                 horizon_dict["max_loss"] = (
                     f"SHORT STRIKE INSIDE EXPECTED MOVE -- reject this trade "
@@ -1848,10 +2064,21 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None):
         band = ""
         if spot is not None:
             lo, hi = spot - exp_move["expected_move_pts"], spot + exp_move["expected_move_pts"]
-            band = f" -- 68% probability band: {lo:,.0f}–{hi:,.0f}"
+            band = f" -- probability band used for gating: {lo:,.0f}–{hi:,.0f}"
+        basis = exp_move.get("expected_move_basis", "straddle")
+        basis_label = "IV-based 1σ" if basis == "iv" else "ATM straddle"
+        both_note = ""
+        iv_pts = exp_move.get("iv_move_pts")
+        straddle_pts = exp_move.get("straddle_move_pts")
+        if iv_pts and straddle_pts:
+            div_pct = exp_move.get("move_divergence_pct")
+            both_note = f" [straddle: ±{straddle_pts:g}, IV 1σ: ±{iv_pts:g}"
+            if div_pct is not None and div_pct >= EM_DIVERGENCE_THRESHOLD_PCT:
+                both_note += f", diverge {div_pct:g}% -- using the wider of the two"
+            both_note += "]"
         horizon_dict["expected_move"] = (
             f"±{exp_move['expected_move_pts']:g} pts (~{exp_move.get('expected_move_pct', 'n/a')}% of spot) "
-            f"by expiry, from the {exp_move['atm_strike']:g} ATM straddle{band}"
+            f"by expiry, from {basis_label}{band}{both_note}"
         )
     else:
         horizon_dict["expected_move"] = "n/a (no ATM straddle premium available this run)"
