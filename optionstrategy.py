@@ -3,7 +3,7 @@ optionstrategy.py
 
 Standalone companion to main.py, structured the same way as
 swing_trade_advisor.py. Runs a single "recommend the best risk-defined
-Nifty options strategy across Weekly / Monthly / Quarterly
+Nifty options strategy across Weekly / Monthly
 horizons" prompt against whichever free LLM backend main.py already knows
 how to set up (Groq free tier -> Gemini 2.5 Flash free tier -> local
 Qwen2.5-1.5B fallback), then emails the result to the same recipients
@@ -96,7 +96,7 @@ EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_P
 # threshold -- see compute_bid_ask_spread_pct().
 MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
 
-HORIZON_ORDER = ["Weekly", "Monthly", "Quarterly"]
+HORIZON_ORDER = ["Weekly", "Monthly"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
@@ -106,7 +106,7 @@ RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
 # the index as if it paid no dividend at all (q=0), which biases delta,
 # theta, POP, and touch-probability for the underlying's expected drift --
 # the bias compounds with time-to-expiry, so it matters most for the
-# Monthly/Quarterly horizons. Default is a reasonable long-run estimate;
+# Monthly horizon. Default is a reasonable long-run estimate;
 # override via env if you track the live trailing yield.
 DIVIDEND_YIELD = float(os.getenv("OPTIONS_DIVIDEND_YIELD", "0.012"))
 
@@ -328,6 +328,16 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
             reverse=not is_bull_call,
         )
 
+        if not all_strikes:
+            return {
+                "ok": False,
+                "reason": (
+                    f"No liquid {opt_type} strikes available for {strategy_type} scan "
+                    f"(chain empty or every strike failed the liquidity gate) -- "
+                    f"not a gate-quality failure, there was nothing to evaluate."
+                ),
+            }
+
         for i, long_strike in enumerate(all_strikes):
             # Mirror of constraint #2 on the credit verticals: don't buy a
             # long leg that's already past the expected-move band on the
@@ -377,7 +387,15 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
             ),
         }
 
-    valid_structures.sort(key=lambda x: (x["rr_ratio"], x["credit_width_pct"]), reverse=True)
+    # Sort by credit_width_pct (premium collected as % of width) first, then
+    # rr_ratio as tiebreaker. The R:R floor is already enforced by the
+    # MIN_REWARD_RISK_RATIO gate above, so every candidate here already
+    # clears the minimum acceptable risk/reward -- the remaining objective
+    # is to maximize premium captured, not to keep optimizing R:R once it's
+    # already "good enough". (Previously sorted (rr_ratio, credit_width_pct),
+    # which could pick a lower-premium structure over a materially richer
+    # one just for a marginally better R:R.)
+    valid_structures.sort(key=lambda x: (x["credit_width_pct"], x["rr_ratio"]), reverse=True)
     best_trade = valid_structures[0]
     
     return {
@@ -485,9 +503,7 @@ def _pick_horizon_expiry_dates(dt_list):
     weekly_dt = dts[0]
     same_month = [dt for dt in dts if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
     monthly_dt = same_month[-1] if same_month else weekly_dt
-    quarter_candidates = [dt for dt in dts if dt.month in (3, 6, 9, 12) and dt >= monthly_dt]
-    quarterly_dt = quarter_candidates[0] if quarter_candidates else dts[-1]
-    return {"Weekly": weekly_dt, "Monthly": monthly_dt, "Quarterly": quarterly_dt}
+    return {"Weekly": weekly_dt, "Monthly": monthly_dt}
 
 
 def _pick_horizon_expiries(expiry_dates):
@@ -2386,10 +2402,9 @@ def build_prompt(live_data=None):
 
 {live_data_block}
 
-Analyze current market conditions and determine the optimal strategy stance independently across THREE distinct time horizons:
+Analyze current market conditions and determine the optimal strategy stance independently across TWO distinct time horizons:
 1. Nifty Weekly -- (current/nearest weekly expiry)
 2. Nifty Monthly -- (current monthly expiry)
-3. Nifty Quarterly -- (nearest quarterly expiry on the Mar/Jun/Sep/Dec cycle)
 
 --------------------------------------------------------------------------------
 STRATEGY & LEGS CONSTRAINT:
@@ -2437,8 +2452,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "confidence": "High",
       "data_status": "live"
     }},
-    {{ "horizon": "Monthly", ... same fields ... }},
-    {{ "horizon": "Quarterly", ... same fields ... }}
+    {{ "horizon": "Monthly", ... same fields ... }}
   ],
   "portfolio_view": "One paragraph on overall market gap risk and cross-horizon alignment."
 }}
@@ -3533,7 +3547,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
             <td style="background:#14213D;padding:26px 28px 22px;" class="email-padding">
               <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#B08D57;">Market Intelligence &nbsp;&bull;&nbsp; Derivatives Desk</div>
               <h1 style="margin:8px 0 0;font-family:{serif};font-weight:400;font-size:23px;line-height:1.3;color:#ffffff;letter-spacing:0.01em;">Nifty Options Strategy Note</h1>
-              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Monthly &middot; Quarterly &mdash; Risk-Defined Only</p>
+              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Monthly &mdash; Risk-Defined Only</p>
             </td>
           </tr>
           <tr>

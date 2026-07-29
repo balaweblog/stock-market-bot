@@ -3,6 +3,7 @@ import re
 import math
 import json
 import time
+import random
 import html
 import requests
 import yfinance as yf
@@ -586,17 +587,41 @@ def fetch_data(symbol):
     # swing_trade_advisor.py's weekly-technicals check (needs 55+ weekly
     # bars, i.e. ~385+ trading days) instead of that check falling back to
     # "insufficient history" on almost every run.
-    df = yf.download(
-        symbol,
-        period="2y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        session=get_resilient_session()
-    )
+    # yf.download() has no built-in retry, and all tickers in a run are
+    # dispatched concurrently via ThreadPoolExecutor(max_workers=10) --
+    # bursts like that reliably trigger Yahoo Finance's rate limiting
+    # (HTTP 429) or plain intermittent drops, and a different, seemingly
+    # random subset of tickers fails each run as a result. Retry a few
+    # times with exponential backoff (+ jitter, so 10 threads don't all
+    # retry in lockstep and immediately re-trigger the same rate limit)
+    # before giving up.
+    max_attempts = 4
+    last_exc = None
+    df = None
+    for attempt in range(max_attempts):
+        try:
+            df = yf.download(
+                symbol,
+                period="2y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                session=get_resilient_session()
+            )
+            if not df.empty:
+                break
+            last_exc = Exception(f"No data for {symbol}")
+        except Exception as exc:
+            last_exc = exc
 
-    if df.empty:
-        raise Exception(f"No data for {symbol}")
+        if attempt < max_attempts - 1:
+            sleep_for = (2 ** attempt) + random.uniform(0, 1)
+            print(f"fetch_data({symbol}): attempt {attempt + 1}/{max_attempts} failed "
+                  f"({last_exc}), retrying in {sleep_for:.1f}s")
+            time.sleep(sleep_for)
+
+    if df is None or df.empty:
+        raise last_exc if last_exc is not None else Exception(f"No data for {symbol}")
 
     df.reset_index(inplace=True)
 
@@ -1843,8 +1868,8 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                 </tr>
             </table>
             """
-    return (4, 0, ticker, err_html, {
-        "stock_name": ticker,
+    return (4, 0, stock_name, err_html, {
+        "stock_name": stock_name,
         "ticker": ticker,
         "signal": "ERROR",
         "current_price": None,
@@ -2336,6 +2361,13 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
 
     by_market = {"US": [], "India": []}
     for pr, score, name, _html, summary_entry, market in rows:
+        # Skip failed-fetch rows here -- with no price/trend/move data they'd
+        # only render as "⚪ ERROR" / "➖ Unknown" / blank cells. Failures are
+        # already surfaced once, cleanly, via the error banner shown just
+        # above this table (build_error_summary_html), so repeating them
+        # here as noisy placeholder rows adds confusion, not information.
+        if pr == 4 or str(summary_entry.get("signal", "")).upper() == "ERROR":
+            continue
         by_market.setdefault(market, []).append((pr, score, name, summary_entry))
 
     market_sections = [("US", "🇺🇸 US Stocks"), ("India", "🇮🇳 India Stocks")]

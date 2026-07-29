@@ -183,7 +183,7 @@ WATCHLIST_MAX_AGE_DAYS = _env_int("WATCHLIST_MAX_AGE_DAYS", 42)  # ~6 weeks, the
 # risk:reward text and check previously had -- the prompt said "1:2.5" but
 # the code enforced 2.0; MIN_RISK_REWARD's default below preserves that
 # previously-enforced 2.0 rather than silently tightening it).
-MIN_GROWTH_YOY_PCT = _env_float("MIN_GROWTH_YOY_PCT", 20.0)
+MIN_GROWTH_YOY_PCT = _env_float("MIN_GROWTH_YOY_PCT", 15.0)
 MIN_RISK_REWARD = _env_float("MIN_RISK_REWARD", 2.0)
 MAX_RSI_OVERBOUGHT = _env_float("MAX_RSI_OVERBOUGHT", 70.0)
 MAX_DEBT_TO_EQUITY_PCT = _env_float("MAX_DEBT_TO_EQUITY_PCT", 100.0)

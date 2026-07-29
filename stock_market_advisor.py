@@ -58,6 +58,7 @@ import yfinance as yf
 
 import stockpredictor  # reuses LLM init, email config/credentials, and helpers
 from compliance import build_compliance_block_html
+from constants import WATCHLIST
 from swing_trade_advisor import (
     _env_int,
     generate_analysis,
@@ -73,15 +74,8 @@ SERIF = "Georgia,'Times New Roman',serif"
 # -----------------------------
 # Watchlist & sector universe
 # -----------------------------
-DEFAULT_WATCHLIST = [
-    "Reliance Industries",
-    "HDFC Bank",
-    "Infosys",
-    "Tata Consultancy Services",
-    "ICICI Bank",
-    "Larsen & Toubro",
-    "Bharti Airtel",
-]
+# WATCHLIST is imported from constants.py (previously loaded at runtime via
+# the STOCK_WATCHLIST_JSON environment variable).
 
 MARKET_TOPICS = [
     "Nifty 50", "Sensex", "Bank Nifty", "Midcap Index", "Smallcap Index",
@@ -116,24 +110,6 @@ NO_FABRICATION_NOTE = (
     "instead of inventing one."
 )
 
-
-def _load_watchlist():
-    raw = os.getenv("STOCK_WATCHLIST_JSON")
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list) and data and all(isinstance(x, str) and x.strip() for x in data):
-                return [x.strip() for x in data]
-            stockpredictor.log.warning(
-                "STOCK_WATCHLIST_JSON parsed but is not a non-empty list of "
-                "strings -- using the default watchlist instead."
-            )
-        except json.JSONDecodeError as e:
-            stockpredictor.log.warning(f"STOCK_WATCHLIST_JSON is not valid JSON ({e}) -- using the default watchlist.")
-    return DEFAULT_WATCHLIST
-
-
-WATCHLIST = _load_watchlist()
 
 # -----------------------------
 # Weekly return -- computed from real price data, not the LLM

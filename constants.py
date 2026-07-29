@@ -21,6 +21,25 @@ STOCKS = {
     "QQQ": "QQQ",
 }
 
+# Stock watchlist for stock_market_advisor.py.
+#
+# Previously supplied at runtime via the STOCK_WATCHLIST_JSON environment
+# variable (a JSON-encoded list of stock names). Now hardcoded here instead.
+# To add, remove, or rename a watchlist entry, edit this list directly.
+WATCHLIST = [
+    "Sun  Pharmaceuticals Ltd.",
+    "State Bank of India",
+    "ITC  Industries Ltd.",
+    "Tata Consultancy Services",
+    "ICICI Bank",
+    "Larsen & Toubro",
+    "Coal India Ltd.",
+    "Bharath Electrical Ltd.",
+    "Apple Inc.",
+    "Amazon.com Inc.",
+    "Google Alphabet Inc.",
+]
+
 # Mutual fund portfolio for mutual_fund_advisor.py.
 #
 # Previously supplied at runtime via the MF_PORTFOLIO_JSON environment
