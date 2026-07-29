@@ -72,15 +72,9 @@ SERIF = "Georgia,'Times New Roman',serif"
 # -----------------------------
 # Portfolio & sector universe
 # -----------------------------
-DEFAULT_PORTFOLIO = [
-    "Mirae Asset Large & Midcap Fund - Direct Growth",
-    "Parag Parikh Flexi Cap Fund - Direct Growth",
-    "SBI Small Cap Fund - Direct Growth",
-    "DSP Multi Asset Fund - Direct Growth",
-    "ICICI Prudential US Bluechip Fund",
-    "ICICI Prudential Manufacturing Fund",
-    "DSP Natural Resources & New Energy Fund",
-]
+# Portfolio now lives in constants.py instead of the MF_PORTFOLIO_JSON
+# environment variable.
+from constants import MF_PORTFOLIO
 
 MARKET_TOPICS = [
     "Nifty 50", "Sensex", "Midcap Index", "Smallcap Index", "RBI",
@@ -116,23 +110,7 @@ NO_FABRICATION_NOTE = (
 )
 
 
-def _load_portfolio():
-    raw = os.getenv("MF_PORTFOLIO_JSON")
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list) and data and all(isinstance(x, str) and x.strip() for x in data):
-                return [x.strip() for x in data]
-            stockpredictor.log.warning(
-                "MF_PORTFOLIO_JSON parsed but is not a non-empty list of "
-                "strings -- using the default portfolio instead."
-            )
-        except json.JSONDecodeError as e:
-            stockpredictor.log.warning(f"MF_PORTFOLIO_JSON is not valid JSON ({e}) -- using the default portfolio.")
-    return DEFAULT_PORTFOLIO
-
-
-PORTFOLIO = _load_portfolio()
+PORTFOLIO = MF_PORTFOLIO
 
 
 def _chunks(items, size):

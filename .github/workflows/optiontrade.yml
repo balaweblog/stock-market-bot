@@ -16,7 +16,6 @@ jobs:
       EMAIL_TO: ${{ secrets.EMAIL_TO }}
       NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      STOCKS_JSON: ${{ secrets.STOCKS_JSON }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       DRY_RUN: ${{ github.event.inputs.dry_run }}
       TAVILY_API_KEY : ${{ secrets.TAVILY_API_KEY }}
