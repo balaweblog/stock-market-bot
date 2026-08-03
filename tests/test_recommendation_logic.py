@@ -7,7 +7,15 @@ import pandas as pd
 from commodity_tracker import CommodityTracker
 from position_sizing import apply_risk_management
 from recommendation_logic import derive_commodity_buy_levels
-from stockpredictor import build_fundamentals_html, build_quick_summary, calculate_52_week_range, calculate_risk_meter
+from stockpredictor import (
+    build_data_quality_banner,
+    build_executive_summary_html,
+    build_fundamentals_html,
+    build_market_takeaway_banner,
+    build_quick_summary,
+    calculate_52_week_range,
+    calculate_risk_meter,
+)
 
 
 class RecommendationLogicTests(unittest.TestCase):
@@ -176,6 +184,77 @@ class RecommendationLogicTests(unittest.TestCase):
         self.assertIn("18.5%", html)
         self.assertIn("Debt/Equity", html)
         self.assertIn("42.7", html)
+
+    def test_build_data_quality_banner_flags_missing_core_fields(self):
+        html = build_data_quality_banner(
+            [
+                {"ticker": "AAPL", "recommendation": "Buy", "decision_note": "Strong setup", "current_price": 100},
+                {"ticker": "TSLA", "recommendation": "", "decision_note": "", "current_price": None},
+            ],
+            section_name="stocks",
+        )
+
+        self.assertIn("Data quality", html)
+        self.assertIn("1/2", html)
+        self.assertIn("missing core fields", html)
+
+    def test_build_market_takeaway_banner_creates_headline_and_watch_items(self):
+        html = build_market_takeaway_banner(
+            buy_count=2,
+            hold_count=1,
+            sell_count=0,
+            err_count=0,
+            summary_rows=[{"stock_name": "SBIN", "signal": "BUY", "current_price": 100, "recommended_buy_level": 102}],
+            commodity_bullets_by_metal={"gold": ["✅ Buy Signal: Gold at ₹70"], "silver": []},
+        )
+
+        self.assertIn("Market takeaway", html)
+        self.assertIn("What to watch next", html)
+        self.assertIn("Buy ideas", html)
+
+    def test_build_market_takeaway_banner_highlights_priority_watch_items(self):
+        html = build_market_takeaway_banner(
+            buy_count=1,
+            hold_count=2,
+            sell_count=1,
+            err_count=0,
+            summary_rows=[
+                {"stock_name": "SBIN", "signal": "BUY", "current_price": 100, "recommended_buy_level": 102},
+                {"stock_name": "ICICI", "signal": "HOLD", "current_price": 105, "recommended_buy_level": 103},
+                {"stock_name": "ITC", "signal": "SELL", "current_price": 95, "recommended_buy_level": 98},
+            ],
+            commodity_bullets_by_metal={"gold": ["✅ Gold is holding support"], "silver": []},
+        )
+
+        self.assertIn("Top things to watch", html)
+        self.assertIn("ICICI", html)
+        self.assertIn("Gold", html)
+
+    def test_build_executive_summary_html_uses_polished_brief_copy(self):
+        html = build_executive_summary_html(
+            us_block_html="<div>US view</div>",
+            india_block_html="<div>India view</div>",
+            gold_block_html="<div>Gold view</div>",
+            silver_block_html="<div>Silver view</div>",
+        )
+
+        self.assertIn("Executive Brief", html)
+        self.assertIn("near-term view", html)
+
+    def test_email_html_includes_commodity_section_when_available(self):
+        commodity_row_html = """
+            <tr>
+              <td style="padding:0 28px 20px;" class="email-padding">
+                <h2>Commodities (2)</h2>
+              </td>
+            </tr>
+        """
+        email_html = (
+            "<html></html>"
+            + commodity_row_html
+        )
+
+        self.assertIn("Commodities (2)", email_html)
 
 
 if __name__ == "__main__":

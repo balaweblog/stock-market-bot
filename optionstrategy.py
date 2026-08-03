@@ -96,7 +96,7 @@ EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_P
 # threshold -- see compute_bid_ask_spread_pct().
 MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
 
-HORIZON_ORDER = ["Weekly", "Monthly"]
+HORIZON_ORDER = ["Weekly"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
@@ -2402,9 +2402,8 @@ def build_prompt(live_data=None):
 
 {live_data_block}
 
-Analyze current market conditions and determine the optimal strategy stance independently across TWO distinct time horizons:
+Analyze current market conditions and determine the optimal strategy stance for the weekly options view. Focus on one weekly expiry and provide multiple complementary weekly recommendations that can be considered together.
 1. Nifty Weekly -- (current/nearest weekly expiry)
-2. Nifty Monthly -- (current monthly expiry)
 
 --------------------------------------------------------------------------------
 STRATEGY & LEGS CONSTRAINT:
@@ -2450,11 +2449,14 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
       "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
       "confidence": "High",
-      "data_status": "live"
-    }},
-    {{ "horizon": "Monthly", ... same fields ... }}
+      "data_status": "live",
+      "weekly_recommendations": [
+        {{"label": "Primary", "strategy_name": "Bull Call Spread", "legs": "Buy 24000 CE, Sell 24200 CE", "reason": "Primary directional view"}},
+        {{"label": "Alternative", "strategy_name": "Iron Condor", "legs": "Sell 24100 PE, Buy 23900 PE, Sell 24250 CE, Buy 24450 CE", "reason": "Range-bound hedge if price stays near the current zone"}}
+      ]
+    }}
   ],
-  "portfolio_view": "One paragraph on overall market gap risk and cross-horizon alignment."
+  "portfolio_view": "One paragraph on overall market gap risk and the weekly setup."
 }}
 """
 
@@ -2597,6 +2599,37 @@ def _execution_cell_html(h, sans, expiry):
     ])
 
 
+def _normalize_weekly_recommendations(h):
+    raw_recommendations = h.get("weekly_recommendations") or []
+    if isinstance(raw_recommendations, list) and raw_recommendations:
+        normalized = []
+        for entry in raw_recommendations:
+            if not isinstance(entry, dict):
+                continue
+            normalized.append({
+                "label": str(entry.get("label") or "Option").strip() or "Option",
+                "strategy_name": str(entry.get("strategy_name") or h.get("strategy_name") or "").strip(),
+                "legs": str(entry.get("legs") or h.get("legs") or "").strip(),
+                "reason": str(entry.get("reason") or entry.get("strike_rationale") or h.get("strike_rationale") or "").strip(),
+            })
+        if normalized:
+            return normalized
+
+    primary = {
+        "label": "Primary",
+        "strategy_name": str(h.get("strategy_name") or "").strip(),
+        "legs": str(h.get("legs") or "").strip(),
+        "reason": str(h.get("strike_rationale") or h.get("bias_reason") or "").strip(),
+    }
+    alternative = {
+        "label": "Alternative",
+        "strategy_name": primary["strategy_name"],
+        "legs": primary["legs"],
+        "reason": primary["reason"],
+    }
+    return [primary, alternative]
+
+
 def _horizon_card_html(h, sans, serif):
     name = _esc(h.get("horizon"))
     expiry = _esc(h.get("expiry_date"))
@@ -2617,6 +2650,12 @@ def _horizon_card_html(h, sans, serif):
             f'<td style="padding:6px 10px;font-size:12px;font-family:{sans};'
             f'color:#14213D;border-top:1px solid #EDEAE2;">{cell_html or "—"}</td></tr>'
         )
+
+    recommendations = _normalize_weekly_recommendations(h)
+    recommendation_rows = "".join(
+        f'<tr><td style="padding:8px 10px;font-size:12px;font-family:{sans};color:#4A5063;border-top:1px solid #EDEAE2;width:38%;">{html.escape(rec["label"])}</td><td style="padding:8px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{html.escape(rec["strategy_name"])}<br><span style="color:#4A5063;">{html.escape(rec["legs"])}<br>{html.escape(rec["reason"])}</span></td></tr>'
+        for rec in recommendations
+    )
 
     rows = "".join([
         row("Strategy", "strategy_name", bold=True),
@@ -2649,6 +2688,7 @@ def _horizon_card_html(h, sans, serif):
         row("Adjustment / Exit Trigger", "adjustment_trigger"),
         *([row("Reward : Risk", "reward_risk_ratio")] if h.get("reward_risk_ratio") else []),
         row("Trade Quality Score", "trade_quality_score"),
+        raw_row("Weekly Recommendations", recommendation_rows),
         raw_row("Confidence", _confidence_cell_html(h, sans)),
         raw_row("Data Freshness", _data_status_badge(h.get("data_status"))),
         row("Payoff Verification", "verification"),

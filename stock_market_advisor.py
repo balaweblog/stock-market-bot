@@ -291,8 +291,15 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (
         }}
       ],
       "corporate_actions": "Earnings, buybacks, splits, bonus issues, board changes, M&A, or capex announcements this week -- or 'No material disclosed changes found this window' if none verifiable",
-      "weekly_return_pct": "Approximate % price move this window as a plain number string (e.g. '2.4'), or null if not verifiable",
+      "weekly_return_pct": "Approximate % price move this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'weekly_return_pct' only.",
       "analyst_view": "Any analyst rating/target-price change mentioned, or 'No update found this window'",
+      "current_price": "Latest price as a plain number string, or 'Not disclosed'",
+      "market_cap_cr": "Market cap in ₹ crore as a plain number string, or 'Not disclosed'",
+      "pe_ratio": "PE ratio as a plain number string, or 'Not disclosed'",
+      "sector": "Sector name or 'Not disclosed'",
+      "beta": "Beta as a plain number string, or 'Not disclosed'",
+      "risk_level": "Low | Medium | High or 'Not disclosed'",
+      "decision_note": "One short sentence on why this stock is attractive, neutral, or unattractive for a short-term or swing-trading investor",
       "assessment": "Positive | Neutral | Negative",
       "short_term_outlook": "1-4 week outlook, 1-2 sentences",
       "recommendation": "Strong Buy | Buy | Hold | Review | Reduce | Exit"
@@ -568,6 +575,65 @@ def render_executive_summary(market_data, synthesis_data):
     """
 
 
+def _format_weekly_return_display(stock_data):
+    for key in ("weekly_return_pct", "weekly_return", "weekly_return_percent", "return_pct"):
+        value = stock_data.get(key)
+        if value in (None, "", "null", "None"):
+            continue
+        if isinstance(value, (int, float)):
+            return f"{value}%"
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned in ("", "null", "None"):
+                continue
+            if cleaned.endswith("%"):
+                return cleaned
+            return f"{cleaned}%"
+    return "n/a"
+
+
+def _decision_signal_text(stock_data):
+    explicit_signal = stock_data.get("decision_signal") or stock_data.get("decision_signal_label")
+    if explicit_signal:
+        return str(explicit_signal), _reco_color(stock_data.get("recommendation"))
+
+    reco = (stock_data.get("recommendation") or "").strip()
+    assess = (stock_data.get("assessment") or "").strip()
+    pieces = []
+    if reco and reco.lower() not in ("-", "none"):
+        pieces.append(reco)
+    if assess and assess.lower() not in ("-", "none"):
+        pieces.append(assess)
+    if not pieces:
+        pieces.append("Review")
+    return " / ".join(pieces), _reco_color(reco) if reco else _sentiment_color(assess)
+
+
+def _quality_status(stock_data):
+    decision_note = str(stock_data.get("decision_note") or "").strip()
+    recommendation = str(stock_data.get("recommendation") or "").strip()
+    assessment = str(stock_data.get("assessment") or "").strip()
+    current_price = stock_data.get("current_price")
+    if decision_note and recommendation and assessment:
+        return "Verified", "#1E7A46"
+    if decision_note and current_price not in (None, "", "null", "None"):
+        return "Verified", "#1E7A46"
+    if decision_note or current_price not in (None, "", "null", "None"):
+        return "Partial", "#B08D57"
+    return "Needs review", "#B0473F"
+
+
+def _action_now_text(stock_data):
+    reco = (stock_data.get("recommendation") or "").strip().lower()
+    if reco in {"strong buy", "buy"}:
+        return "Add on pullbacks or near support; keep position size disciplined."
+    if reco in {"hold", "review"}:
+        return "Wait for confirmation and a clearer catalyst before adding."
+    if reco in {"reduce", "exit", "sell"}:
+        return "Reduce exposure or avoid new entry until the setup improves."
+    return "Monitor the setup and wait for a clearer confirmation signal."
+
+
 def render_stock_cards(stocks_data):
     if not stocks_data:
         return _section_title("2. Watchlist Stock Analysis") + (
@@ -577,20 +643,59 @@ def render_stock_cards(stocks_data):
     for st in stocks_data:
         name = st.get("stock_name", "Unknown Stock")
         news = st.get("news_timeline") or []
-        news_html = "".join(
-            f'<div style="margin:0 0 10px;padding:8px 10px;background:#F8F7F3;border-left:3px solid #B08D57;border-radius:2px;">'
-            f'<div style="font-family:{SANS};font-size:11px;color:#8A8F9C;">{_esc(n.get("date",""))} &middot; Confidence: {_esc(n.get("confidence","-"))}</div>'
-            f'<div style="font-family:{SANS};font-size:12.5px;font-weight:700;color:#14213D;margin:2px 0;">{_esc(n.get("headline",""))}</div>'
-            f'<div style="font-family:{SANS};font-size:12px;color:#4A5063;">{_esc(n.get("summary",""))}</div>'
-            f'<div style="font-family:{SANS};font-size:11.5px;color:#4A5063;margin-top:3px;"><em>Why it matters:</em> {_esc(n.get("why_it_matters",""))} &middot; Impact: {_esc(n.get("impact_on_stock","-"))}</div>'
-            f'</div>'
-            for n in news
-        ) or f'<p style="font-family:{SANS};font-size:12px;color:#8A8F9C;">No dated news items found this window.</p>'
+        news_html = ""
+        if news:
+            for n in news:
+                headline = n.get("headline") or "No major news found"
+                summary = n.get("summary") or "No significant news or announcements were found for this company in the given time window."
+                confidence = n.get("confidence") or "Low"
+                date_text = n.get("date") or "Not specified"
+                why_it_matters = n.get("why_it_matters") or "The evidence is limited or not independently verifiable this run."
+                impact = n.get("impact_on_stock") or "Neutral"
+                badge_color = "#B0473F" if str(confidence).lower() == "low" else "#B08D57"
+                news_html += (
+                    f'<div style="margin:0 0 10px;padding:8px 10px;background:#F8F7F3;border-left:3px solid {badge_color};border-radius:2px;">'
+                    f'<div style="font-family:{SANS};font-size:11px;color:#8A8F9C;">{_esc(date_text)} &middot; Confidence: {_esc(confidence)}</div>'
+                    f'<div style="font-family:{SANS};font-size:12.5px;font-weight:700;color:#14213D;margin:2px 0;">{_esc(headline)}</div>'
+                    f'<div style="font-family:{SANS};font-size:12px;color:#4A5063;">{_esc(summary)}</div>'
+                    f'<div style="font-family:{SANS};font-size:11.5px;color:#4A5063;margin-top:3px;"><em>Why it matters:</em> {_esc(why_it_matters)} &middot; Impact: {_esc(impact)}</div>'
+                    f'</div>'
+                )
+        else:
+            news_html = f'<p style="font-family:{SANS};font-size:12px;color:#8A8F9C;">No dated news items found this window.</p>'
 
         reco = st.get("recommendation", "-")
         assess = st.get("assessment", "-")
-        ret = st.get("weekly_return_pct")
-        ret_str = f"{ret}%" if ret not in (None, "", "null") else "n/a"
+        ret_str = _format_weekly_return_display(st)
+        signal_text, signal_color = _decision_signal_text(st)
+        quality_status, quality_color = _quality_status(st)
+        action_now = _action_now_text(st)
+
+        snapshot_items = [
+            ("Price", st.get("current_price") or "Not disclosed"),
+            ("MCap (₹ Cr)", st.get("market_cap_cr") or "Not disclosed"),
+            ("PE", st.get("pe_ratio") or "Not disclosed"),
+            ("Sector", st.get("sector") or "Not disclosed"),
+            ("Beta", st.get("beta") or "Not disclosed"),
+            ("Risk", st.get("risk_level") or "Not disclosed"),
+        ]
+        snapshot_html = "".join(
+            f'<tr><td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{_esc(label)}</div>'
+            f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:#14213D;">{_esc(value)}</div></td>'
+            f'<td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;">'
+            f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{_esc(next_label)}</div>'
+            f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:#14213D;">{_esc(next_value)}</div></td></tr>'
+            for (label, value), (next_label, next_value) in zip(snapshot_items[::2], snapshot_items[1::2])
+        )
+        if len(snapshot_items) % 2 == 1:
+            last_label, last_value = snapshot_items[-1]
+            snapshot_html += (
+                f'<tr><td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;">'
+                f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{_esc(last_label)}</div>'
+                f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:#14213D;">{_esc(last_value)}</div></td>'
+                f'<td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;"></td></tr>'
+            )
 
         cards.append(f"""
         <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
@@ -608,6 +713,24 @@ def render_stock_cards(stocks_data):
               {news_html}
               <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 4px;">Corporate Actions</div>
               <p style="margin:0;font-family:{SANS};font-size:12px;color:#4A5063;">{_esc(st.get("corporate_actions","-"))}</p>
+              <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 4px;">Snapshot</div>
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:4px;border-collapse:collapse;">
+                <tbody>
+                  {snapshot_html}
+                </tbody>
+              </table>
+              <p style="margin:8px 0 0;font-family:{SANS};font-size:12px;color:#4A5063;line-height:1.6;white-space:pre-wrap;word-break:break-word;"><strong>Decision note:</strong> {_esc(st.get("decision_note","-"))}</p>
+              <div style="margin-top:10px;padding:8px 10px;background:#F8F7F3;border:1px solid #E7E4DC;border-radius:4px;">
+                <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.04em;">Decision Signal</div>
+                <div style="margin-top:4px;display:inline-block;padding:3px 10px;border-radius:999px;background:{signal_color}1A;color:{signal_color};font-family:{SANS};font-size:12px;font-weight:700;">{_esc(signal_text)}</div>
+                <div style="margin-top:6px;font-family:{SANS};font-size:11px;color:#4A5063;">
+                  <span style="display:inline-block;padding:2px 8px;border-radius:999px;background:{quality_color}1A;color:{quality_color};font-weight:700;">{_esc(quality_status)}</span>
+                </div>
+              </div>
+              <div style="margin-top:10px;padding:8px 10px;background:#fffdf8;border:1px solid #F2E2BF;border-radius:4px;">
+                <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.04em;">Action now</div>
+                <div style="margin-top:4px;font-family:{SANS};font-size:12px;color:#14213D;line-height:1.5;">{_esc(action_now)}</div>
+              </div>
               <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:10px;">
                 <tr>
                   <td style="width:33%;padding:6px 0;font-family:{SANS};font-size:11px;color:#8A8F9C;">Approx. Weekly Return<br>

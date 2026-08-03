@@ -1321,7 +1321,7 @@ def _fund_color(label, raw_value):
             return "#d97706", "Weak", "#d97706"
         return "#dc2626", "Negative", "#dc2626"
 
-    if label == "Debt / Equity":
+    if label == "Debt/Equity":
         if v < 30:
             return "#047857", "Low debt", "#047857"
         if v < 100:
@@ -1395,7 +1395,7 @@ def build_fundamentals_html(fundamentals, fund_score):
                                             {_tile("Dividend Yield", div_raw,  div_fmt, right=True)}
                                         </tr>
                                         <tr>
-                                            {_tile("Debt / Equity",  debt_raw, debt_fmt)}
+                                            {_tile("Debt/Equity",  debt_raw, debt_fmt)}
                                             <td style="width:50%;padding:0 0 6px 6px;vertical-align:top;"></td>
                                         </tr>
                                     </table>
@@ -1928,15 +1928,11 @@ def _relative_day_label(value):
     return f"{abs(delta_days)} days ago"
 
 
-def build_quick_summary(rows):
+def build_quick_summary_groups(rows):
     """
     Builds compact, human-readable summary bullets for the top of the
     report, grouped first by market (US / India) and then by recommendation
-    (Buy / Hold / Sell) within each market -- mirroring the Portfolio
-    Heatmap's US / India / Commodities grouping so the Executive Summary
-    reads the same way at a glance.
-    Returns a dict: {"US": {"Buy": [...], "Hold": [...], "Sell": [...]},
-                     "India": {"Buy": [...], "Hold": [...], "Sell": [...]}}.
+    (Buy / Hold / Sell) within each market.
     """
     groups = {
         "US": {"Buy": [], "Hold": [], "Sell": []},
@@ -1950,7 +1946,13 @@ def build_quick_summary(rows):
     for row in rows:
         group_key = priority_to_group.get(row.get("priority"))
         if group_key is None:
-            continue  # errors aren't actionable in the quick summary
+            signal = str(row.get("signal") or "").upper()
+            if "SELL" in signal:
+                group_key = "Sell"
+            elif "BUY" in signal:
+                group_key = "Buy"
+            else:
+                group_key = "Hold"
 
         market_key = classify_market(row.get("ticker"))
         if market_key not in groups:
@@ -1965,7 +1967,7 @@ def build_quick_summary(rows):
         upcoming_events = row.get("upcoming_events") or {}
 
         if "BUY" in signal and current_price is not None and recommended_buy_level is not None and current_price < recommended_buy_level:
-            market_bucket[group_key].append(f"✅ {stock_name} below ₹{recommended_buy_level}")
+            market_bucket[group_key].append(f"✅ Buy: {stock_name} below ₹{recommended_buy_level}")
             continue
 
         results_date = upcoming_events.get("results_announcement_date")
@@ -1973,9 +1975,9 @@ def build_quick_summary(rows):
             short_date = _format_short_date(results_date)
             relative_label = _relative_day_label(results_date)
             if relative_label == "today":
-                market_bucket[group_key].append(f"📊 {stock_name} results today")
+                market_bucket[group_key].append(f"✅ Watch: {stock_name} results today")
             else:
-                market_bucket[group_key].append(f"📊 {stock_name} results on {short_date or results_date}")
+                market_bucket[group_key].append(f"✅ Watch: {stock_name} results on {short_date or results_date}")
             continue
 
         dividend_date = upcoming_events.get("dividend_record_date")
@@ -1991,6 +1993,144 @@ def build_quick_summary(rows):
             market_bucket[group_key].append(f"⚠ {stock_name} below EMA20—avoid adding")
 
     return groups
+
+
+def build_data_quality_banner(items, section_name="items"):
+    """Build a compact banner that surfaces missing or weak data quality issues."""
+    if not items:
+        return ""
+
+    missing_count = 0
+    for item in items:
+        if not item:
+            continue
+        if not item.get("recommendation") or not str(item.get("recommendation", "")).strip():
+            missing_count += 1
+        if not item.get("decision_note") or not str(item.get("decision_note", "")).strip():
+            missing_count += 1
+        if item.get("current_price") in (None, "", "null", "None"):
+            missing_count += 1
+
+    if missing_count == 0:
+        return ""
+
+    display_name = section_name.replace("_", " ").strip() or "items"
+    missing_items = sum(1 for item in items if item and (
+        not item.get("recommendation") or not str(item.get("recommendation", "")).strip()
+        or not item.get("decision_note") or not str(item.get("decision_note", "")).strip()
+        or item.get("current_price") in (None, "", "null", "None")
+    ))
+    return f"""
+        <tr>
+          <td style="padding:0 28px 10px;" class="email-padding">
+            <div style="border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:4px;background:#fff7ed;padding:10px 12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#92400e;">
+              <strong>Data quality:</strong> {missing_items}/{len(items)} {display_name} are missing core fields or have incomplete context. Review the source data before acting on the recommendation.
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_market_takeaway_banner(buy_count, hold_count, sell_count, err_count, summary_rows, commodity_bullets_by_metal):
+    """Build an executive-style top-of-email banner with a concise market takeaway and watchlist."""
+    if not summary_rows and not commodity_bullets_by_metal.get("gold") and not commodity_bullets_by_metal.get("silver"):
+        return ""
+
+    buy_items = [item for item in summary_rows if str(item.get("signal") or "").upper().startswith("BUY")]
+    watch_items = [item for item in summary_rows if str(item.get("signal") or "").upper() in {"HOLD", "SELL"}]
+
+    buy_excerpt = ""
+    if buy_items:
+        first_buy = buy_items[0]
+        stock_name = first_buy.get("stock_name") or "a stock"
+        buy_excerpt = f"{stock_name} is the clearest near-term opportunity right now."
+    else:
+        buy_excerpt = "The setup is still selective; no strong buy idea is standing out yet."
+
+    watch_items_html = ""
+    if watch_items:
+        watch_items_html = "<div style=\"margin-top:6px;font-size:12px;color:#4A5063;\">What to watch next: " + html.escape(", ".join(
+            str(item.get("stock_name") or "") for item in watch_items[:3] if item.get("stock_name")
+        )) + "</div>"
+    elif buy_items:
+        watch_items_html = "<div style=\"margin-top:6px;font-size:12px;color:#4A5063;\">What to watch next: Follow the data-quality and price confirmation signals before adding more.</div>"
+
+    commodity_watch = []
+    for bullets in commodity_bullets_by_metal.values():
+        commodity_watch.extend(bullets[:1])
+    commodity_html = ""
+    if commodity_watch:
+        commodity_html = '<div style="margin-top:6px;font-size:12px;color:#4A5063;">Commodity pulse: ' + html.escape(" | ".join(commodity_watch[:2])) + '</div>'
+
+    priority_watch_items = []
+    for item in watch_items[:2]:
+        stock_name = str(item.get("stock_name") or "").strip()
+        if stock_name:
+            priority_watch_items.append(stock_name)
+    if commodity_watch:
+        priority_watch_items.append("Commodity pulse")
+
+    priority_watch_html = ""
+    if priority_watch_items:
+        priority_watch_html = '<div style="margin-top:8px;padding:7px 10px;border-radius:4px;background:#F6F3EA;font-size:12px;color:#4A5063;">Top things to watch: ' + html.escape(" • ".join(priority_watch_items[:3])) + '</div>'
+
+    if buy_count > 0 and sell_count == 0:
+        posture_label, posture_color, posture_bg = "Bullish", "#1E7A46", "#EAF7EE"
+    elif sell_count > 0 and buy_count == 0:
+        posture_label, posture_color, posture_bg = "Cautious", "#B0473F", "#FBEAEA"
+    else:
+        posture_label, posture_color, posture_bg = "Neutral", "#8A6D1D", "#FDF3D9"
+
+    return f"""
+        <tr>
+          <td style="padding:0 28px 10px;" class="email-padding">
+            <div style="border:1px solid #E7E4DC;border-left:4px solid #B08D57;border-radius:4px;background:#FCFBF8;padding:12px 14px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+                <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.08em;">Market takeaway</div>
+                <div style="display:inline-block;padding:3px 10px;border-radius:999px;background:{posture_bg};color:{posture_color};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;">Risk posture: {posture_label}</div>
+              </div>
+              <div style="margin-top:6px;font-family:Georgia,'Times New Roman',serif;font-size:15px;font-weight:600;color:#14213D;">{html.escape(buy_excerpt)}</div>
+              <div style="margin-top:8px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#4A5063;">Buy ideas: <strong>{buy_count}</strong> &nbsp;&middot;&nbsp; Hold: <strong>{hold_count}</strong> &nbsp;&middot;&nbsp; Sell: <strong>{sell_count}</strong>{f' &nbsp;&middot;&nbsp; Errors: <strong>{err_count}</strong>' if err_count else ''}</div>
+              {watch_items_html}
+              {priority_watch_html}
+              {commodity_html}
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_executive_summary_html(us_block_html, india_block_html, gold_block_html, silver_block_html):
+    """Build a polished executive brief block for the top of the email/report."""
+    if not any([us_block_html, india_block_html, gold_block_html, silver_block_html]):
+        return ""
+
+    return f"""
+        <tr>
+          <td style="padding:0 28px 14px;" class="email-padding">
+            <div style="border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;background:#FAF9F6;padding:14px 16px;">
+              <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.08em;">Executive Brief</div>
+              <div style="margin-top:4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#4A5063;">A concise near-term view of the market, the watchlist, and the most actionable signals.</div>
+              {us_block_html}
+              {india_block_html}
+              {gold_block_html}
+              {silver_block_html}
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_quick_summary(rows):
+    """
+    Builds a compact, human-readable summary string for the top of the report.
+    """
+    groups = build_quick_summary_groups(rows)
+    items = []
+    for market_key in ("US", "India"):
+        for group_key in ("Buy", "Hold", "Sell"):
+            items.extend(groups[market_key][group_key])
+    return "\n".join(items)
 
 
 # Thresholds for the Action Plan table's buy-zone classification. Tunable
@@ -2861,6 +3001,17 @@ def main(mode, use_llm, detailed_llm=False):
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
     formatted_date_ist = now_ist.strftime('%A, %d %B %Y, %I:%M %p %Z')
 
+    data_quality_banner_html = build_data_quality_banner(summary_rows, section_name="stocks")
+
+    market_takeaway_html = build_market_takeaway_banner(
+        buy_count=buy_count,
+        hold_count=hold_count,
+        sell_count=sell_count,
+        err_count=err_count,
+        summary_rows=summary_rows,
+        commodity_bullets_by_metal=commodity_bullets_by_metal,
+    )
+
     summary_html = f"""
         <tr>
           <td style="padding:18px 28px;border-top:1px solid #EDEAE2;" class="email-padding">
@@ -2877,7 +3028,7 @@ def main(mode, use_llm, detailed_llm=False):
         </tr>
     """
 
-    quick_summary_groups = build_quick_summary(summary_rows)
+    quick_summary_groups = build_quick_summary_groups(summary_rows)
 
     # Fetch commodity data early so we can include it in the quick summary
     # and reuse the same data object when rendering the full section below.
@@ -3013,21 +3164,12 @@ def main(mode, use_llm, detailed_llm=False):
     gold_block_html = _es_commodity_block("🥇 Gold (22K)", commodity_bullets_by_metal.get("gold") or [])
     silver_block_html = _es_commodity_block("🥈 Silver", commodity_bullets_by_metal.get("silver") or [])
 
-    quick_summary_html = ""
-    if us_block_html or india_block_html or gold_block_html or silver_block_html:
-        quick_summary_html = f"""
-            <tr>
-              <td style="padding:0 28px 14px;" class="email-padding">
-                <div style="border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;background:#FAF9F6;padding:14px 16px;">
-                  <div style="font-family:{sans_es};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;letter-spacing:0.08em;">Executive Summary</div>
-                  {us_block_html}
-                  {india_block_html}
-                  {gold_block_html}
-                  {silver_block_html}
-                </div>
-              </td>
-            </tr>
-        """
+    quick_summary_html = build_executive_summary_html(
+        us_block_html=us_block_html,
+        india_block_html=india_block_html,
+        gold_block_html=gold_block_html,
+        silver_block_html=silver_block_html,
+    )
 
     # India rendered before US: on a large report (many stocks / detailed
     # LLM mode) Gmail clips the message around ~102 KB and everything past
@@ -3171,8 +3313,10 @@ def main(mode, use_llm, detailed_llm=False):
         + quick_jump_html
         + ai_portfolio_story_html
         + track_record_html
+        + market_takeaway_html
         + quick_summary_html
         + action_plan_html
+        + data_quality_banner_html
         + summary_html
         + commodity_row_html
         + concentration_alert_html
@@ -3183,13 +3327,24 @@ def main(mode, use_llm, detailed_llm=False):
     # Email gets the Portfolio Heatmap + Quick Summary, PLUS the small AI
     # Portfolio Story paragraph (one professional-level summary combining
     # every stock's AI Stock Story, from the same single combined AI call
-    # -- no extra AI request). The full per-stock "portfolio" breakdown
-    # (summary/commodity cards/concentration alerts/detailed stock cards
-    # with their individual AI Stock Story bullets) is dropped from the
-    # inline message and lives only in the attached PDF -- keeps the email
-    # short and avoids Gmail's ~102 KB body-clipping entirely rather than
-    # just working around it.
-    email_html = report_html_header + quick_jump_html + ai_portfolio_story_html + track_record_html + quick_summary_html + action_plan_html + footer_html
+    # -- no extra AI request). We also include the commodity section here,
+    # because the gold/silver cards are important for the email reader and
+    # were previously omitted despite being built above. The full per-stock
+    # "portfolio" breakdown is still dropped from the inline message and
+    # remains only in the attached PDF -- keeps the email short and avoids
+    # Gmail's ~102 KB body-clipping entirely rather than just working around it.
+    email_html = (
+        report_html_header
+        + quick_jump_html
+        + ai_portfolio_story_html
+        + track_record_html
+        + market_takeaway_html
+        + quick_summary_html
+        + action_plan_html
+        + data_quality_banner_html
+        + commodity_row_html
+        + footer_html
+    )
 
     # Persist this run's state so the next run can diff signals/prices
     # against it (change badges, breach alerts, commodity streaks).

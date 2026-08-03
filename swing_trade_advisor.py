@@ -114,6 +114,11 @@ def _fmt_num(x):
     return f"{x:g}"
 
 
+REQUIRE_PROFESSIONAL_QUALITY_GATE = os.getenv("REQUIRE_PROFESSIONAL_QUALITY_GATE", "true").lower() == "true"
+MIN_COMPOSITE_SCORE = _env_float("MIN_COMPOSITE_SCORE", 72.0)
+MAX_POSITION_SIZE_PCT = _env_float("MAX_POSITION_SIZE_PCT", 5.0)
+
+
 # -----------------------------
 # Deterministic fundamentals screen (replaces LLM-driven Stage-1 discovery)
 # -----------------------------
@@ -943,6 +948,7 @@ Mandatory technical / sentiment / risk filters:
 - Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
 - Risk/reward: minimum 1:{_fmt_num(MIN_RISK_REWARD)} based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
 - Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
+- Only include a stock if it can be supported by verified current data and internally consistent numbers; if any required value is unverifiable, inconsistent, or weak, return an empty list rather than forcing a pick.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
 
@@ -1829,6 +1835,23 @@ def _hard_contradictions(stock):
     return [n for n, sev in (stock.get("_verification_notes") or []) if sev == "hard"]
 
 
+def _passes_professional_quality_gate(stock):
+    notes = stock.get("_verification_notes") or []
+    if not stock.get("current_price_display"):
+        return False, "Missing a verified live price for the trade setup"
+    if any(sev == "nodata" for _, sev in notes):
+        return False, "At least one required data source could not be verified"
+
+    composite = stock.get("_composite_score")
+    if composite is not None and composite < MIN_COMPOSITE_SCORE:
+        return False, f"Composite score {composite:.1f}/100 is below the professional minimum {MIN_COMPOSITE_SCORE:.1f}/100"
+
+    allocation = _parse_first_number(stock.get("allocation_pct"))
+    if allocation is not None and allocation > MAX_POSITION_SIZE_PCT:
+        return False, f"Allocation {allocation:.1f}% exceeds the professional cap of {MAX_POSITION_SIZE_PCT:.1f}%"
+    return True, None
+
+
 def _split_qualifying(stocks):
     """
     Splits verified stocks into (qualifying, rejected). A stock qualifies only if
@@ -1839,7 +1862,17 @@ def _split_qualifying(stocks):
     """
     qualifying, rejected = [], []
     for s in stocks:
-        (rejected if _hard_contradictions(s) else qualifying).append(s)
+        if _hard_contradictions(s):
+            rejected.append(s)
+            continue
+        if REQUIRE_PROFESSIONAL_QUALITY_GATE:
+            passes, reason = _passes_professional_quality_gate(s)
+            if not passes:
+                s.setdefault("_verification_notes", [])
+                s["_verification_notes"] = list(s.get("_verification_notes") or []) + [(reason, "hard")]
+                rejected.append(s)
+                continue
+        qualifying.append(s)
     return qualifying, rejected
 
 
@@ -1982,6 +2015,13 @@ def render_stock_table_html(stocks):
     )
 
 
+def _choose_analysis_html(qualifying, candidates, rejected, require_qualifying_stock=True):
+    if qualifying:
+        return render_stock_table_html(qualifying)
+    if require_qualifying_stock:
+        return _no_qualifying_stock_html(rejected or candidates)
+    return render_stock_table_html(candidates)
+
 
 def _no_qualifying_stock_html(rejected):
     """
@@ -2011,11 +2051,25 @@ def _no_qualifying_stock_html(rejected):
         ranked = scoring.rank_by_composite([s for s in rejected if "_composite_score" in s])
         unscored = [s for s in rejected if "_composite_score" not in s]  # e.g. Stage-1 fundamentals-only rejections
         display_list = (ranked + unscored)[-6:] if not ranked else ranked[:6]
+
+        def _summary_for_rejected(s):
+            notes = [n for n, sev in (s.get("_verification_notes") or []) if sev in ("hard", "nodata")]
+            if not notes:
+                return "no hard contradiction surfaced"
+            concise = []
+            for note in notes[:3]:
+                text = note.split(" -- ", 1)[0]
+                text = text.replace("contradicts the 'low debt-to-equity' requirement.", "failed low debt/equity")
+                text = text.replace("contradicts the 'high/improving ROCE/ROE' requirement.", "failed ROE strength")
+                text = text.replace("the prompt requires.", "missed the required threshold")
+                concise.append(text)
+            return "; ".join(concise)
+
         items = "".join(
             f'<div style="margin-top:8px;font-family:{sans};font-size:12px;color:#4A5063;">'
             f'<strong style="color:#14213D;">{html.escape(str(s.get("name") or s.get("ticker") or "Unnamed"))}</strong>'
             + (f' &mdash; composite {s["_composite_score"]:.1f}/100' if "_composite_score" in s else "")
-            + f' &mdash; rejected: {html.escape("; ".join(n for n, sev in (s.get("_verification_notes") or []) if sev in ("hard", "nodata")) or "unspecified")}'
+            + f' &mdash; {html.escape(_summary_for_rejected(s))}'
             "</div>"
             for s in display_list
         )
@@ -2464,7 +2518,12 @@ def run():
         )
 
         if qualifying or not REQUIRE_QUALIFYING_STOCK:
-            analysis_html = render_stock_table_html(qualifying or stocks)
+            analysis_html = _choose_analysis_html(
+                qualifying=qualifying,
+                candidates=stocks,
+                rejected=rejected,
+                require_qualifying_stock=REQUIRE_QUALIFYING_STOCK,
+            )
             break
 
         stockpredictor.log.info(

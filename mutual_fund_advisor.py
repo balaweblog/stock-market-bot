@@ -209,8 +209,17 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (
         }}
       ],
       "portfolio_changes": "New additions, exits, increased/reduced holdings, sector-allocation shifts, cash allocation, AUM change, or fund-manager updates this month -- or 'No material disclosed changes found this window' if none verifiable",
-      "monthly_return_pct": "Approximate % return this window as a plain number string (e.g. '2.4'), or null if not verifiable",
+      "monthly_return_pct": "Approximate % return this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'monthly_return_pct' only.",
       "benchmark_comparison": "How the fund did vs its benchmark/category this window",
+      "fund_category": "Short fund category label, e.g. 'Large & Mid Cap' or 'Flexi Cap'",
+      "benchmark": "Benchmark name or 'Not disclosed'",
+      "nav_latest": "Latest NAV as a plain number string, or 'Not disclosed'",
+      "aum_cr": "Latest AUM in ₹ crore as a plain number string, or 'Not disclosed'",
+      "expense_ratio_pct": "Latest expense ratio as a plain number string (e.g. '0.84'), or 'Not disclosed'",
+      "one_year_return_pct": "Latest 1-year return as a plain number string, or 'Not disclosed'",
+      "three_year_return_pct": "Latest 3-year return as a plain number string, or 'Not disclosed'",
+      "risk_level": "Low | Medium | High | Very High or 'Not disclosed'",
+      "decision_note": "One short sentence on why this fund is attractive, neutral, or unattractive for a long-term SIP investor",
       "assessment": "Positive | Neutral | Negative",
       "short_term_outlook": "3-6 month outlook, 1-2 sentences",
       "long_term_outlook": "5-20 year outlook, 1-2 sentences",
@@ -507,6 +516,44 @@ def render_executive_summary(market_data, synthesis_data):
     """
 
 
+def _format_monthly_return_display(fund_data):
+    for key in ("monthly_return_pct", "monthly_return", "monthly_return_percent", "return_pct"):
+        value = fund_data.get(key)
+        if value in (None, "", "null", "None"):
+            continue
+        if isinstance(value, (int, float)):
+            return f"{value}%"
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned in ("", "null", "None"):
+                continue
+            if cleaned.endswith("%"):
+                return cleaned
+            return f"{cleaned}%"
+    return "n/a"
+
+
+def _quality_status(fund_data):
+    decision_note = str(fund_data.get("decision_note") or "").strip()
+    nav = fund_data.get("nav_latest")
+    if decision_note and nav not in (None, "", "null", "None"):
+        return "Verified", "#1E7A46"
+    if decision_note or nav not in (None, "", "null", "None"):
+        return "Partial", "#B08D57"
+    return "Needs review", "#B0473F"
+
+
+def _action_now_text(fund_data):
+    reco = (fund_data.get("recommendation") or "").strip().lower()
+    if reco in {"strong buy", "buy", "continue sip"}:
+        return "Consider adding gradually and monitor the fund’s positioning versus its benchmark."
+    if reco in {"hold", "review"}:
+        return "Wait for a clearer trend shift before changing SIP or allocation."
+    if reco in {"reduce", "exit", "sell"}:
+        return "Trim exposure and reassess if the fund’s risk profile or flows weaken."
+    return "Monitor the fund with a long-term lens and reassess on a new data point."
+
+
 def render_fund_cards(funds_data):
     if not funds_data:
         return _section_title("2. Fund-wise Analysis") + (
@@ -528,17 +575,45 @@ def render_fund_cards(funds_data):
 
         reco = f.get("recommendation", "-")
         assess = f.get("assessment", "-")
-        ret = f.get("monthly_return_pct")
-        ret_str = f"{ret}%" if ret not in (None, "", "null") else "n/a"
+        ret_str = _format_monthly_return_display(f)
+        quality_status, quality_color = _quality_status(f)
+        action_now = _action_now_text(f)
+
+        snapshot_items = [
+            ("Category", f.get("fund_category") or "Not disclosed"),
+            ("Benchmark", f.get("benchmark") or "Not disclosed"),
+            ("NAV", f.get("nav_latest") or "Not disclosed"),
+            ("AUM (₹ Cr)", f.get("aum_cr") or "Not disclosed"),
+            ("Expense", f.get("expense_ratio_pct") or "Not disclosed"),
+            ("1Y", f.get("one_year_return_pct") or "Not disclosed"),
+            ("3Y", f.get("three_year_return_pct") or "Not disclosed"),
+            ("Risk", f.get("risk_level") or "Not disclosed"),
+        ]
+        snapshot_html = ""
+        for idx in range(0, len(snapshot_items), 2):
+            row_items = snapshot_items[idx:idx+2]
+            row_cells = "".join(
+                f'<td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;">'
+                f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{_esc(label)}</div>'
+                f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:#14213D;">{_esc(value)}</div></td>'
+                for label, value in row_items
+            )
+            snapshot_html += f'<tr>{row_cells}</tr>'
 
         cards.append(f"""
         <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
                style="margin:14px 0;border:1px solid #E7E4DC;border-radius:6px;overflow:hidden;border-collapse:collapse;">
           <tr>
             <td style="padding:10px 14px;background:#14213D;">
-              <span style="font-family:{SERIF};font-size:14.5px;color:#ffffff;">{_esc(name)}</span>
-              <span style="float:right;font-family:{SANS};font-size:11px;font-weight:700;color:{_reco_color(reco)};
-                    background:#ffffff;padding:2px 10px;border-radius:12px;">{_esc(reco)}</span>
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+                <tr>
+                  <td style="font-family:{SERIF};font-size:14.5px;color:#ffffff;vertical-align:middle;">{_esc(name)}</td>
+                  <td style="text-align:right;vertical-align:middle;">
+                    <span style="font-family:{SANS};font-size:11px;font-weight:700;color:{_reco_color(reco)};
+                          background:#ffffff;padding:2px 10px;border-radius:12px;display:inline-block;">{_esc(reco)}</span>
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
           <tr>
@@ -546,7 +621,21 @@ def render_fund_cards(funds_data):
               <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:6px;">News Timeline</div>
               {news_html}
               <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 4px;">Portfolio Changes</div>
-              <p style="margin:0;font-family:{SANS};font-size:12px;color:#4A5063;">{_esc(f.get("portfolio_changes","-"))}</p>
+              <p style="margin:0;font-family:{SANS};font-size:12px;color:#4A5063;line-height:1.6;white-space:pre-wrap;word-break:break-word;">{_esc(f.get("portfolio_changes","-"))}</p>
+              <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.05em;margin:10px 0 4px;">Snapshot</div>
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:4px;border-collapse:collapse;">
+                <tbody>
+                  {snapshot_html}
+                </tbody>
+              </table>
+              <p style="margin:8px 0 0;font-family:{SANS};font-size:12px;color:#4A5063;line-height:1.6;white-space:pre-wrap;word-break:break-word;"><strong>Decision note:</strong> {_esc(f.get("decision_note","-"))}</p>
+              <div style="margin-top:10px;padding:8px 10px;background:#fffdf8;border:1px solid #F2E2BF;border-radius:4px;">
+                <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.04em;">Action now</div>
+                <div style="margin-top:4px;font-family:{SANS};font-size:12px;color:#14213D;line-height:1.5;">{_esc(action_now)}</div>
+              </div>
+              <div style="margin-top:8px;font-family:{SANS};font-size:11px;color:#4A5063;">
+                <span style="display:inline-block;padding:2px 8px;border-radius:999px;background:{quality_color}1A;color:{quality_color};font-weight:700;">{_esc(quality_status)}</span>
+              </div>
               <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:10px;">
                 <tr>
                   <td style="width:33%;padding:6px 0;font-family:{SANS};font-size:11px;color:#8A8F9C;">Approx. Monthly Return<br>

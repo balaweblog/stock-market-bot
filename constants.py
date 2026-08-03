@@ -19,6 +19,9 @@ STOCKS = {
     "Goog": "GOOG",
     "AMZN": "AMZN",
     "QQQ": "QQQ",
+    "KALYANJEWEL": "KALYANJEWEL.NS",
+    "CHENNPETRO": "CHENNPETRO.NS",
+    "BAJFINANCE": "BAJFINANCE.NS"
 }
 
 # Stock watchlist for stock_market_advisor.py.
@@ -27,17 +30,20 @@ STOCKS = {
 # variable (a JSON-encoded list of stock names). Now hardcoded here instead.
 # To add, remove, or rename a watchlist entry, edit this list directly.
 WATCHLIST = [
-    "Sun  Pharmaceuticals Ltd.",
+    "Sun Pharmaceutical Industries Ltd.",
     "State Bank of India",
-    "ITC  Industries Ltd.",
-    "Tata Consultancy Services",
-    "ICICI Bank",
-    "Larsen & Toubro",
+    "ITC Ltd.",
+    "Tata Consultancy Services Ltd.",
+    "ICICI Bank Ltd.",
+    "Larsen & Toubro Ltd.",
     "Coal India Ltd.",
-    "Bharath Electrical Ltd.",
+    "Bharat Electronics Ltd.",
     "Apple Inc.",
-    "Amazon.com Inc.",
-    "Google Alphabet Inc.",
+    "Amazon.com, Inc.",
+    "Alphabet Inc.",
+    "Kalyan Jewellers India Ltd.",
+    "Chennai Petroleum Corporation Ltd.",
+    "Bajaj Finance Ltd."
 ]
 
 # Mutual fund portfolio for mutual_fund_advisor.py.
@@ -52,4 +58,5 @@ MF_PORTFOLIO = [
     "DSP Multi Asset Fund - Direct Growth",
     "ICICI Prudential Manufacturing Fund",
     "DSP Natural Resources & New Energy Fund",
+    "Nippon India Gold Savings Fund"
 ]
