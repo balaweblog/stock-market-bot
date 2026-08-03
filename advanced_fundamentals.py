@@ -103,7 +103,12 @@ def score_advanced_fundamentals(data):
         score += 10
     if data.get("quick_ratio") is not None and data["quick_ratio"] > 0.8:
         score += 10
-    if data.get("debt_to_equity") is not None and data["debt_to_equity"] < 100:
+    # BUG FIX: the previous check `debt_to_equity < 100` awarded 15 bonus
+    # points to companies with a NEGATIVE D/E ratio. A negative D/E means
+    # total liabilities exceed total equity (book insolvency) -- exactly the
+    # opposite of a healthy balance sheet. Guard with `>= 0` so only companies
+    # with genuine low positive leverage qualify for the bonus.
+    if data.get("debt_to_equity") is not None and 0 <= data["debt_to_equity"] < 100:
         score += 15
     if data.get("free_cash_flow") is not None and data["free_cash_flow"] > 0:
         score += 10

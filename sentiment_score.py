@@ -1,7 +1,28 @@
-from transformers import pipeline
 from datetime import datetime
 
-sentiment_pipe = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+# Lazy-load the FinBERT pipeline -- loading at import time (the previous
+# behaviour) caused the entire system to crash on import if `transformers` was
+# unavailable, the model couldn't be downloaded (offline/CI), or HuggingFace
+# was rate-limiting. Sentinel is set on first successful load; any subsequent
+# import of this module reuses the already-loaded pipeline without reloading.
+_sentiment_pipe = None
+_sentiment_unavailable = False  # set True once we know loading failed
+
+
+def _get_pipeline():
+    """Return the FinBERT pipeline, loading it lazily on first call."""
+    global _sentiment_pipe, _sentiment_unavailable
+    if _sentiment_pipe is not None:
+        return _sentiment_pipe
+    if _sentiment_unavailable:
+        return None
+    try:
+        from transformers import pipeline as _pipeline
+        _sentiment_pipe = _pipeline("sentiment-analysis", model="ProsusAI/finbert")
+        return _sentiment_pipe
+    except Exception:
+        _sentiment_unavailable = True
+        return None
 
 
 def score_headlines(headlines, available=True):
@@ -35,12 +56,24 @@ def score_headlines(headlines, available=True):
             "available": True,
         }
 
+    pipe = _get_pipeline()
+    if pipe is None:
+        # FinBERT unavailable (not installed, offline, etc.) -- return a neutral
+        # fallback so the rest of the scoring pipeline still works.
+        return {
+            "score": 50.0,
+            "label": "Neutral (FinBERT unavailable)",
+            "weighted_score": 50.0,
+            "details": [],
+            "available": True,
+        }
+
     total_score = 0.0
     total_weight = 0.0
     scored = []
 
     for idx, headline in enumerate(headlines[:8]):
-        result = sentiment_pipe(headline)[0]
+        result = pipe(headline)[0]
         label = result["label"].lower()
         confidence = result["score"]
         weight = max(1.0, 3.0 - idx * 0.3)

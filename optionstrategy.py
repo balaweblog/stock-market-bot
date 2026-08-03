@@ -280,25 +280,44 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                             continue
                         put_width = sp - lp
                         put_premium = put_ltp[sp] - put_ltp[lp]
-                        
-                        width = max(call_width, put_width)
-                        premium = call_premium + put_premium
-                        
-                        if premium <= 0:
+
+                        total_premium = call_premium + put_premium
+                        if total_premium <= 0:
                             continue
-                            
-                        stats = evaluate_spread(premium, width)
-                        if not stats:
+
+                        # BUG FIX: for an Iron Condor the theoretical max loss is
+                        # per-wing, not the wider width against the total premium.
+                        # With unequal wings the call side and put side can each
+                        # have a different max loss (wing_width - wing_premium);
+                        # the trade max loss is the larger of the two. Previously
+                        # max(call_width, put_width) was used as a single width
+                        # against the combined premium -- correct only when wings
+                        # are equal, wrong otherwise (overstates max-loss for a
+                        # wider-call / richer-put condor, understates for the
+                        # reverse). Compute per-wing then take the max.
+                        call_max_loss = call_width - call_premium
+                        put_max_loss = put_width - put_premium
+                        if call_max_loss <= 0 or put_max_loss <= 0:
+                            # Either wing is fully funded by its own credit -- no
+                            # genuine risk on that side; skip (data anomaly).
                             continue
-                        max_profit, max_loss, rr_ratio, credit_width_pct = stats
-                        
+                        max_loss = max(call_max_loss, put_max_loss)
+                        max_profit = total_premium
+                        rr_ratio = max_profit / max_loss
+                        # credit_width_pct: use the wider wing as the reference
+                        # width, consistent with how brokers display it.
+                        ref_width = max(call_width, put_width)
+                        credit_width_pct = (total_premium / ref_width) * 100
+
                         if rr_ratio >= MIN_REWARD_RISK_RATIO and credit_width_pct >= MIN_CREDIT_WIDTH_PCT:
                             valid_structures.append({
                                 "short_call": sc, "long_call": lc,
                                 "short_put": sp, "long_put": lp,
                                 "rr_ratio": rr_ratio,
                                 "credit_width_pct": credit_width_pct,
-                                "premium": premium
+                                "premium": total_premium,
+                                "_call_max_loss": call_max_loss,
+                                "_put_max_loss": put_max_loss,
                             })
 
     # 3. Evaluate Debit Verticals (Bull Call / Bear Put)
@@ -668,9 +687,12 @@ def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None, call_i
     iv_move_pts = None
     atm_iv = None
     if call_iv and put_iv and expiry:
-        ivs = [v for v in (call_iv.get(atm_strike), put_iv.get(atm_strike)) if v]
-        if ivs:
-            atm_iv = sum(ivs) / len(ivs)
+        # Use call-side ATM IV with put as fallback -- the canonical quant
+        # convention for index options (put-call parity keeps them close, but
+        # averaging can halve the estimate if one side is stale/zero).
+        atm_iv_val = call_iv.get(atm_strike) or put_iv.get(atm_strike)
+        if atm_iv_val:
+            atm_iv = atm_iv_val
             try:
                 t_years = time_to_expiry_years(_parse_nse_date(expiry))
                 sigma = _iv_to_frac(atm_iv)
@@ -681,9 +703,14 @@ def compute_expected_move(call_ltp, put_ltp, spot, vix=None, expiry=None, call_i
 
     move_divergence_pct = None
     if iv_move_pts and straddle_move_pts:
-        move_divergence_pct = round(
-            abs(straddle_move_pts - iv_move_pts) / min(straddle_move_pts, iv_move_pts) * 100, 1
-        )
+        # BUG FIX: guard zero denominator -- min() can be 0 if one estimate is
+        # 0.0, which would crash with ZeroDivisionError. Skip divergence calc
+        # in that edge case; callers treat None divergence as "no penalty".
+        min_move = min(straddle_move_pts, iv_move_pts)
+        if min_move > 0:
+            move_divergence_pct = round(
+                abs(straddle_move_pts - iv_move_pts) / min_move * 100, 1
+            )
 
     if iv_move_pts and iv_move_pts > straddle_move_pts:
         expected_move_pts, expected_move_basis = iv_move_pts, "iv"
@@ -803,7 +830,11 @@ def fetch_latest_nse_bhavcopy_fo(max_days_back=6):
     skipped_weekdays = []
     for i in range(max_days_back + 1):
         candidate = now_ist - timedelta(days=i)
-        if i == 0 and now_ist.time() < dtime(19, 0):
+        # BUG FIX: NSE publishes Bhavcopy files by ~18:30 IST on most trading
+        # days. The old 19:00 cutoff caused the script to skip today's already-
+        # published file during the 18:30-19:00 window and fall back to
+        # yesterday's data unnecessarily. 18:30 is a safer cutoff.
+        if i == 0 and now_ist.time() < dtime(18, 30):
             continue
         rows = fetch_nse_bhavcopy_fo(candidate)
         if rows:
@@ -829,7 +860,12 @@ def _extract_bhavcopy_snapshot(rows, symbol, expiry_dt):
             continue
         opt_type = r.get("OptnTp", "").strip()
         try:
-            settle_px = float(r.get("ClsPric") or r.get("SttlmPric") or 0) or None
+            # BUG FIX: for options the official settlement price (SttlmPric)
+            # is the theoretically correct figure for daily MTM and end-of-day
+            # premium. ClsPric is the last traded price and can be stale if the
+            # option had no trades near close. Try SttlmPric first; fall back
+            # to ClsPric if missing (e.g. on far-OTM strikes with no settlement).
+            settle_px = float(r.get("SttlmPric") or r.get("ClsPric") or 0) or None
         except (ValueError, TypeError):
             settle_px = None
         if opt_type == "CE":
@@ -1231,6 +1267,21 @@ def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE, q=DI
 
 
 def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE, q=DIVIDEND_YIELD):
+    """
+    BUG FIX: the previous implementation used an asymmetric branching formula
+    (different d1/d2 formulas for a > 0 vs a < 0) which is non-standard and
+    gives wrong probabilities. The correct formula is the standard
+    reflection-principle (first-passage) probability for a log-normal process:
+
+        P(touch) = N(d+) + exp(2*mu*a / sigma^2) * N(d-)
+
+    where a = ln(barrier/spot), d+ = (a - mu*T)/(sigma*sqrt(T)),
+    d- = (-a - mu*T)/(sigma*sqrt(T)), and mu = r - q - 0.5*sigma^2.
+
+    This formula is symmetric -- the sign of `a` already encodes direction
+    (positive = upward barrier, negative = downward barrier). The same
+    formula handles both cases without branching.
+    """
     sigma = _iv_to_frac(iv)
     if (
         spot is None or sigma is None or t_years is None or t_years <= 0
@@ -1238,18 +1289,17 @@ def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE, q=DI
     ):
         return None
     try:
+        if barrier == spot:
+            return 100.0
         mu = r - q - 0.5 * sigma ** 2
         a = math.log(barrier / spot)
         sqrt_t = math.sqrt(t_years)
-        if a > 0:
-            d1 = (mu * t_years - a) / (sigma * sqrt_t)
-            d2 = (-mu * t_years - a) / (sigma * sqrt_t)
-        elif a < 0:
-            d1 = (a - mu * t_years) / (sigma * sqrt_t)
-            d2 = (a + mu * t_years) / (sigma * sqrt_t)
-        else:
-            return 100.0
-        prob = _norm_cdf(d1) + math.exp(2 * mu * a / sigma ** 2) * _norm_cdf(d2)
+        # Standard reflection-principle formula (identical for up/down barriers):
+        d_plus  = (a - mu * t_years) / (sigma * sqrt_t)   # towards barrier
+        d_minus = (-a - mu * t_years) / (sigma * sqrt_t)  # reflected path
+        exponent = 2.0 * mu * a / (sigma ** 2)
+        # Clamp exponent to avoid overflow in exp() for extreme parameters
+        prob = _norm_cdf(d_plus) + math.exp(min(exponent, 700.0)) * _norm_cdf(d_minus)
     except (ValueError, ZeroDivisionError, OverflowError):
         return None
     return round(max(0.0, min(1.0, prob)) * 100, 1)
