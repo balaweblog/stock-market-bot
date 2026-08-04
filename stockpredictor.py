@@ -3001,33 +3001,6 @@ def main(mode, use_llm, detailed_llm=False):
     now_ist = now_utc.astimezone(ZoneInfo("Asia/Kolkata"))
     formatted_date_ist = now_ist.strftime('%A, %d %B %Y, %I:%M %p %Z')
 
-    data_quality_banner_html = build_data_quality_banner(summary_rows, section_name="stocks")
-
-    market_takeaway_html = build_market_takeaway_banner(
-        buy_count=buy_count,
-        hold_count=hold_count,
-        sell_count=sell_count,
-        err_count=err_count,
-        summary_rows=summary_rows,
-        commodity_bullets_by_metal=commodity_bullets_by_metal,
-    )
-
-    summary_html = f"""
-        <tr>
-          <td style="padding:18px 28px;border-top:1px solid #EDEAE2;" class="email-padding">
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-              <tr>
-                <td>
-                  <h2 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:17px;color:#14213D;">Portfolio Snapshot</h2>
-                </td>
-                <td style="text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;">{formatted_date_ist}</td>
-              </tr>
-            </table>
-            <p style="margin:8px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#4A5063;">Coverage: <strong style="color:#14213D;">{len(rows)}</strong> symbols &nbsp;&middot;&nbsp; Buy: <strong style="color:#2F5233;">{buy_count}</strong> &nbsp;&middot;&nbsp; Hold: <strong style="color:#8A6D3B;">{hold_count}</strong> &nbsp;&middot;&nbsp; Sell: <strong style="color:#8B2E2E;">{sell_count}</strong>{f' &nbsp;&middot;&nbsp; Errors: <strong style="color:#8B2E2E;">{err_count}</strong>' if err_count else ''}</p>
-          </td>
-        </tr>
-    """
-
     quick_summary_groups = build_quick_summary_groups(summary_rows)
 
     # Fetch commodity data early so we can include it in the quick summary
@@ -3102,6 +3075,33 @@ def main(mode, use_llm, detailed_llm=False):
                 commodity_bullets_by_metal[metal_key].append(
                     f"⬛ {metal} {direction} {change_sign}{change}% — stable"
                 )
+
+    data_quality_banner_html = build_data_quality_banner(summary_rows, section_name="stocks")
+
+    market_takeaway_html = build_market_takeaway_banner(
+        buy_count=buy_count,
+        hold_count=hold_count,
+        sell_count=sell_count,
+        err_count=err_count,
+        summary_rows=summary_rows,
+        commodity_bullets_by_metal=commodity_bullets_by_metal,
+    )
+
+    summary_html = f"""
+        <tr>
+          <td style="padding:18px 28px;border-top:1px solid #EDEAE2;" class="email-padding">
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+              <tr>
+                <td>
+                  <h2 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:17px;color:#14213D;">Portfolio Snapshot</h2>
+                </td>
+                <td style="text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;">{formatted_date_ist}</td>
+              </tr>
+            </table>
+            <p style="margin:8px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#4A5063;">Coverage: <strong style="color:#14213D;">{len(rows)}</strong> symbols &nbsp;&middot;&nbsp; Buy: <strong style="color:#2F5233;">{buy_count}</strong> &nbsp;&middot;&nbsp; Hold: <strong style="color:#8A6D3B;">{hold_count}</strong> &nbsp;&middot;&nbsp; Sell: <strong style="color:#8B2E2E;">{sell_count}</strong>{f' &nbsp;&middot;&nbsp; Errors: <strong style="color:#8B2E2E;">{err_count}</strong>' if err_count else ''}</p>
+          </td>
+        </tr>
+    """
 
     # Build the Executive Summary grouped by US Stocks / India Stocks / Gold /
     # Silver -- the same grouping and visual language as the Portfolio

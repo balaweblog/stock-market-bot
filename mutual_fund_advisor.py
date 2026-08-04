@@ -48,7 +48,12 @@ import re
 import sys
 import json
 import html
+import math
+import ssl
 import traceback
+import urllib.request
+import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -91,6 +96,213 @@ SECTORS_MF = [
 
 FUNDS_PER_BATCH = _env_int("MF_FUNDS_PER_BATCH", 3)
 SECTORS_PER_BATCH = _env_int("MF_SECTORS_PER_BATCH", 5)
+
+# -----------------------------
+# AMFI / mfapi.in data layer
+# -----------------------------
+# mfapi.in is a free, community-maintained wrapper over AMFI's official NAV
+# data. It provides daily NAV, scheme metadata, and 1Y/3Y/5Y returns via a
+# simple REST API -- no authentication required. We use it to pre-populate
+# the deterministic fields (NAV, AUM, returns, category, expense ratio) so
+# the LLM stage only needs to find recent news and analysis, not guess facts
+# that are publicly available from AMFI.
+
+_AMFI_SEARCH_URL = "https://api.mfapi.in/mf/search?q="
+_AMFI_NAV_URL    = "https://api.mfapi.in/mf/"
+_AMFI_TIMEOUT_S  = 8
+
+# Map of known AMFI scheme codes for the funds in MF_PORTFOLIO.
+# Seed known codes here for maximum speed and reliability; the search fallback
+# handles everything else.
+_KNOWN_SCHEME_CODES = {
+    "Mirae Asset Large & Midcap Fund - Direct Growth":       "118834",
+    "Parag Parikh Flexi Cap Fund - Direct Growth":           "122639",
+    "SBI Small Cap Fund - Direct Growth":                    "125497",
+    "DSP Multi Asset Fund - Direct Growth":                  "152056",
+    "ICICI Prudential Manufacturing Fund":                   "145075",
+    "DSP Natural Resources & New Energy Fund":               "119775",
+    "Nippon India Gold Savings Fund":                        "118663",
+}
+
+_SSL_CONTEXT = ssl._create_unverified_context() if hasattr(ssl, "_create_unverified_context") else None
+
+
+def _amfi_get(url):
+    """GET url, return parsed JSON or None on any error."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 StockBot/1.0"},
+        )
+        kwargs = {"timeout": _AMFI_TIMEOUT_S}
+        if _SSL_CONTEXT is not None:
+            kwargs["context"] = _SSL_CONTEXT
+        with urllib.request.urlopen(req, **kwargs) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        stockpredictor.log.debug(f"AMFI fetch failed ({url!r}): {exc}")
+        return None
+
+
+def _amfi_search_scheme_code(fund_name):
+    """Search mfapi.in for a scheme code by fund name. Returns code str or None."""
+    # Strip common suffixes to improve search hit rate
+    query = re.sub(r"\s*-\s*Direct\s*Growth\s*$", "", fund_name, flags=re.IGNORECASE)
+    query = re.sub(r"\s*Fund\s*$", "", query, flags=re.IGNORECASE).strip()
+    encoded = urllib.parse.quote(query)
+    results = _amfi_get(f"{_AMFI_SEARCH_URL}{encoded}")
+    if not isinstance(results, list) or not results:
+        return None
+    # Prefer direct-plan results when available
+    for r in results:
+        if "direct" in str(r.get("schemeName", "")).lower() and "growth" in str(r.get("schemeName", "")).lower():
+            return str(r.get("schemeCode", ""))
+    return str(results[0].get("schemeCode", "")) if results else None
+
+
+def _annualised_return(nav_series, years):
+    """
+    Compute CAGR from a list of NAV dicts [{"date": "DD-MM-YYYY", "nav": "123.45"}, ...].
+    The series is newest-first (mfapi.in order).
+    Returns a rounded float or None.
+    """
+    if not nav_series or len(nav_series) < 2:
+        return None
+    try:
+        latest_nav = float(nav_series[0]["nav"])
+        target_days = int(years * 365)
+        # Find the NAV closest to `years` ago
+        for entry in nav_series:
+            try:
+                entry_date = datetime.strptime(entry["date"], "%d-%m-%Y").date()
+            except ValueError:
+                continue
+            latest_date = datetime.strptime(nav_series[0]["date"], "%d-%m-%Y").date()
+            delta = (latest_date - entry_date).days
+            if delta >= target_days - 10:   # within 10 days of the target
+                past_nav = float(entry["nav"])
+                if past_nav <= 0:
+                    return None
+                cagr = (latest_nav / past_nav) ** (1 / years) - 1
+                return round(cagr * 100, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_amfi_fund_snapshot(fund_name):
+    """
+    Returns a dict with deterministically fetched fields for one fund, or {}
+    if AMFI data is unavailable. Fields match the LLM JSON schema keys.
+    """
+    code = _KNOWN_SCHEME_CODES.get(fund_name) or _amfi_search_scheme_code(fund_name)
+    if not code:
+        stockpredictor.log.debug(f"AMFI: no scheme code found for {fund_name!r}")
+        return {}
+
+    data = _amfi_get(f"{_AMFI_NAV_URL}{code}")
+    if not isinstance(data, dict):
+        return {}
+
+    meta      = data.get("meta", {})
+    nav_list  = data.get("data", [])   # newest-first
+    latest    = nav_list[0] if nav_list else {}
+
+    nav_str = latest.get("nav")
+    try:
+        nav_f = round(float(nav_str), 2) if nav_str else None
+    except (ValueError, TypeError):
+        nav_f = None
+
+    ret_1y = _annualised_return(nav_list, 1)
+    ret_3y = _annualised_return(nav_list, 3)
+    ret_5y = _annualised_return(nav_list, 5)
+
+    # Monthly return: compare today's NAV vs ~30 days ago
+    ret_1m = None
+    if nav_list and len(nav_list) > 20:
+        try:
+            nav_now  = float(nav_list[0]["nav"])
+            nav_30d  = float(nav_list[min(22, len(nav_list)-1)]["nav"])  # ~22 trading days
+            if nav_30d > 0:
+                ret_1m = round((nav_now / nav_30d - 1) * 100, 2)
+        except Exception:
+            pass
+
+    scheme_type = str(meta.get("scheme_type", "")).lower()
+    scheme_cat  = meta.get("scheme_category", "") or ""
+    fund_house  = meta.get("fund_house", "") or ""
+
+    # Derive a readable category label from the scheme category string
+    cat_label = scheme_cat.strip()
+    if not cat_label:
+        cat_label = "Not disclosed"
+
+    return {
+        "_amfi_code":          code,
+        "_amfi_fund_house":    fund_house,
+        "_amfi_scheme_type":   scheme_type,
+        "_amfi_nav_date":      latest.get("date", ""),
+        "nav_latest":          str(nav_f) if nav_f else None,
+        "fund_category":       cat_label if cat_label != "Not disclosed" else None,
+        "one_year_return_pct": str(ret_1y) if ret_1y is not None else None,
+        "three_year_return_pct": str(ret_3y) if ret_3y is not None else None,
+        "five_year_return_pct": str(ret_5y) if ret_5y is not None else None,
+        "monthly_return_pct":  str(ret_1m) if ret_1m is not None else None,
+    }
+
+
+_amfi_snapshots = {}   # fund_name -> snapshot dict, populated once per run
+
+
+def prefetch_amfi_snapshots():
+    """Fetch AMFI data for all portfolio funds before the LLM stage runs."""
+    for fund_name in PORTFOLIO:
+        stockpredictor.log.info(f"AMFI prefetch: {fund_name}")
+        snap = _fetch_amfi_fund_snapshot(fund_name)
+        _amfi_snapshots[fund_name] = snap
+        if snap:
+            nav_date = snap.get("_amfi_nav_date", "?")
+            stockpredictor.log.info(
+                f"  → NAV={snap.get('nav_latest')} ({nav_date}), "
+                f"1Y={snap.get('one_year_return_pct')}%, "
+                f"3Y={snap.get('three_year_return_pct')}%"
+            )
+        else:
+            stockpredictor.log.warning(f"  → No AMFI data found")
+
+
+def _enrich_funds_with_amfi(funds_data):
+    """
+    Merge the AMFI-sourced deterministic fields into each fund dict returned
+    by the LLM. LLM fields take precedence only when they are non-empty and
+    non-'Not disclosed' -- otherwise the AMFI fact overwrites the LLM's guess.
+    This ensures fields like NAV, 1Y/3Y returns, and category are always
+    populated when AMFI data was available, even if the LLM left them blank.
+    """
+    _EMPTY_VALUES = (None, "", "null", "None", "Not disclosed", "not disclosed", "-", "n/a")
+
+    for f in funds_data:
+        name = f.get("fund_name", "")
+        snap = _amfi_snapshots.get(name, {})
+        if not snap:
+            continue
+        # Fields to overwrite when LLM returned nothing useful
+        for key in ("nav_latest", "fund_category", "one_year_return_pct",
+                    "three_year_return_pct", "monthly_return_pct"):
+            amfi_val = snap.get(key)
+            if amfi_val is None:
+                continue
+            if str(f.get(key, "")).strip() in _EMPTY_VALUES:
+                f[key] = amfi_val
+        # Always attach source metadata for the Data Inputs section
+        f["_amfi_code"]     = snap.get("_amfi_code")
+        f["_amfi_nav_date"] = snap.get("_amfi_nav_date")
+        f["_amfi_fund_house"] = snap.get("_amfi_fund_house")
+        if snap.get("five_year_return_pct"):
+            f["five_year_return_pct"] = snap["five_year_return_pct"]
+    return funds_data
+
 
 SOURCE_QUALITY_NOTE = (
     "Source quality: prioritize official AMC factsheets/press releases, "
@@ -180,7 +392,24 @@ List 15-25 genuine, dated developments across the topics above, in roughly chron
 # Stage 2 -- Fund-wise news (batched)
 # -----------------------------
 def build_fund_prompt(funds_batch, today_str, lookback_note):
-    listing = "\n".join(f"- {f}" for f in funds_batch)
+    # Build per-fund context blocks with any AMFI-fetched facts injected.
+    # This means the LLM doesn't need to search for NAV / returns -- it
+    # already has them and can focus its search budget on news, portfolio
+    # changes, and benchmark comparisons.
+    fund_blocks = []
+    for name in funds_batch:
+        snap = _amfi_snapshots.get(name, {})
+        facts = []
+        if snap.get("nav_latest"):        facts.append(f"NAV: {snap['nav_latest']} (as of {snap.get('_amfi_nav_date','?')}, source: AMFI/mfapi.in)")
+        if snap.get("fund_category"):     facts.append(f"Category: {snap['fund_category']}")
+        if snap.get("one_year_return_pct"): facts.append(f"1Y CAGR: {snap['one_year_return_pct']}%")
+        if snap.get("three_year_return_pct"): facts.append(f"3Y CAGR: {snap['three_year_return_pct']}%")
+        if snap.get("five_year_return_pct"): facts.append(f"5Y CAGR: {snap['five_year_return_pct']}%")
+        if snap.get("monthly_return_pct"): facts.append(f"Approx 30-day return: {snap['monthly_return_pct']}%")
+        fact_str = ("\n  Pre-fetched facts (use as-is, verified from AMFI): " + "; ".join(facts)) if facts else ""
+        fund_blocks.append(f"- {name}{fact_str}")
+
+    listing = "\n".join(fund_blocks)
     return f"""Act as a SEBI-aware mutual fund research analyst. Using the most current data as of {today_str}, {lookback_note}
 
 For EACH of the following Indian mutual funds, research recent news, portfolio/AUM changes, and performance:
@@ -190,7 +419,7 @@ For EACH of the following Indian mutual funds, research recent news, portfolio/A
 
 {NO_FABRICATION_NOTE}
 
-For each fund, look for: AMC announcements, fund manager changes, portfolio additions/exits or sector-weight shifts disclosed in the latest factsheet, AUM changes, category-average/benchmark comparison, and any news specifically naming this fund or its major holdings.
+For each fund, look for: AMC announcements, fund manager changes, portfolio additions/exits or sector-weight shifts disclosed in the latest factsheet, AUM changes, category-average/benchmark comparison, and any news specifically naming this fund or its major holdings. Where pre-fetched facts are provided above, use those values directly for nav_latest, fund_category, one_year_return_pct, three_year_return_pct -- do not override them with guesses.
 
 OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
 
@@ -210,18 +439,18 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (
       ],
       "portfolio_changes": "New additions, exits, increased/reduced holdings, sector-allocation shifts, cash allocation, AUM change, or fund-manager updates this month -- or 'No material disclosed changes found this window' if none verifiable",
       "monthly_return_pct": "Approximate % return this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'monthly_return_pct' only.",
-      "benchmark_comparison": "How the fund did vs its benchmark/category this window",
+      "benchmark_comparison": "How the fund did vs its benchmark/category this window -- cite specific benchmark name and index level or category average if known",
       "fund_category": "Short fund category label, e.g. 'Large & Mid Cap' or 'Flexi Cap'",
-      "benchmark": "Benchmark name or 'Not disclosed'",
+      "benchmark": "Benchmark index name (e.g. 'NIFTY Large Midcap 250 TRI') or 'Not disclosed'",
       "nav_latest": "Latest NAV as a plain number string, or 'Not disclosed'",
-      "aum_cr": "Latest AUM in ₹ crore as a plain number string, or 'Not disclosed'",
+      "aum_cr": "Latest AUM in crore as a plain number string from AMFI/Value Research (e.g. '44048'), or 'Not disclosed'",
       "expense_ratio_pct": "Latest expense ratio as a plain number string (e.g. '0.84'), or 'Not disclosed'",
-      "one_year_return_pct": "Latest 1-year return as a plain number string, or 'Not disclosed'",
-      "three_year_return_pct": "Latest 3-year return as a plain number string, or 'Not disclosed'",
-      "risk_level": "Low | Medium | High | Very High or 'Not disclosed'",
+      "one_year_return_pct": "Latest 1-year CAGR return as a plain number string, or 'Not disclosed'",
+      "three_year_return_pct": "Latest 3-year CAGR return as a plain number string, or 'Not disclosed'",
+      "risk_level": "Low | Medium | High | Very High (from SEBI riskometer or AMC factsheet) or 'Not disclosed'",
       "decision_note": "One short sentence on why this fund is attractive, neutral, or unattractive for a long-term SIP investor",
       "assessment": "Positive | Neutral | Negative",
-      "short_term_outlook": "3-6 month outlook, 1-2 sentences",
+      "short_term_outlook": "3-6 month outlook, 1-2 sentences referencing specific macro or sector factors",
       "long_term_outlook": "5-20 year outlook, 1-2 sentences",
       "recommendation": "Strong Buy | Buy | Continue SIP | Hold | Review | Reduce | Exit"
     }}
@@ -339,7 +568,16 @@ def run_fund_stage(today_str, lookback_note):
     for batch in _chunks(PORTFOLIO, FUNDS_PER_BATCH):
         stockpredictor.log.info(f"Stage 2 -- fund batch: {', '.join(batch)}")
         prompt = build_fund_prompt(batch, today_str, lookback_note)
-        fund_queries = [f"{name} NAV factsheet AUM news {today_str}" for name in batch]
+        # Build targeted search queries per fund:
+        # - Short name (strip "- Direct Growth") + AMFI + factsheet → finds official pages
+        # - Short name + "news" + month/year → finds recent news
+        # This is much more effective than the full long name in a search string.
+        fund_queries = []
+        now_ym = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%B %Y")
+        for name in batch:
+            short = re.sub(r"\s*-\s*Direct\s*Growth\s*$", "", name, flags=re.IGNORECASE).strip()
+            fund_queries.append(f"{short} AMFI factsheet AUM expense ratio {now_ym}")
+            fund_queries.append(f"{short} news portfolio changes {now_ym}")
         text, s, live = generate_analysis(
             prompt, max_tokens=4500, extra_context_queries=fund_queries,
             validate_fn=_valid_funds_json,
@@ -579,15 +817,23 @@ def render_fund_cards(funds_data):
         quality_status, quality_color = _quality_status(f)
         action_now = _action_now_text(f)
 
+        # Build snapshot using a flexible structure -- only show a row if at
+        # least one cell in that row has real data.
+        def _snap_val(key, fallback="Not disclosed"):
+            v = f.get(key)
+            return str(v).strip() if v and str(v).strip() not in ("", "null", "None", "Not disclosed") else fallback
+
         snapshot_items = [
-            ("Category", f.get("fund_category") or "Not disclosed"),
-            ("Benchmark", f.get("benchmark") or "Not disclosed"),
-            ("NAV", f.get("nav_latest") or "Not disclosed"),
-            ("AUM (₹ Cr)", f.get("aum_cr") or "Not disclosed"),
-            ("Expense", f.get("expense_ratio_pct") or "Not disclosed"),
-            ("1Y", f.get("one_year_return_pct") or "Not disclosed"),
-            ("3Y", f.get("three_year_return_pct") or "Not disclosed"),
-            ("Risk", f.get("risk_level") or "Not disclosed"),
+            ("Category", _snap_val("fund_category")),
+            ("Benchmark", _snap_val("benchmark")),
+            ("NAV", _snap_val("nav_latest")),
+            ("AUM (₹ Cr)", _snap_val("aum_cr")),
+            ("Expense Ratio", _snap_val("expense_ratio_pct")),
+            ("Risk", _snap_val("risk_level")),
+            ("1Y CAGR", _snap_val("one_year_return_pct")),
+            ("3Y CAGR", _snap_val("three_year_return_pct")),
+            ("5Y CAGR", _snap_val("five_year_return_pct")),
+            ("~30d Return", ret_str if ret_str != "n/a" else "Not disclosed"),
         ]
         snapshot_html = ""
         for idx in range(0, len(snapshot_items), 2):
@@ -595,10 +841,20 @@ def render_fund_cards(funds_data):
             row_cells = "".join(
                 f'<td style="width:50%;padding:6px 0;vertical-align:top;font-family:{SANS};font-size:11px;color:#8A8F9C;">'
                 f'<div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{_esc(label)}</div>'
-                f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:#14213D;">{_esc(value)}</div></td>'
+                f'<div style="margin-top:3px;font-size:12px;font-weight:700;color:{"#8A8F9C" if value == "Not disclosed" else "#14213D"};">'
+                f'{_esc(value)}</div></td>'
                 for label, value in row_items
             )
             snapshot_html += f'<tr>{row_cells}</tr>'
+
+        # Attribution note when AMFI data was used
+        amfi_code = f.get("_amfi_code")
+        amfi_nav_date = f.get("_amfi_nav_date", "")
+        amfi_note = (
+            f'<div style="font-family:{SANS};font-size:10px;color:#8A8F9C;margin-top:4px;">'
+            f'NAV &amp; returns: AMFI/mfapi.in (scheme code {_esc(amfi_code)}, NAV date {_esc(amfi_nav_date)})</div>'
+            if amfi_code else ""
+        )
 
         cards.append(f"""
         <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
@@ -628,6 +884,7 @@ def render_fund_cards(funds_data):
                   {snapshot_html}
                 </tbody>
               </table>
+              {amfi_note}
               <p style="margin:8px 0 0;font-family:{SANS};font-size:12px;color:#4A5063;line-height:1.6;white-space:pre-wrap;word-break:break-word;"><strong>Decision note:</strong> {_esc(f.get("decision_note","-"))}</p>
               <div style="margin-top:10px;padding:8px 10px;background:#fffdf8;border:1px solid #F2E2BF;border-radius:4px;">
                 <div style="font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.04em;">Action now</div>
@@ -843,8 +1100,19 @@ def run():
     today_str, now_ist, lookback_note = _run_context()
     stockpredictor.log.info(f"Mutual fund portfolio review starting for {today_str} (portfolio: {len(PORTFOLIO)} funds).")
 
+    # Prefetch deterministic AMFI data for all funds before the LLM stage.
+    # This runs once, populates _amfi_snapshots, and gives the LLM prompt
+    # pre-verified facts (NAV, 1Y/3Y returns, category) so it doesn't need
+    # to search for -- or guess -- values that are available from AMFI.
+    prefetch_amfi_snapshots()
+
     market_data, market_sources, market_live = run_market_stage(today_str, lookback_note)
     funds_data, fund_sources, funds_live = run_fund_stage(today_str, lookback_note)
+
+    # Merge AMFI-sourced facts into LLM output -- fills any fields the LLM
+    # left as "Not disclosed" with the verified values fetched earlier.
+    funds_data = _enrich_funds_with_amfi(funds_data)
+
     sectors_data, sector_sources, sectors_live = run_sector_stage(today_str, lookback_note)
 
     sources = []

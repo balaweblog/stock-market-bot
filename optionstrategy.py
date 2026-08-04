@@ -96,7 +96,7 @@ EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_P
 # threshold -- see compute_bid_ask_spread_pct().
 MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
 
-HORIZON_ORDER = ["Weekly"]
+HORIZON_ORDER = ["Weekly", "Next Week", "Monthly"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
@@ -520,9 +520,10 @@ def _pick_horizon_expiry_dates(dt_list):
     if not dts:
         return {}
     weekly_dt = dts[0]
+    next_week_dt = dts[1] if len(dts) > 1 else dts[0]
     same_month = [dt for dt in dts if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
-    monthly_dt = same_month[-1] if same_month else weekly_dt
-    return {"Weekly": weekly_dt, "Monthly": monthly_dt}
+    monthly_dt = same_month[-1] if len(same_month) > 1 else (dts[-1] if len(dts) > 1 else weekly_dt)
+    return {"Weekly": weekly_dt, "Next Week": next_week_dt, "Monthly": monthly_dt}
 
 
 def _pick_horizon_expiries(expiry_dates):
@@ -2452,8 +2453,10 @@ def build_prompt(live_data=None):
 
 {live_data_block}
 
-Analyze current market conditions and determine the optimal strategy stance for the weekly options view. Focus on one weekly expiry and provide multiple complementary weekly recommendations that can be considered together.
-1. Nifty Weekly -- (current/nearest weekly expiry)
+Analyze current market conditions and determine the optimal strategy stance for three distinct horizons:
+1. Weekly -- (current/nearest weekly expiry)
+2. Next Week -- (next week's expiry)
+3. Monthly -- (current month-end expiry)
 
 --------------------------------------------------------------------------------
 STRATEGY & LEGS CONSTRAINT:
@@ -2491,22 +2494,42 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
   "horizons": [
     {{
       "horizon": "Weekly",
-      "expiry_date": "The actual expiry date for this horizon, copied EXACTLY as shown in the LIVE DATA FEED above (e.g. '24 Jul 2026').",
+      "expiry_date": "The actual expiry date for Weekly copied EXACTLY as shown in the LIVE DATA FEED above.",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data you found, referencing specific OI levels or PCR where relevant.",
+      "bias_reason": "One or two sentences grounded in the live data for Weekly.",
       "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
       "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
       "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
       "confidence": "High",
-      "data_status": "live",
-      "weekly_recommendations": [
-        {{"label": "Primary", "strategy_name": "Bull Call Spread", "legs": "Buy 24000 CE, Sell 24200 CE", "reason": "Primary directional view"}},
-        {{"label": "Alternative", "strategy_name": "Iron Condor", "legs": "Sell 24100 PE, Buy 23900 PE, Sell 24250 CE, Buy 24450 CE", "reason": "Range-bound hedge if price stays near the current zone"}}
-      ]
+      "data_status": "live"
+    }},
+    {{
+      "horizon": "Next Week",
+      "expiry_date": "The actual expiry date for Next Week copied EXACTLY as shown in the LIVE DATA FEED above.",
+      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "n/a",
+      "bias_reason": "One or two sentences grounded in the live data for Next Week.",
+      "strategy_name": "One of allowed defined-risk structures",
+      "legs": "Comma-separated string, e.g. 'Buy 24000 CE, Sell 24200 CE'",
+      "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
+      "confidence": "High",
+      "data_status": "live"
+    }},
+    {{
+      "horizon": "Monthly",
+      "expiry_date": "The actual expiry date for Monthly copied EXACTLY as shown in the LIVE DATA FEED above.",
+      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "n/a",
+      "bias_reason": "One or two sentences grounded in the live data for Monthly.",
+      "strategy_name": "One of allowed defined-risk structures",
+      "legs": "Comma-separated string, e.g. 'Sell 23800 PE, Buy 23600 PE'",
+      "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
+      "confidence": "High",
+      "data_status": "live"
     }}
   ],
-  "portfolio_view": "One paragraph on overall market gap risk and the weekly setup."
+  "portfolio_view": "One paragraph on overall market gap risk and multi-horizon portfolio diversification across Weekly, Next Week, and Monthly setups."
 }}
 """
 

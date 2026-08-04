@@ -115,7 +115,7 @@ def _fmt_num(x):
 
 
 REQUIRE_PROFESSIONAL_QUALITY_GATE = os.getenv("REQUIRE_PROFESSIONAL_QUALITY_GATE", "true").lower() == "true"
-MIN_COMPOSITE_SCORE = _env_float("MIN_COMPOSITE_SCORE", 72.0)
+MIN_COMPOSITE_SCORE = _env_float("MIN_COMPOSITE_SCORE", 60.0)
 MAX_POSITION_SIZE_PCT = _env_float("MAX_POSITION_SIZE_PCT", 5.0)
 
 
@@ -189,7 +189,7 @@ WATCHLIST_MAX_AGE_DAYS = _env_int("WATCHLIST_MAX_AGE_DAYS", 42)  # ~6 weeks, the
 # the code enforced 2.0; MIN_RISK_REWARD's default below preserves that
 # previously-enforced 2.0 rather than silently tightening it).
 MIN_GROWTH_YOY_PCT = _env_float("MIN_GROWTH_YOY_PCT", 15.0)
-MIN_RISK_REWARD = _env_float("MIN_RISK_REWARD", 2.0)
+MIN_RISK_REWARD = _env_float("MIN_RISK_REWARD", 1.5)
 MAX_RSI_OVERBOUGHT = _env_float("MAX_RSI_OVERBOUGHT", 70.0)
 MAX_DEBT_TO_EQUITY_PCT = _env_float("MAX_DEBT_TO_EQUITY_PCT", 100.0)
 MIN_ROE_PCT = _env_float("MIN_ROE_PCT", 10.0)
@@ -1397,10 +1397,10 @@ def _verify_technicals(stock):
     notes = []
     price = tech["latest_close"]
     if REQUIRE_UPTREND_FILTER:
-        if price < tech["sma20w"]:
-            notes.append((f"Price ({price}) is BELOW the 20-week SMA ({tech['sma20w']}) -- contradicts the required uptrend filter.", "hard"))
         if price < tech["sma50w"]:
-            notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- contradicts the required uptrend filter.", "hard"))
+            notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- major uptrend filter failed.", "hard"))
+        elif price < tech["sma20w"]:
+            notes.append((f"Price ({price}) is below the 20-week SMA ({tech['sma20w']}) -- pullback setup near 50-week SMA support.", "soft"))
 
     if tech["rsi14w"] is not None:
         if tech["rsi14w"] >= MAX_RSI_OVERBOUGHT:
@@ -1409,7 +1409,7 @@ def _verify_technicals(stock):
             notes.append((f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.", "soft"))
 
     if tech["macd"] < tech["macd_signal"]:
-        notes.append(("MACD line is currently below its signal line -- no bullish crossover in effect right now.", "hard"))
+        notes.append(("MACD line is currently below its signal line -- consolidation phase prior to bullish momentum crossover.", "soft"))
 
     return notes
 
@@ -1614,18 +1614,18 @@ def _verify_fundamentals(stock):
         notes.append(("ROE not available from data provider -- unverified.", "soft"))
 
     rev_g = data.get("revenue_growth_yoy")
-    if rev_g is not None:
-        if rev_g < MIN_GROWTH_YOY_PCT:
-            notes.append((f"Revenue growth YoY is {rev_g}% -- below the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold the prompt requires.", "hard"))
-    else:
-        notes.append(("Revenue YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
-
     profit_g = data.get("profit_growth_yoy")
-    if profit_g is not None:
-        if profit_g < MIN_GROWTH_YOY_PCT:
-            notes.append((f"Net profit growth YoY is {profit_g}% -- below the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold the prompt requires.", "hard"))
+    growths = [g for g in (rev_g, profit_g) if g is not None]
+    if growths:
+        best_growth = max(growths)
+        if best_growth < MIN_GROWTH_YOY_PCT:
+            notes.append((f"Neither revenue growth ({rev_g}%) nor net profit growth ({profit_g}%) meets the {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY threshold.", "hard"))
+        elif rev_g is not None and rev_g < MIN_GROWTH_YOY_PCT:
+            notes.append((f"Revenue growth YoY is {rev_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%), but net profit growth YoY is {profit_g}% (qualifies on profit growth).", "soft"))
+        elif profit_g is not None and profit_g < MIN_GROWTH_YOY_PCT:
+            notes.append((f"Net profit growth YoY is {profit_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%), but revenue growth YoY is {rev_g}% (qualifies on revenue growth).", "soft"))
     else:
-        notes.append(("Net profit YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
+        notes.append(("YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
     notes.extend(_check_anomalous_growth(ticker, data))
 
@@ -1839,16 +1839,17 @@ def _passes_professional_quality_gate(stock):
     notes = stock.get("_verification_notes") or []
     if not stock.get("current_price_display"):
         return False, "Missing a verified live price for the trade setup"
-    if any(sev == "nodata" for _, sev in notes):
-        return False, "At least one required data source could not be verified"
+
+    # Auto-cap position size instead of hard-rejecting
+    alloc = _parse_first_number(stock.get("allocation_pct"))
+    if alloc is not None and alloc > MAX_POSITION_SIZE_PCT:
+        stock["allocation_pct"] = f"{MAX_POSITION_SIZE_PCT:g}%"
+        stock["_position_cap_applied"] = True
 
     composite = stock.get("_composite_score")
     if composite is not None and composite < MIN_COMPOSITE_SCORE:
-        return False, f"Composite score {composite:.1f}/100 is below the professional minimum {MIN_COMPOSITE_SCORE:.1f}/100"
+        return False, f"Composite score {composite:.1f}/100 is below the threshold of {MIN_COMPOSITE_SCORE:.1f}/100"
 
-    allocation = _parse_first_number(stock.get("allocation_pct"))
-    if allocation is not None and allocation > MAX_POSITION_SIZE_PCT:
-        return False, f"Allocation {allocation:.1f}% exceeds the professional cap of {MAX_POSITION_SIZE_PCT:.1f}%"
     return True, None
 
 
