@@ -392,7 +392,6 @@ def init_llm_generator(force_local=False):
 
     return "local" if llm_pipeline is not None else None
 
-
 # -----------------------------------------------------------------------
 # Error classification (single copy -- previously duplicated verbatim)
 # -----------------------------------------------------------------------
@@ -716,24 +715,38 @@ def generate_analysis(
     the full tier order). Every script in this project should call this
     instead of hand-rolling its own chain.
 
-    prompt: the base (non-grounded) prompt.
+    prompt: the base (non‑grounded) prompt.
     max_tokens: output token budget, clamped to MAX_TOKENS_CEILING.
     gather_context_fn: optional () -> (context_text, sources) used ONLY for
       tier 3 (Tavily + plain Groq synthesis). If omitted, or if it returns
       falsy context_text, tier 3 is skipped and the chain moves straight
       from groq/compound-mini to Gemini.
     build_grounded_prompt: optional context_text -> str, used to build the
-      tier-3 prompt. Defaults to f"{context_text}\\n\\n{prompt}".
+      tier‑3 prompt. Defaults to f"{context_text}\n\n{prompt}".
     validate_fn: optional text -> bool. If a tier's raw output fails this
       check (e.g. "didn't parse as the expected JSON shape"), that tier is
       treated as a failure and the chain moves to the next one, instead of
-      returning content the caller can't use. Defaults to "non-empty".
-    log_label: short human-readable label used in log lines (e.g. "AI
-      Stocks Story", "swing-trade generation").
+      returning content the caller can't use. Defaults to "non‑empty".
+    log_label: short human‑readable label used in log lines (e.g. "AI
+      Stocks Story", "swing‑trade generation").
 
     Returns (text, sources, used_live_search). On total failure, text is
     "" (falsy) so callers can check `if not text:` uniformly.
     """
+    # -------------------------------------------------------------------
+    # Prompt size safety net – Groq returns 413 if the request payload is
+    # too large (typically when the prompt exceeds ~4 KB). We proactively
+    # truncate overly long prompts to avoid hitting that error and then
+    # let the normal fallback chain handle the shortened request.
+    # -------------------------------------------------------------------
+    MAX_PROMPT_CHARS = 3000  # empirical safe ceiling; can be tuned via env
+    if len(prompt) > MAX_PROMPT_CHARS:
+        log.warning(
+            f"Prompt length ({len(prompt)}) exceeds safe limit ({MAX_PROMPT_CHARS}); "
+            "truncating to avoid Groq 413 errors."
+        )
+        prompt = prompt[:MAX_PROMPT_CHARS]
+
     if validate_fn is None:
         validate_fn = lambda t: bool(t and t.strip())
 
@@ -750,8 +763,8 @@ def generate_analysis(
         compound_order = _order_by_headroom(GROQ_COMPOUND_MODELS, max_tokens)
         if compound_order != GROQ_COMPOUND_MODELS:
             log.info(
-                f"Trying compound tiers in quota-adjusted order for {log_label}: {compound_order} "
-                "(reordered from the default groq/compound -> groq/compound-mini based on what "
+                f"Trying compound tiers in quota‑adjusted order for {log_label}: {compound_order} "
+                "(reordered from the default groq/compound -> groq/compound‑mini based on what "
                 "an earlier call this run saw)."
             )
         result = None
@@ -769,7 +782,7 @@ def generate_analysis(
             tavily_remaining = _tavily_remaining_credits()
             if tavily_remaining is not None and tavily_remaining <= 0:
                 log.info(
-                    f"Skipping Tavily-context tier for {log_label} -- last-known Tavily "
+                    f"Skipping Tavily‑context tier for {log_label} -- last‑known Tavily "
                     f"quota shows {tavily_remaining} credits remaining."
                 )
                 context_text = None
@@ -786,7 +799,7 @@ def generate_analysis(
                     if validate_fn(text):
                         return text, gathered_sources, live
             else:
-                log.warning(f"Gathered-context tier returned no usable results for {log_label} -- skipping.")
+                log.warning(f"Gathered‑context tier returned no usable results for {log_label} -- skipping.")
 
         if gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None):
             grounded = _try_gemini_grounded(prompt, log_label=log_label)

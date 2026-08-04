@@ -2,6 +2,14 @@ from datetime import date, datetime
 
 import yfinance as yf
 import pandas as pd
+import requests
+# Set a realistic User-Agent header for yfinance HTTP requests to avoid 401 Unauthorized errors
+_yf_session = requests.Session()
+_yf_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+})
+# Inject the custom session into yfinance's internal request handling
+yf.utils._requests = _yf_session
 
 
 def format_event_date(value):
@@ -214,7 +222,10 @@ def fetch_stock_data(symbol):
 
 
 def fetch_fundamentals(symbol):
+    # Ensure yfinance uses the custom session with proper headers
     ticker = yf.Ticker(symbol)
+    # Reassign the session in case yfinance re-instantiates it
+    yf.utils._requests = _yf_session
     info = ticker.info
 
     return {
