@@ -222,10 +222,8 @@ def fetch_stock_data(symbol):
 
 
 def fetch_fundamentals(symbol):
-    # Ensure yfinance uses the custom session with proper headers
-    ticker = yf.Ticker(symbol)
-    # Reassign the session in case yfinance re-instantiates it
-    yf.utils._requests = _yf_session
+    # Use custom session with realistic User-Agent for Yahoo Finance requests
+    ticker = yf.Ticker(symbol, session=_yf_session)
     info = ticker.info
 
     return {
