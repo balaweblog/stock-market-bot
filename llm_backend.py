@@ -57,6 +57,7 @@ retry/backoff policy, and which error is worth retrying at all."
 import os
 import re
 import time
+import json
 import threading
 
 try:
@@ -187,6 +188,34 @@ _QUOTA_SAFETY_MARGIN_TOKENS = 500
 # beyond the check itself, so it's cached rather than called every time
 # generate_analysis() considers the Tavily tier.
 _TAVILY_QUOTA_REFRESH_SECONDS = 300
+_QUOTA_CACHE_FILE = "quota_cache.json"
+
+
+def _load_quota_cache():
+    global _groq_quota, _tavily_quota
+    try:
+        if os.path.exists(_QUOTA_CACHE_FILE):
+            with open(_QUOTA_CACHE_FILE, "r") as f:
+                data = json.load(f)
+                with _quota_lock:
+                    _groq_quota.update(data.get("groq", {}))
+                    _tavily_quota.update(data.get("tavily", {}))
+    except Exception as exc:
+        log.debug(f"Could not load quota cache: {exc}")
+
+
+def _save_quota_cache():
+    try:
+        with _quota_lock:
+            payload = {"groq": _groq_quota, "tavily": _tavily_quota}
+        with open(_QUOTA_CACHE_FILE, "w") as f:
+            json.dump(payload, f)
+    except Exception as exc:
+        log.debug(f"Could not save quota cache: {exc}")
+
+
+# Load cached quota state from disk on import so process restarts inherit headroom knowledge
+_load_quota_cache()
 
 
 def _record_groq_headers(headers, model_name):
@@ -203,6 +232,7 @@ def _record_groq_headers(headers, model_name):
                 "remaining_requests": int(rem_req) if rem_req is not None else None,
                 "updated_at": time.time(),
             }
+        _save_quota_cache()
     except Exception as e:
         log.warning(f"Could not record Groq quota headers for {model_name}: {e}")
 
@@ -277,6 +307,7 @@ def _tavily_remaining_credits():
         with _quota_lock:
             _tavily_quota["remaining_credits"] = remaining
             _tavily_quota["updated_at"] = time.time()
+        _save_quota_cache()
         return remaining
     except Exception as e:
         log.warning(f"Could not refresh Tavily quota: {e}")
