@@ -46,7 +46,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Mutual Fund Portfolio Advisor
-        run: python mutual_fund_advisor.py
+        run: python -m controllers.mutual_fund_controller
 
       - name: Upload dry-run report (if DRY_RUN=true)
         if: ${{ github.event.inputs.dry_run == 'true' }}

@@ -52,7 +52,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Option Trade
-        run: python swing_trade_advisor.py
+        run: python -m controllers.swing_controller
 
       # --- NEW: persist the two CSV logs the auto-adjustment feature relies
       # on. checkout@v4 gives a fresh clone every run, so without this,

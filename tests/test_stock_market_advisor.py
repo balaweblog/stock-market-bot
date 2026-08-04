@@ -1,6 +1,6 @@
 import unittest
 
-from stock_market_advisor import _format_weekly_return_display, render_stock_cards
+from controllers.nifty_stock_controller import _format_weekly_return_display, render_stock_cards
 
 
 class StockMarketAdvisorTests(unittest.TestCase):

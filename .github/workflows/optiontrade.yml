@@ -38,4 +38,4 @@ jobs:
 
 
       - name: Run Option trade
-        run: python optionstrategy.py
+        run: python -m controllers.option_controller

@@ -29,7 +29,6 @@ import json
 import html
 import time
 import requests
-import traceback
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -40,22 +39,18 @@ from email.mime.text import MIMEText
 
 import pandas as pd
 
-import stockpredictor  # reuses email config/credentials and helpers
-import llm_backend  # shared LLM init + fallback chain (see llm_backend.py)
-from compliance import build_compliance_block_html
+from utils import config
+from utils.logger import log
+from services.stock_fetcher import fetch_stock_data
+from models.market_context import classify_market
+from llm import llm_backend  # shared LLM init + fallback chain (see llm_backend.py)
+from utils.compliance import build_compliance_block_html
 
-# Independent-of-the-LLM risk/regime/scoring/tracking modules -- see each
-# file's own docstring for the rationale. Kept as separate modules rather
-# than folded into this already-1800-line file so each concern (position
-# sizing, market regime, composite scoring, outcome tracking) is
-# independently testable and can be reused by optionstrategy.py /
-# stock_market_advisor.py later without dragging in this file's Stage-1/
-# Stage-2 prompt-building code.
-import swing_trade_risk as risk
-import swing_trade_regime as regime
-import swing_trade_scoring as scoring
-import swing_trade_outcomes as outcomes
-import swing_trade_universe as universe  # static ticker seed list for the deterministic screen (see below)
+from models import swing_trade_risk as risk
+from models import swing_trade_regime as regime
+from models import swing_trade_scoring as scoring
+from models import swing_trade_outcomes as outcomes
+from models import swing_trade_universe as universe  # static ticker seed list for the deterministic screen (see below)
 
 # -----------------------------
 # Qualifying-stock gate
@@ -278,7 +273,7 @@ def _log_rejection_history(rejected, today_str, log_path=REJECTION_HISTORY_LOG):
                 writer.writeheader()
             writer.writerows(rows)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not write rejection history log: {e}")
+        log.warning(f"Could not write rejection history log: {e}")
 
 
 # -----------------------------
@@ -375,7 +370,7 @@ def _load_history_rows(log_path=REJECTION_HISTORY_LOG):
                     continue
                 rows.append(r)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not read rejection history log '{log_path}': {e}")
+        log.warning(f"Could not read rejection history log '{log_path}': {e}")
     return rows
 
 
@@ -396,7 +391,7 @@ def _log_threshold_adjustments(applied, log_path=THRESHOLD_ADJUSTMENT_LOG):
             for gname, old, new, reason in applied:
                 writer.writerow({"date": today_str, "constant": gname, "old_value": old, "new_value": new, "reason": reason})
     except Exception as e:
-        stockpredictor.log.warning(f"Could not write threshold adjustment log: {e}")
+        log.warning(f"Could not write threshold adjustment log: {e}")
 
 
 def _apply_auto_adjustments(log_path=REJECTION_HISTORY_LOG):
@@ -611,7 +606,7 @@ def _log_watchlist(rejected, today_str_iso, log_path=WATCHLIST_LOG):
                 writer.writeheader()
             writer.writerows(rows)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not write watchlist log: {e}")
+        log.warning(f"Could not write watchlist log: {e}")
 
 
 def _load_and_recheck_watchlist(log_path=WATCHLIST_LOG, max_age_days=WATCHLIST_MAX_AGE_DAYS):
@@ -638,7 +633,7 @@ def _load_and_recheck_watchlist(log_path=WATCHLIST_LOG, max_age_days=WATCHLIST_M
         with path.open(newline="") as f:
             rows = list(csv.DictReader(f))
     except Exception as e:
-        stockpredictor.log.warning(f"Could not read watchlist log '{log_path}': {e}")
+        log.warning(f"Could not read watchlist log '{log_path}': {e}")
         return [], []
 
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
@@ -694,7 +689,7 @@ def _rewrite_watchlist(rows, log_path=WATCHLIST_LOG):
             writer.writeheader()
             writer.writerows(rows)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not rewrite watchlist log: {e}")
+        log.warning(f"Could not rewrite watchlist log: {e}")
 
 
 # -----------------------------
@@ -1030,7 +1025,7 @@ def _tavily_search(query, max_results=4, include_domains=None):
             })
         return results
     except Exception as e:
-        stockpredictor.log.warning(f"Tavily search failed for query '{query}': {e}")
+        log.warning(f"Tavily search failed for query '{query}': {e}")
         return []
 
 
@@ -1182,15 +1177,15 @@ def _fetch_current_price(ticker):
     if not ticker:
         return None, None
     try:
-        df = stockpredictor.fetch_data(ticker)
-        latest_close = stockpredictor._safe_float(df.iloc[-1].get("close"))
+        df = fetch_stock_data(ticker)
+        latest_close = float(df.iloc[-1].get("close")) if df is not None and not df.empty else None
         if latest_close is None:
             return None, None
-        market = stockpredictor.classify_market(ticker)
+        market = classify_market(ticker)
         currency_symbol = "₹" if market == "India" else "$"
         return latest_close, currency_symbol
     except Exception as e:
-        stockpredictor.log.warning(f"Could not fetch live price for '{ticker}': {e}")
+        log.warning(f"Could not fetch live price for '{ticker}': {e}")
         return None, None
 
 
@@ -1312,7 +1307,7 @@ def _verify_risk_reward(stock):
 
 def _fetch_weekly_technicals(ticker):
     try:
-        df = stockpredictor.fetch_data(ticker)
+        df = fetch_stock_data(ticker)
         if df is None or len(df) < 30 or "close" not in df.columns:
             return None
 
@@ -1362,7 +1357,7 @@ def _fetch_weekly_technicals(ticker):
             "macd_signal": round(float(signal_line.iloc[-1]), 3),
         }
     except Exception as e:
-        stockpredictor.log.warning(f"Could not compute weekly technicals for '{ticker}': {e}")
+        log.warning(f"Could not compute weekly technicals for '{ticker}': {e}")
         return None
 
 
@@ -1428,7 +1423,7 @@ def _fetch_fundamentals(ticker):
     try:
         import yfinance as yf
     except ImportError:
-        stockpredictor.log.warning("yfinance not installed -- fundamentals verification skipped.")
+        log.warning("yfinance not installed -- fundamentals verification skipped.")
         return None
     try:
         yt = yf.Ticker(ticker)
@@ -1444,7 +1439,7 @@ def _fetch_fundamentals(ticker):
             if qf is not None and not qf.empty and qf.shape[1] >= 2:
                 year_ago_idx = _find_year_ago_index(list(qf.columns))
                 if year_ago_idx is None:
-                    stockpredictor.log.warning(
+                    log.warning(
                         f"'{ticker}': no quarterly_financials column falls within "
                         "45 days of 1 year before the latest quarter -- skipping "
                         "YoY growth calc (irregular/missing quarterly history) "
@@ -1462,10 +1457,10 @@ def _fetch_fundamentals(ticker):
                         if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
                             result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
         except Exception as e:
-            stockpredictor.log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
+            log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
         return result
     except Exception as e:
-        stockpredictor.log.warning(f"Could not fetch fundamentals for '{ticker}': {e}")
+        log.warning(f"Could not fetch fundamentals for '{ticker}': {e}")
         return None
 
 
@@ -2227,28 +2222,28 @@ def build_email_html(analysis_html, today_str, sources, used_live_search, adjust
 
 
 def send_swing_trade_email(html_body):
-    if not all([stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD, stockpredictor.EMAIL_TO]):
-        stockpredictor.log.error(
+    if not all([config.EMAIL_FROM, config.EMAIL_PASSWORD, config.EMAIL_TO]):
+        log.error(
             "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
             "and EMAIL_TO (the same env vars main.py uses)."
         )
         return False
 
-    to_recipients = stockpredictor.parse_email_list(stockpredictor.EMAIL_TO)
-    cc_recipients = stockpredictor.parse_email_list(getattr(stockpredictor, "EMAIL_CC", "") or "")
+    to_recipients = config.parse_email_list(config.EMAIL_TO)
+    cc_recipients = config.parse_email_list(getattr(config, "EMAIL_CC", "") or "")
 
     if not to_recipients:
-        stockpredictor.log.error("No valid TO recipients found in EMAIL_TO.")
+        log.error("No valid TO recipients found in EMAIL_TO.")
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
     note_label = "Weekly Swing Trade Research Note" if now_ist.weekday() == 0 else "Swing Trade Research Note"
-    subject = f"{note_label} — {stockpredictor.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"{note_label} — {config.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
-    msg["From"] = stockpredictor.EMAIL_FROM
+    msg["From"] = config.EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -2258,24 +2253,24 @@ def send_swing_trade_email(html_body):
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
-            server.login(stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD)
-            server.sendmail(stockpredictor.EMAIL_FROM, all_recipients, msg.as_string())
-        stockpredictor.log.info("Swing trade email sent successfully.")
+            server.login(config.EMAIL_FROM, config.EMAIL_PASSWORD)
+            server.sendmail(config.EMAIL_FROM, all_recipients, msg.as_string())
+        log.info("Swing trade email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
-        stockpredictor.log.error(
+        log.error(
             "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
             "(use a Gmail App Password, not the account password)."
         )
     except Exception as e:
-        stockpredictor.log.error(f"Failed to send swing trade email: {e}")
+        log.error(f"Failed to send swing trade email: {e}")
         traceback.print_exc()
     return False
 
 
 def _require_live_or_abort(used_live, stage_label):
     if not used_live and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        stockpredictor.log.error(
+        log.error(
             f"Live web search was not used for {stage_label} this run (Groq's "
             "live-search model was unavailable or the backend fell back to "
             "Gemini/local), so the output would only reflect stale training-data "
@@ -2289,13 +2284,13 @@ def _require_live_or_abort(used_live, stage_label):
 def run():
     applied_adjustments = _apply_auto_adjustments()
     if applied_adjustments:
-        stockpredictor.log.info("Auto-adjusted thresholds this run based on rejection history:")
+        log.info("Auto-adjusted thresholds this run based on rejection history:")
         for gname, old, new, reason in applied_adjustments:
-            stockpredictor.log.info(f"  {gname}: {old} -> {new}  ({reason})")
+            log.info(f"  {gname}: {old} -> {new}  ({reason})")
 
     today_str, is_monday, lookback_note = _run_context()
     if is_monday:
-        stockpredictor.log.info("Monday run detected -- widening news/catalyst lookback to the past week.")
+        log.info("Monday run detected -- widening news/catalyst lookback to the past week.")
 
     analysis_html = None
     sources = []
@@ -2303,7 +2298,7 @@ def run():
     all_rejected = []
     qualifying = []  # default if every attempt "continue"s before ever assigning it
     regime_ok, regime_detail = regime.check_market_regime()
-    stockpredictor.log.info(f"Market-regime check: {regime_detail}")
+    log.info(f"Market-regime check: {regime_detail}")
 
     # Every ticker rejected so far this run (at either the fundamentals or
     # technicals stage) -- excluded from later attempts' prompts AND
@@ -2322,7 +2317,7 @@ def run():
     # swing_trade_regime.py's env) to disable and fall back to the old
     # per-stock-only behavior.
     if regime.REQUIRE_MARKET_REGIME_FILTER and not regime_ok:
-        stockpredictor.log.warning(
+        log.warning(
             f"Market regime gate failed ({regime_detail.get('classification')}) -- "
             "skipping this run's scan entirely rather than screening individual "
             "stocks against an unfavorable broad-market backdrop."
@@ -2335,14 +2330,14 @@ def run():
         if os.getenv("DRY_RUN", "false").lower() == "true":
             with open("swing_trade_report.html", "w") as f:
                 f.write(email_html)
-            stockpredictor.log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
+            log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
             return
         send_swing_trade_email(email_html)
         return
 
     regime_softening = _regime_soften_growth_bar(regime_detail)
     if regime_softening:
-        stockpredictor.log.info(
+        log.info(
             f"Regime-driven softening this run: MIN_GROWTH_YOY_PCT "
             f"{regime_softening[0]} -> {regime_softening[1]} ({regime_softening[2]})"
         )
@@ -2355,7 +2350,7 @@ def run():
 
     for attempt in range(1, MAX_GENERATION_ATTEMPTS + 1):
         sectors = _sectors_for_attempt(attempt - 1)
-        stockpredictor.log.info(
+        log.info(
             f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS} -- Stage 1 (fundamentals "
             f"screen) in sectors: {', '.join(sectors)}"
         )
@@ -2365,7 +2360,7 @@ def run():
             # for these sectors (see _deterministic_fundamentals_screen) --
             # no "did the model's search find anything" uncertainty, and no
             # 8-12-per-sector sampling limit.
-            stockpredictor.log.info(
+            log.info(
                 f"Attempt {attempt}: deterministic fundamentals screen "
                 f"(no LLM call) across {', '.join(sectors)}."
             )
@@ -2394,7 +2389,7 @@ def run():
             )
 
             if not growth_analysis:
-                stockpredictor.log.error(
+                log.error(
                     "No LLM backend produced Stage 1 output (no GROQ_API_KEY/"
                     "GOOGLE_API_KEY set and local model unavailable/failed). "
                     "Aborting without sending an email."
@@ -2409,7 +2404,7 @@ def run():
 
             candidates = _parse_candidates_json(growth_analysis)
             if candidates is None:
-                stockpredictor.log.warning(
+                log.warning(
                     f"Attempt {attempt}: Stage 1 output could not be parsed as "
                     "candidate JSON -- treating as zero candidates for this attempt."
                 )
@@ -2420,7 +2415,7 @@ def run():
                 if (c.get("ticker") or "").strip().upper() not in seen_tickers
             ]
             if not candidates:
-                stockpredictor.log.info(f"Attempt {attempt}: no new candidates found in {', '.join(sectors)}.")
+                log.info(f"Attempt {attempt}: no new candidates found in {', '.join(sectors)}.")
                 fundamentally_qualified, rejected_fund = [], []
             else:
                 fundamentally_qualified, rejected_fund = _prefilter_by_fundamentals(candidates)
@@ -2435,7 +2430,7 @@ def run():
         # on the first attempt, rather than duplicating the whole Stage 2
         # block for them separately.
         if attempt == 1 and watchlist_graduates:
-            stockpredictor.log.info(
+            log.info(
                 f"{len(watchlist_graduates)} watchlist candidate(s) now clear both "
                 "fundamentals and technicals -- adding to this attempt's Stage 2 batch: "
                 + ", ".join(c.get("name") or c.get("ticker") or "?" for c in watchlist_graduates)
@@ -2446,13 +2441,13 @@ def run():
             )
 
         if not fundamentally_qualified:
-            stockpredictor.log.info(
+            log.info(
                 f"Attempt {attempt}: no candidate from {', '.join(sectors)} "
                 "passed independent fundamentals verification -- none reached Stage 2."
             )
             continue
 
-        stockpredictor.log.info(
+        log.info(
             f"Attempt {attempt} -- Stage 2 (technicals) for "
             f"{len(fundamentally_qualified)} fundamentally-qualified candidate(s): "
             + ", ".join(c.get("name") or c.get("ticker") or "?" for c in fundamentally_qualified)
@@ -2465,7 +2460,7 @@ def run():
         )
 
         if not tech_analysis:
-            stockpredictor.log.error(
+            log.error(
                 "No LLM backend produced Stage 2 output. Aborting without sending an email."
             )
             sys.exit(1)
@@ -2478,7 +2473,7 @@ def run():
 
         stocks = _parse_analysis_json(tech_analysis)
         if stocks is None:
-            stockpredictor.log.warning(
+            log.warning(
                 f"Attempt {attempt}: Stage 2 output could not be parsed as stock "
                 "JSON -- treating as zero candidates for this attempt."
             )
@@ -2490,7 +2485,7 @@ def run():
         stocks = [s for s in stocks if (s.get("ticker") or "").strip().upper() in allowed]
 
         if not stocks:
-            stockpredictor.log.info(f"Attempt {attempt}: no candidate passed Stage 2 technicals.")
+            log.info(f"Attempt {attempt}: no candidate passed Stage 2 technicals.")
             continue
 
         stocks = _attach_live_prices(stocks)
@@ -2527,7 +2522,7 @@ def run():
             )
             break
 
-        stockpredictor.log.info(
+        log.info(
             f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: {len(rejected)} "
             "candidate(s) failed independent verification at Stage 2."
         )
@@ -2556,7 +2551,7 @@ def run():
     _rewrite_watchlist(list(merged_by_ticker.values()))
 
     if analysis_html is None:
-        stockpredictor.log.warning(
+        log.warning(
             f"All {MAX_GENERATION_ATTEMPTS} attempt(s) failed to produce a stock "
             "that passes its own strategy's mandatory filters against real data. "
             "Reporting 'no qualifying trade' instead of a contradicted pick."
@@ -2580,7 +2575,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("swing_trade_report.html", "w") as f:
             f.write(email_html)
-        stockpredictor.log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
+        log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
         return
 
     send_swing_trade_email(email_html)

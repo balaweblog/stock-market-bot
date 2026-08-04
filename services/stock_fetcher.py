@@ -45,7 +45,10 @@ def format_event_date(value):
 
 
 def build_upcoming_event_summary(ticker, info=None):
-    if info is None:
+    if info is None and isinstance(ticker, dict):
+        info = ticker
+        ticker = None
+    elif info is None:
         info = {}
 
     today = pd.Timestamp.today().normalize()

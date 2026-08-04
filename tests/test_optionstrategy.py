@@ -1,6 +1,6 @@
 import unittest
 
-from optionstrategy import _normalize_weekly_recommendations, build_prompt
+from controllers.option_controller import _normalize_weekly_recommendations, build_prompt
 
 
 class OptionStrategyTests(unittest.TestCase):
@@ -18,11 +18,11 @@ class OptionStrategyTests(unittest.TestCase):
         self.assertEqual(recommendations[0]["label"], "Primary")
         self.assertTrue(any("Alternative" in rec["label"] for rec in recommendations))
 
-    def test_build_prompt_only_targets_weekly_horizon(self):
+    def test_build_prompt_targets_multi_horizons(self):
         prompt = build_prompt(live_data={})
 
-        self.assertIn("Nifty Weekly", prompt)
-        self.assertNotIn("Nifty Monthly", prompt)
+        self.assertIn("Weekly", prompt)
+        self.assertIn("Monthly", prompt)
 
 
 if __name__ == "__main__":

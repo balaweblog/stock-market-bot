@@ -1,6 +1,6 @@
 import unittest
 
-from mutual_fund_advisor import _format_monthly_return_display, render_fund_cards
+from controllers.mutual_fund_controller import _format_monthly_return_display, render_fund_cards
 
 
 class MutualFundAdvisorTests(unittest.TestCase):

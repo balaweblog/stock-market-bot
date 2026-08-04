@@ -4,10 +4,10 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from commodity_tracker import CommodityTracker
-from position_sizing import apply_risk_management
-from recommendation_logic import derive_commodity_buy_levels
-from stockpredictor import (
+from services.commodity_tracker import CommodityTracker
+from models.position_sizing import apply_risk_management
+from models.recommendation_logic import derive_commodity_buy_levels
+from controllers.stock_controller import (
     build_data_quality_banner,
     build_executive_summary_html,
     build_fundamentals_html,

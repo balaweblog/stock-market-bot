@@ -1,7 +1,7 @@
 import unittest
 from datetime import date, timedelta
 
-from stock_fetcher import build_upcoming_event_summary, format_event_date
+from services.stock_fetcher import build_upcoming_event_summary, format_event_date
 
 
 class StockFetcherTests(unittest.TestCase):

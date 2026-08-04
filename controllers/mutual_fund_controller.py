@@ -48,11 +48,9 @@ import re
 import sys
 import json
 import html
-import math
 import ssl
 import traceback
 import urllib.request
-import urllib.error
 import urllib.parse
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -60,9 +58,11 @@ from zoneinfo import ZoneInfo
 import smtplib
 from email.mime.text import MIMEText
 
-import stockpredictor  # reuses LLM init, email config/credentials, and helpers
-from compliance import build_compliance_block_html
-from swing_trade_advisor import (
+from utils import config
+from utils.logger import log
+from llm import llm_backend
+from utils.compliance import build_compliance_block_html
+from controllers.swing_controller import (
     _env_int,
     generate_analysis,
     _strip_code_fences,
@@ -79,7 +79,7 @@ SERIF = "Georgia,'Times New Roman',serif"
 # -----------------------------
 # Portfolio now lives in constants.py instead of the MF_PORTFOLIO_JSON
 # environment variable.
-from constants import MF_PORTFOLIO
+from utils.constants import MF_PORTFOLIO
 
 MARKET_TOPICS = [
     "Nifty 50", "Sensex", "Midcap Index", "Smallcap Index", "RBI",
@@ -140,7 +140,7 @@ def _amfi_get(url):
         with urllib.request.urlopen(req, **kwargs) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        stockpredictor.log.debug(f"AMFI fetch failed ({url!r}): {exc}")
+        log.debug(f"AMFI fetch failed ({url!r}): {exc}")
         return None
 
 
@@ -197,7 +197,7 @@ def _fetch_amfi_fund_snapshot(fund_name):
     """
     code = _KNOWN_SCHEME_CODES.get(fund_name) or _amfi_search_scheme_code(fund_name)
     if not code:
-        stockpredictor.log.debug(f"AMFI: no scheme code found for {fund_name!r}")
+        log.debug(f"AMFI: no scheme code found for {fund_name!r}")
         return {}
 
     data = _amfi_get(f"{_AMFI_NAV_URL}{code}")
@@ -258,18 +258,18 @@ _amfi_snapshots = {}   # fund_name -> snapshot dict, populated once per run
 def prefetch_amfi_snapshots():
     """Fetch AMFI data for all portfolio funds before the LLM stage runs."""
     for fund_name in PORTFOLIO:
-        stockpredictor.log.info(f"AMFI prefetch: {fund_name}")
+        log.info(f"AMFI prefetch: {fund_name}")
         snap = _fetch_amfi_fund_snapshot(fund_name)
         _amfi_snapshots[fund_name] = snap
         if snap:
             nav_date = snap.get("_amfi_nav_date", "?")
-            stockpredictor.log.info(
+            log.info(
                 f"  → NAV={snap.get('nav_latest')} ({nav_date}), "
                 f"1Y={snap.get('one_year_return_pct')}%, "
                 f"3Y={snap.get('three_year_return_pct')}%"
             )
         else:
-            stockpredictor.log.warning(f"  → No AMFI data found")
+            log.warning(f"  → No AMFI data found")
 
 
 def _enrich_funds_with_amfi(funds_data):
@@ -543,12 +543,12 @@ def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
     text, sources, live = generate_analysis(prompt, max_tokens=3000, validate_fn=_valid_market_json)
     if not text:
-        stockpredictor.log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
+        log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
         sys.exit(1)
     _require_live_or_abort(live, "Stage 1 (market/macro)")
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        stockpredictor.log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
+        log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
         data = {}
     data.setdefault("developments", [])
     data.setdefault("market_sentiment", "Neutral")
@@ -566,7 +566,7 @@ def _valid_funds_json(text):
 def run_fund_stage(today_str, lookback_note):
     all_funds, sources, used_live = [], [], False
     for batch in _chunks(PORTFOLIO, FUNDS_PER_BATCH):
-        stockpredictor.log.info(f"Stage 2 -- fund batch: {', '.join(batch)}")
+        log.info(f"Stage 2 -- fund batch: {', '.join(batch)}")
         prompt = build_fund_prompt(batch, today_str, lookback_note)
         # Build targeted search queries per fund:
         # - Short name (strip "- Direct Growth") + AMFI + factsheet → finds official pages
@@ -583,7 +583,7 @@ def run_fund_stage(today_str, lookback_note):
             validate_fn=_valid_funds_json,
         )
         if not text:
-            stockpredictor.log.error(f"No LLM output for fund batch ({', '.join(batch)}) -- skipping this batch.")
+            log.error(f"No LLM output for fund batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 2 (fund batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -598,7 +598,7 @@ def run_fund_stage(today_str, lookback_note):
             snippet_len = 400
             head = text[:snippet_len]
             tail = text[-snippet_len:] if len(text) > snippet_len else ""
-            stockpredictor.log.warning(
+            log.warning(
                 f"Could not parse fund JSON for batch: {', '.join(batch)} "
                 f"(raw length={len(text)} chars). "
                 f"Start of output: {head!r}"
@@ -619,11 +619,11 @@ def _valid_sectors_json(text):
 def run_sector_stage(today_str, lookback_note):
     all_sectors, sources, used_live = [], [], False
     for batch in _chunks(SECTORS_MF, SECTORS_PER_BATCH):
-        stockpredictor.log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
+        log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
         prompt = build_sector_prompt(batch, today_str, lookback_note)
         text, s, live = generate_analysis(prompt, max_tokens=2000, validate_fn=_valid_sectors_json)
         if not text:
-            stockpredictor.log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
+            log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 3 (sector batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -631,7 +631,7 @@ def run_sector_stage(today_str, lookback_note):
         if isinstance(sectors, list):
             all_sectors.extend(sectors)
         else:
-            stockpredictor.log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
+            log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
         for src in s:
             if src not in sources:
                 sources.append(src)
@@ -647,38 +647,37 @@ def _plain_generate(prompt, max_tokens=3800):
     -> local model, mirroring generate_analysis's backend order without
     any of the search-cascade machinery.
     """
-    backend = stockpredictor.init_llm_generator()
-    stockpredictor.log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
+    backend = llm_backend.init_llm_generator()
+    log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
 
-    if backend == "groq" and getattr(stockpredictor, "groq_client", None) is not None:
+    if backend == "groq" and getattr(llm_backend, "groq_client", None) is not None:
         try:
-            response = stockpredictor.groq_client.chat.completions.create(
-                model=os.getenv("MF_SYNTHESIS_MODEL", "llama-3.3-70b-versatile"),
+            response = llm_backend.groq_client.chat.completions.create(
+                model=llm_backend.SYNTHESIS_MODELS[0],
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=max_tokens,
+                temperature=0.4,
+                max_tokens=3800,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            stockpredictor.log.error(f"Groq synthesis call failed: {e}")
+            log.error(f"Groq synthesis call failed: {e}")
 
-    have_gemini = getattr(stockpredictor, "gemini_client", None) is not None or (
-        os.getenv("GOOGLE_API_KEY") and getattr(stockpredictor, "genai", None) is not None
+    have_gemini = getattr(llm_backend, "gemini_client", None) is not None or (
+        os.getenv("GOOGLE_API_KEY") and getattr(llm_backend, "genai", None) is not None
     )
-    if have_gemini:
+    if backend == "gemini" or have_gemini:
         try:
-            if getattr(stockpredictor, "gemini_client", None) is None:
-                stockpredictor.gemini_client = stockpredictor.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = stockpredictor.gemini_client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt,
+            if getattr(llm_backend, "gemini_client", None) is None:
+                llm_backend.gemini_client = llm_backend.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+            response = llm_backend.gemini_client.models.generate_content(
+                model=llm_backend.GEMINI_MODEL, contents=prompt
             )
             return response.text.strip()
         except Exception as e:
-            stockpredictor.log.error(f"Gemini synthesis call failed: {e}")
+            log.error(f"Gemini synthesis call failed: {e}")
 
-    local_backend = stockpredictor.init_llm_generator(force_local=True)
-    if local_backend == "local" and stockpredictor.llm_pipeline is not None:
+    local_backend = llm_backend.init_llm_generator(force_local=True)
+    if local_backend == "local" and llm_backend.llm_pipeline is not None:
         text = _generate_local(prompt)
         if text:
             return text
@@ -690,11 +689,11 @@ def run_synthesis_stage(market_data, funds_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, funds_data, sectors_data, PORTFOLIO, today_str)
     text = _plain_generate(prompt)
     if not text:
-        stockpredictor.log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
+        log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
         sys.exit(1)
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        stockpredictor.log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
+        log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
         data = {}
     data.setdefault("top_developments", [])
     return data
@@ -1051,27 +1050,27 @@ def build_email_html(market_data, funds_data, sectors_data, synthesis_data, sour
 
 
 def send_portfolio_email(html_body, today_str):
-    if not all([stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD, stockpredictor.EMAIL_TO]):
-        stockpredictor.log.error(
+    if not all([config.EMAIL_FROM, config.EMAIL_PASSWORD, config.EMAIL_TO]):
+        log.error(
             "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
             "and EMAIL_TO (the same env vars main.py uses)."
         )
         return False
 
-    to_recipients = stockpredictor.parse_email_list(stockpredictor.EMAIL_TO)
-    cc_recipients = stockpredictor.parse_email_list(getattr(stockpredictor, "EMAIL_CC", "") or "")
+    to_recipients = config.parse_email_list(config.EMAIL_TO)
+    cc_recipients = config.parse_email_list(getattr(config, "EMAIL_CC", "") or "")
 
     if not to_recipients:
-        stockpredictor.log.error("No valid TO recipients found in EMAIL_TO.")
+        log.error("No valid TO recipients found in EMAIL_TO.")
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"Mutual Fund Portfolio Review — {stockpredictor.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"Mutual Fund Portfolio Review — {config.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
-    msg["From"] = stockpredictor.EMAIL_FROM
+    msg["From"] = config.EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -1081,24 +1080,24 @@ def send_portfolio_email(html_body, today_str):
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
-            server.login(stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD)
-            server.sendmail(stockpredictor.EMAIL_FROM, all_recipients, msg.as_string())
-        stockpredictor.log.info("Mutual fund portfolio email sent successfully.")
+            server.login(config.EMAIL_FROM, config.EMAIL_PASSWORD)
+            server.sendmail(config.EMAIL_FROM, all_recipients, msg.as_string())
+        log.info("Mutual fund portfolio email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
-        stockpredictor.log.error(
+        log.error(
             "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
             "(use a Gmail App Password, not the account password)."
         )
     except Exception as e:
-        stockpredictor.log.error(f"Failed to send mutual fund portfolio email: {e}")
+        log.error(f"Failed to send mutual fund portfolio email: {e}")
         traceback.print_exc()
     return False
 
 
 def run():
     today_str, now_ist, lookback_note = _run_context()
-    stockpredictor.log.info(f"Mutual fund portfolio review starting for {today_str} (portfolio: {len(PORTFOLIO)} funds).")
+    log.info(f"Mutual fund portfolio review starting for {today_str} (portfolio: {len(PORTFOLIO)} funds).")
 
     # Prefetch deterministic AMFI data for all funds before the LLM stage.
     # This runs once, populates _amfi_snapshots, and gives the LLM prompt
@@ -1132,7 +1131,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("mutual_fund_report.html", "w") as f:
             f.write(email_html)
-        stockpredictor.log.info("DRY_RUN enabled -- wrote mutual_fund_report.html instead of emailing.")
+        log.info("DRY_RUN enabled -- wrote mutual_fund_report.html instead of emailing.")
         return
 
     send_portfolio_email(email_html, today_str)

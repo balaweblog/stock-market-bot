@@ -2,10 +2,10 @@ import requests
 from datetime import datetime
 import yfinance as yf
 
-from recommendation_logic import derive_commodity_buy_levels
+from models.recommendation_logic import derive_commodity_buy_levels
 
 try:
-    from market_context import get_resilient_session
+    from models.market_context import get_resilient_session
 except ImportError:
     def get_resilient_session():
         return None

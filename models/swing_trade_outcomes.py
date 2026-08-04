@@ -39,7 +39,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-import stockpredictor
+from utils.logger import log
+from services.stock_fetcher import fetch_stock_data
 
 OUTCOMES_LOG = "swing_trade_outcomes_log.csv"
 
@@ -100,7 +101,7 @@ def log_recommendation(stock, today_str_iso=None):
                 writer.writeheader()
             writer.writerow(row)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not write outcome log entry: {e}")
+        log.warning(f"Could not write outcome log entry: {e}")
 
 
 def _load_rows(log_path=OUTCOMES_LOG):
@@ -175,7 +176,7 @@ def _check_one_outcome(row, today):
     horizon_end = rec_date + timedelta(days=HORIZON_DAYS_IF_NO_EXIT_DATE)
 
     try:
-        df = stockpredictor.fetch_data(ticker)
+        df = fetch_stock_data(ticker)
         if df is None or "close" not in df.columns:
             row["outcome"] = "data_unavailable"
             row["date_outcome_checked"] = today.strftime("%Y-%m-%d")
@@ -239,7 +240,7 @@ def _check_one_outcome(row, today):
             row["outcome"] = "pending"
         return row
     except Exception as e:
-        stockpredictor.log.warning(f"Could not check outcome for '{ticker}': {e}")
+        log.warning(f"Could not check outcome for '{ticker}': {e}")
         row["outcome"] = "data_unavailable"
         row["date_outcome_checked"] = today.strftime("%Y-%m-%d")
         return row

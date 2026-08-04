@@ -16,7 +16,7 @@ so a failure in tier 2 doesn't stop tier 3 from being tested.
 import os
 import sys
 
-import llm_backend as lb
+from llm import llm_backend as lb
 
 
 def _status(ok, label, detail=""):

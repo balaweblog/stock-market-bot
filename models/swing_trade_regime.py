@@ -17,7 +17,8 @@ from anything the model claims about "market conditions".
 import os
 import pandas as pd
 
-import stockpredictor
+from utils.logger import log
+from services.stock_fetcher import fetch_stock_data
 
 # ^NSEI (Nifty 50) is the default regime index for an India-focused swing
 # strategy. Override via env var if the universe being screened is
@@ -49,33 +50,29 @@ def _weekly_index_trend(index_ticker, weeks=55):
     swing_trade_advisor._fetch_weekly_technicals, for consistency.
     """
     try:
-        df = stockpredictor.fetch_data(index_ticker)
+        df = fetch_stock_data(index_ticker)
         if df is None or len(df) < 30 or "close" not in df.columns:
             return None
-        if not isinstance(df.index, pd.DatetimeIndex):
-            date_col = next((c for c in df.columns if c.lower() == "date"), None)
-            if date_col is None:
-                return None
-            df = df.set_index(pd.to_datetime(df[date_col]))
-
-        close = df["close"].dropna()
-        weekly_close = close.resample("W").last().dropna()
-        if len(weekly_close) < weeks:
+        weekly = df["close"].resample("W").last().dropna()
+        if len(weekly) < 21:
             return None
-
-        sma20w = weekly_close.rolling(20).mean().iloc[-1]
-        sma50w = weekly_close.rolling(50).mean().iloc[-1]
-        latest = weekly_close.iloc[-1]
-        if pd.isna(sma20w) or pd.isna(sma50w) or pd.isna(latest):
-            return None
-
+        sma20 = weekly.rolling(window=20).mean()
+        latest_close = float(weekly.iloc[-1])
+        latest_sma20 = float(sma20.iloc[-1])
+        prev_sma20 = float(sma20.iloc[-2]) if len(sma20) >= 2 and pd.notna(sma20.iloc[-2]) else None
+        pct_above_sma20 = round(((latest_close - latest_sma20) / latest_sma20) * 100, 2)
+        sma20_slope_rising = (latest_sma20 > prev_sma20) if prev_sma20 is not None else True
+        in_uptrend = (latest_close > latest_sma20) and sma20_slope_rising
         return {
-            "latest_close": round(float(latest), 2),
-            "sma20w": round(float(sma20w), 2),
-            "sma50w": round(float(sma50w), 2),
+            "index_ticker": index_ticker,
+            "latest_close": round(latest_close, 2),
+            "sma20w": round(latest_sma20, 2),
+            "pct_above_sma20": pct_above_sma20,
+            "sma20_slope_rising": sma20_slope_rising,
+            "in_uptrend": in_uptrend,
         }
     except Exception as e:
-        stockpredictor.log.warning(f"Could not compute market-regime trend for '{index_ticker}': {e}")
+        log.warning(f"Could not compute market-regime trend for '{index_ticker}': {e}")
         return None
 
 

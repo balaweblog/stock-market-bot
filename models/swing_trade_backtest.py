@@ -56,8 +56,8 @@ except ImportError:
 # Reuse the same thresholds/constants the live pipeline uses, so a
 # backtest run actually tests the rules currently in effect rather than a
 # hand-copied second version that can drift out of sync.
-import swing_trade_advisor as sta
-import swing_trade_risk as risk
+from controllers import swing_controller as sta
+from . import swing_trade_risk as risk
 
 TRADES_LOG = "backtest_trades.csv"
 TRADE_FIELDNAMES = [

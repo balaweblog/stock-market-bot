@@ -6,7 +6,7 @@ try:
     # market_context.py already needed to add to stop Yahoo from blocking
     # requests from this box. Without it, this module was the only yfinance
     # caller in the codebase still using a bare, unauthenticated session.
-    from market_context import get_resilient_session
+    from models.market_context import get_resilient_session
 except ImportError:
     def get_resilient_session():
         return None

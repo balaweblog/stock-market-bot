@@ -1,6 +1,6 @@
 import unittest
 
-from swing_trade_advisor import _choose_analysis_html
+from controllers.swing_controller import _choose_analysis_html
 
 
 class SwingTradeAdvisorTests(unittest.TestCase):

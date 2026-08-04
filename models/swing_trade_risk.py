@@ -27,7 +27,9 @@ is visible, not silently overwritten.
 import os
 import pandas as pd
 
-import stockpredictor  # reuses fetch_data + log, same as swing_trade_advisor.py
+from utils.logger import log
+from services.stock_fetcher import fetch_stock_data
+from models.market_context import classify_market
 
 # -----------------------------
 # Configurable knobs
@@ -39,7 +41,7 @@ def _env_float(name, default):
     try:
         return float(raw.strip())
     except ValueError:
-        stockpredictor.log.warning(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
+        log.warning(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
         return default
 
 
@@ -50,7 +52,7 @@ def _env_int(name, default):
     try:
         return int(raw.strip())
     except ValueError:
-        stockpredictor.log.warning(f"WARNING: env var {name}='{raw}' is not a valid integer -- using default {default}.")
+        log.warning(f"WARNING: env var {name}='{raw}' is not a valid integer -- using default {default}.")
         return default
 
 
@@ -107,7 +109,7 @@ def _weekly_atr(ticker, period_weeks=14):
     if not ticker:
         return None, None
     try:
-        df = stockpredictor.fetch_data(ticker)
+        df = fetch_stock_data(ticker)
         if df is None or len(df) < 30:
             return None, None
         required = {"high", "low", "close"}
@@ -136,7 +138,7 @@ def _weekly_atr(ticker, period_weeks=14):
             return None, None
         return round(float(atr), 2), round(float(latest_close), 2)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not compute weekly ATR for '{ticker}': {e}")
+        log.warning(f"Could not compute weekly ATR for '{ticker}': {e}")
         return None, None
 
 
@@ -212,9 +214,9 @@ def _ticker_currency(ticker):
     is opt-in and off by default anyway.
     """
     try:
-        market = stockpredictor.classify_market(ticker)
+        market = classify_market(ticker)
     except Exception as e:
-        stockpredictor.log.warning(f"Could not classify market for '{ticker}' -- skipping currency check: {e}")
+        log.warning(f"Could not classify market for '{ticker}' -- skipping currency check: {e}")
         return None
     return "INR" if str(market).strip().lower() == "india" else "USD"
 

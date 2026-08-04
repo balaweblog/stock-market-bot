@@ -19,6 +19,16 @@ def parse_email_list(value):
     emails = [email.strip() for email in cleaned_value.split(",") if email.strip()]
     return [email for email in emails if re.match(EMAIL_REGEX, email)]
 
+
+def get_date_with_suffix(d):
+    day = d.day
+    if 4 <= day <= 20 or 24 <= day <= 30:
+        suffix = "th"
+    else:
+        suffix = ["st", "nd", "rd"][day % 10 - 1]
+    return d.strftime(f"%#d{suffix} %B %Y" if os.name == 'nt' else f"%-d{suffix} %B %Y")
+
+
 STOCKS_CSV = os.getenv("STOCKS")
 
 
@@ -28,7 +38,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 # Base stock list now lives in constants.py instead of the STOCKS_JSON
 # environment variable. STOCKS_CSV (below) can still be used to add/override
 # entries on top of this base list without touching constants.py.
-from constants import STOCKS as _CONSTANTS_STOCKS
+from .constants import STOCKS as _CONSTANTS_STOCKS
 
 STOCKS = dict(_CONSTANTS_STOCKS)
 

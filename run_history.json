@@ -1,19 +1,145 @@
 {
-  "stocks": {},
+  "stocks": {
+    "LT.NS": {
+      "signal": "HOLD",
+      "priority": 2,
+      "price": 4023.1,
+      "target": 4304.72,
+      "stop_loss": 3781.71,
+      "last_run_at": "2026-08-04T08:44:23.035761+05:30"
+    },
+    "SBIN.NS": {
+      "signal": "BUY / HOLD",
+      "priority": 2,
+      "price": 1034.1,
+      "target": 1116.83,
+      "stop_loss": 982.39,
+      "last_run_at": "2026-08-04T08:44:23.037221+05:30"
+    },
+    "COALINDIA.NS": {
+      "signal": "SELL",
+      "priority": 3,
+      "price": 416.75,
+      "target": 416.75,
+      "stop_loss": 395.91,
+      "last_run_at": "2026-08-04T08:44:23.082387+05:30"
+    },
+    "SUNPHARMA.NS": {
+      "signal": "HOLD",
+      "priority": 2,
+      "price": 1951.4,
+      "target": 2088.0,
+      "stop_loss": 1834.32,
+      "last_run_at": "2026-08-04T08:44:23.084867+05:30"
+    },
+    "BEL.NS": {
+      "signal": "SELL",
+      "priority": 3,
+      "price": 390.95,
+      "target": 390.95,
+      "stop_loss": 371.4,
+      "last_run_at": "2026-08-04T08:44:23.102202+05:30"
+    },
+    "ICICIBANK.NS": {
+      "signal": "BUY / HOLD",
+      "priority": 2,
+      "price": 1445.1,
+      "target": 1560.71,
+      "stop_loss": 1372.84,
+      "last_run_at": "2026-08-04T08:44:24.165933+05:30"
+    },
+    "GOOG": {
+      "signal": "HOLD",
+      "priority": 2,
+      "price": NaN,
+      "target": NaN,
+      "stop_loss": NaN,
+      "last_run_at": "2026-08-04T08:44:24.786790+05:30"
+    },
+    "TCS.NS": {
+      "signal": "BUY / HOLD",
+      "priority": 2,
+      "price": 2440.9,
+      "target": 2636.17,
+      "stop_loss": 2318.85,
+      "last_run_at": "2026-08-04T08:44:24.904732+05:30"
+    },
+    "ITC.NS": {
+      "signal": "SELL",
+      "priority": 3,
+      "price": 286.65,
+      "target": 286.65,
+      "stop_loss": 272.32,
+      "last_run_at": "2026-08-04T08:44:24.915430+05:30"
+    },
+    "AAPL": {
+      "signal": "HOLD",
+      "priority": 2,
+      "price": NaN,
+      "target": NaN,
+      "stop_loss": NaN,
+      "last_run_at": "2026-08-04T08:44:25.845089+05:30"
+    },
+    "CHENNPETRO.NS": {
+      "signal": "BUY / HOLD",
+      "priority": 2,
+      "price": 1312.6,
+      "target": 1417.61,
+      "stop_loss": 1246.97,
+      "last_run_at": "2026-08-04T08:44:32.348489+05:30"
+    }
+  },
   "commodities": {
     "gold": {
       "buy_streak": 0,
       "last_buy_triggered": false,
-      "last_run_at": "2026-07-19T23:24:08.726940+05:30"
+      "last_run_at": "2026-08-04T08:44:39.934867+05:30"
     },
     "silver": {
       "buy_streak": 0,
       "last_buy_triggered": false,
-      "last_run_at": "2026-07-19T23:24:08.726979+05:30"
+      "last_run_at": "2026-08-04T08:44:39.935052+05:30"
     }
   },
   "track_record": {
-    "open": {},
+    "open": {
+      "SBIN.NS": {
+        "ticker": "SBIN.NS",
+        "stock_name": "SBIN",
+        "signal": "BUY / HOLD",
+        "entry_price": 1034.1,
+        "opened_at": "2026-08-04T08:44:23.037278+05:30",
+        "frozen_target": 1116.83,
+        "frozen_stop_loss": 982.39
+      },
+      "ICICIBANK.NS": {
+        "ticker": "ICICIBANK.NS",
+        "stock_name": "ICICIBANK",
+        "signal": "BUY / HOLD",
+        "entry_price": 1445.1,
+        "opened_at": "2026-08-04T08:44:24.165945+05:30",
+        "frozen_target": 1560.71,
+        "frozen_stop_loss": 1372.84
+      },
+      "TCS.NS": {
+        "ticker": "TCS.NS",
+        "stock_name": "TCS",
+        "signal": "BUY / HOLD",
+        "entry_price": 2440.9,
+        "opened_at": "2026-08-04T08:44:24.904739+05:30",
+        "frozen_target": 2636.17,
+        "frozen_stop_loss": 2318.85
+      },
+      "CHENNPETRO.NS": {
+        "ticker": "CHENNPETRO.NS",
+        "stock_name": "CHENNPETRO",
+        "signal": "BUY / HOLD",
+        "entry_price": 1312.6,
+        "opened_at": "2026-08-04T08:44:32.348532+05:30",
+        "frozen_target": 1417.61,
+        "frozen_stop_loss": 1246.97
+      }
+    },
     "closed": []
   }
 }

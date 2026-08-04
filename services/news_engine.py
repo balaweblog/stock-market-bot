@@ -1,7 +1,7 @@
 import requests
 import feedparser
 import urllib.parse
-from config import NEWS_API_KEY
+from utils.config import NEWS_API_KEY
 
 
 def get_news(stock):

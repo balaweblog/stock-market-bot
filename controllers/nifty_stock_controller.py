@@ -56,10 +56,11 @@ from email.mime.text import MIMEText
 
 import yfinance as yf
 
-import stockpredictor  # reuses LLM init, email config/credentials, and helpers
-from compliance import build_compliance_block_html
-from constants import WATCHLIST
-from swing_trade_advisor import (
+from utils import config
+from utils.logger import log
+from utils.compliance import build_compliance_block_html
+from utils.constants import WATCHLIST
+from controllers.swing_controller import (
     _env_int,
     generate_analysis,
     _strip_code_fences,
@@ -145,9 +146,9 @@ def _load_ticker_map():
                     if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
                 })
             else:
-                stockpredictor.log.warning("STOCK_TICKER_MAP_JSON is not a JSON object -- ignoring.")
+                log.warning("STOCK_TICKER_MAP_JSON is not a JSON object -- ignoring.")
         except json.JSONDecodeError as e:
-            stockpredictor.log.warning(f"STOCK_TICKER_MAP_JSON is not valid JSON ({e}) -- ignoring.")
+            log.warning(f"STOCK_TICKER_MAP_JSON is not valid JSON ({e}) -- ignoring.")
     return merged
 
 
@@ -167,7 +168,7 @@ def fetch_weekly_returns(watchlist):
 
     unmapped = [name for name in watchlist if not TICKER_MAP.get(name)]
     if unmapped:
-        stockpredictor.log.warning(
+        log.warning(
             "No ticker mapping for: %s -- weekly return will show n/a for "
             "these until added to DEFAULT_WATCHLIST_TICKERS or "
             "STOCK_TICKER_MAP_JSON." % ", ".join(unmapped)
@@ -181,7 +182,7 @@ def fetch_weekly_returns(watchlist):
             hist = yf.Ticker(ticker).history(period="12d", interval="1d", auto_adjust=True)
             closes = hist["Close"].dropna()
             if len(closes) < 2:
-                stockpredictor.log.warning(f"Not enough price history to compute weekly return for {name} ({ticker}).")
+                log.warning(f"Not enough price history to compute weekly return for {name} ({ticker}).")
                 continue
             recent = float(closes.iloc[-1])
             # ~5 trading days back approximates "last week"; clamp for short history.
@@ -189,7 +190,7 @@ def fetch_weekly_returns(watchlist):
             if week_ago:
                 results[name] = round((recent - week_ago) / week_ago * 100, 2)
         except Exception as e:
-            stockpredictor.log.warning(f"Could not compute weekly return for {name} ({ticker}): {e}")
+            log.warning(f"Could not compute weekly return for {name} ({ticker}): {e}")
 
     return results
 
@@ -388,12 +389,12 @@ def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
     text, sources, live = generate_analysis(prompt, max_tokens=3000)
     if not text:
-        stockpredictor.log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
+        log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
         sys.exit(1)
     _require_live_or_abort(live, "Stage 1 (market/macro)")
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        stockpredictor.log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
+        log.warning("Stage 1 output could not be parsed as JSON -- proceeding with an empty market section.")
         data = {}
     data.setdefault("developments", [])
     data.setdefault("market_sentiment", "Neutral")
@@ -403,12 +404,12 @@ def run_market_stage(today_str, lookback_note):
 def run_stock_stage(today_str, lookback_note):
     all_stocks, sources, used_live = [], [], False
     for batch in _chunks(WATCHLIST, STOCK_PER_BATCH):
-        stockpredictor.log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
+        log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
         prompt = build_stock_prompt(batch, today_str, lookback_note)
         stock_queries = [f"{name} share price target news {today_str}" for name in batch]
         text, s, live = generate_analysis(prompt, max_tokens=3200, extra_context_queries=stock_queries)
         if not text:
-            stockpredictor.log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
+            log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 2 (stock batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -416,7 +417,7 @@ def run_stock_stage(today_str, lookback_note):
         if isinstance(stocks, list):
             all_stocks.extend(stocks)
         else:
-            stockpredictor.log.warning(f"Could not parse stock JSON for batch: {', '.join(batch)}")
+            log.warning(f"Could not parse stock JSON for batch: {', '.join(batch)}")
         for src in s:
             if src not in sources:
                 sources.append(src)
@@ -440,11 +441,11 @@ def run_stock_stage(today_str, lookback_note):
 def run_sector_stage(today_str, lookback_note):
     all_sectors, sources, used_live = [], [], False
     for batch in _chunks(SECTORS_STOCK, SECTORS_PER_BATCH):
-        stockpredictor.log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
+        log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
         prompt = build_sector_prompt(batch, today_str, lookback_note)
         text, s, live = generate_analysis(prompt, max_tokens=2000)
         if not text:
-            stockpredictor.log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
+            log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
             continue
         _require_live_or_abort(live, f"Stage 3 (sector batch: {', '.join(batch)})")
         data = _parse_json_object(text)
@@ -452,7 +453,7 @@ def run_sector_stage(today_str, lookback_note):
         if isinstance(sectors, list):
             all_sectors.extend(sectors)
         else:
-            stockpredictor.log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
+            log.warning(f"Could not parse sector JSON for batch: {', '.join(batch)}")
         for src in s:
             if src not in sources:
                 sources.append(src)
@@ -468,38 +469,37 @@ def _plain_generate(prompt, max_tokens=3800):
     -> local model, mirroring generate_analysis's backend order without
     any of the search-cascade machinery.
     """
-    backend = stockpredictor.init_llm_generator()
-    stockpredictor.log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
+    backend = llm_backend.init_llm_generator()
+    log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
 
-    if backend == "groq" and getattr(stockpredictor, "groq_client", None) is not None:
+    if backend == "groq" and getattr(llm_backend, "groq_client", None) is not None:
         try:
-            response = stockpredictor.groq_client.chat.completions.create(
-                model=os.getenv("STOCK_SYNTHESIS_MODEL", "llama-3.3-70b-versatile"),
+            response = llm_backend.groq_client.chat.completions.create(
+                model=llm_backend.SYNTHESIS_MODELS[0],
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=max_tokens,
+                temperature=0.4,
+                max_tokens=3800,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
-            stockpredictor.log.error(f"Groq synthesis call failed: {e}")
+            log.error(f"Groq synthesis call failed: {e}")
 
-    have_gemini = getattr(stockpredictor, "gemini_client", None) is not None or (
-        os.getenv("GOOGLE_API_KEY") and getattr(stockpredictor, "genai", None) is not None
+    have_gemini = getattr(llm_backend, "gemini_client", None) is not None or (
+        os.getenv("GOOGLE_API_KEY") and getattr(llm_backend, "genai", None) is not None
     )
-    if have_gemini:
+    if backend == "gemini" or have_gemini:
         try:
-            if getattr(stockpredictor, "gemini_client", None) is None:
-                stockpredictor.gemini_client = stockpredictor.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = stockpredictor.gemini_client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt,
+            if getattr(llm_backend, "gemini_client", None) is None:
+                llm_backend.gemini_client = llm_backend.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+            response = llm_backend.gemini_client.models.generate_content(
+                model=llm_backend.GEMINI_MODEL, contents=prompt
             )
             return response.text.strip()
         except Exception as e:
-            stockpredictor.log.error(f"Gemini synthesis call failed: {e}")
+            log.error(f"Gemini synthesis call failed: {e}")
 
-    local_backend = stockpredictor.init_llm_generator(force_local=True)
-    if local_backend == "local" and stockpredictor.llm_pipeline is not None:
+    local_backend = llm_backend.init_llm_generator(force_local=True)
+    if local_backend == "local" and llm_backend.llm_pipeline is not None:
         text = _generate_local(prompt)
         if text:
             return text
@@ -511,11 +511,11 @@ def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, stocks_data, sectors_data, WATCHLIST, today_str)
     text = _plain_generate(prompt)
     if not text:
-        stockpredictor.log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
+        log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
         sys.exit(1)
     data = _parse_json_object(text)
     if not isinstance(data, dict):
-        stockpredictor.log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
+        log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
         data = {}
     data.setdefault("top_developments", [])
     return data
@@ -888,27 +888,27 @@ def build_email_html(market_data, stocks_data, sectors_data, synthesis_data, sou
 
 
 def send_stock_email(html_body, today_str):
-    if not all([stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD, stockpredictor.EMAIL_TO]):
-        stockpredictor.log.error(
+    if not all([config.EMAIL_FROM, config.EMAIL_PASSWORD, config.EMAIL_TO]):
+        log.error(
             "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
             "and EMAIL_TO (the same env vars main.py uses)."
         )
         return False
 
-    to_recipients = stockpredictor.parse_email_list(stockpredictor.EMAIL_TO)
-    cc_recipients = stockpredictor.parse_email_list(getattr(stockpredictor, "EMAIL_CC", "") or "")
+    to_recipients = config.parse_email_list(config.EMAIL_TO)
+    cc_recipients = config.parse_email_list(getattr(config, "EMAIL_CC", "") or "")
 
     if not to_recipients:
-        stockpredictor.log.error("No valid TO recipients found in EMAIL_TO.")
+        log.error("No valid TO recipients found in EMAIL_TO.")
         return False
 
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
-    subject = f"Stock Market News Review — {stockpredictor.get_date_with_suffix(now_ist)} · {time_str}"
+    subject = f"Stock Market News Review — {config.get_date_with_suffix(now_ist)} · {time_str}"
 
     msg = MIMEText(html_body, "html")
     msg["Subject"] = subject
-    msg["From"] = stockpredictor.EMAIL_FROM
+    msg["From"] = config.EMAIL_FROM
     msg["To"] = ", ".join(to_recipients)
     if cc_recipients:
         msg["Cc"] = ", ".join(cc_recipients)
@@ -918,24 +918,24 @@ def send_stock_email(html_body, today_str):
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
             server.starttls()
-            server.login(stockpredictor.EMAIL_FROM, stockpredictor.EMAIL_PASSWORD)
-            server.sendmail(stockpredictor.EMAIL_FROM, all_recipients, msg.as_string())
-        stockpredictor.log.info("Stock market news email sent successfully.")
+            server.login(config.EMAIL_FROM, config.EMAIL_PASSWORD)
+            server.sendmail(config.EMAIL_FROM, all_recipients, msg.as_string())
+        log.info("Stock market news email sent successfully.")
         return True
     except smtplib.SMTPAuthenticationError:
-        stockpredictor.log.error(
+        log.error(
             "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
             "(use a Gmail App Password, not the account password)."
         )
     except Exception as e:
-        stockpredictor.log.error(f"Failed to send stock market news email: {e}")
+        log.error(f"Failed to send stock market news email: {e}")
         traceback.print_exc()
     return False
 
 
 def run():
     today_str, now_ist, lookback_note = _run_context()
-    stockpredictor.log.info(f"Stock market news review starting for {today_str} (watchlist: {len(WATCHLIST)} stocks).")
+    log.info(f"Stock market news review starting for {today_str} (watchlist: {len(WATCHLIST)} stocks).")
 
     market_data, market_sources, market_live = run_market_stage(today_str, lookback_note)
     stocks_data, stock_sources, stocks_live = run_stock_stage(today_str, lookback_note)

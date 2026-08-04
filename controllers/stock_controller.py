@@ -12,8 +12,6 @@ import ta
 import smtplib
 import traceback
 from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.application import MIMEApplication
 from datetime import datetime
 from zoneinfo import ZoneInfo
 try:
@@ -23,24 +21,24 @@ except ImportError:
 # NOTE: transformers/Groq/google-genai imports and all LLM client state now
 # live in llm_backend.py (shared with swing_trade_advisor.py and
 # optionstrategy.py) -- see the llm_backend import below.
-from config import *
-from stock_fetcher import fetch_fundamentals
-from fundamentals import score_fundamentals
-from advanced_fundamentals import fetch_advanced_fundamentals, score_advanced_fundamentals
-from market_context import build_market_context, get_resilient_session
-from news_engine import get_news
-from sentiment_score import score_headlines
-from scorer import final_score, decision
-from position_sizing import apply_risk_management
-from recommendation_logic import choose_stock_entry
+from utils.config import *
+from services.stock_fetcher import fetch_fundamentals
+from models.fundamentals import score_fundamentals
+from models.advanced_fundamentals import fetch_advanced_fundamentals, score_advanced_fundamentals
+from models.market_context import build_market_context, get_resilient_session
+from services.news_engine import get_news
+from llm.sentiment_score import score_headlines
+from models.scorer import final_score, decision
+from models.position_sizing import apply_risk_management
+from models.recommendation_logic import choose_stock_entry
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from logger import log
-from commodity_tracker import CommodityTracker
-from compliance import build_compliance_block_html
-from track_record import update_track_record, build_track_record_html
-from support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
-import llm_backend
+from utils.logger import log
+from services.commodity_tracker import CommodityTracker
+from utils.compliance import build_compliance_block_html
+from models.track_record import update_track_record, build_track_record_html
+from models.support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
+from llm import llm_backend
 
 import threading
 
