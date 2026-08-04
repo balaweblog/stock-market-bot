@@ -68,6 +68,7 @@ from controllers.swing_controller import (
     _generate_local,
     _require_live_or_abort,
 )
+from llm import llm_backend
 
 SANS = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 SERIF = "Georgia,'Times New Roman',serif"
