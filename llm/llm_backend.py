@@ -73,6 +73,16 @@ try:
 except ImportError:
     genai = None
 
+try:
+    import openai
+except ImportError:
+    openai = None
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
 from utils.logger import log
 
 

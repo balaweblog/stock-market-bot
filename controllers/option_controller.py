@@ -4201,13 +4201,13 @@ def run():
         horizons = repair_rejected_legs(horizons, live_data, sources)
         aggregate_pct, over_cap = _aggregate_risk_from_verified(horizons)
         if over_cap:
-            stockpredictor.log.warning(
+            log.warning(
                 f"Computed worst-case combined max loss ({aggregate_pct}%) exceeds the "
                 f"{AGGREGATE_CAP_PCT:.0f}% cap -- flagging in the report."
             )
         horizons_html = render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data)
     else:
-        stockpredictor.log.error("Could not parse JSON from LLM output; falling back to raw text display.")
+        log.error("Could not parse JSON from LLM output; falling back to raw text display.")
         sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
         horizons_html = (
             f'<div style="font-family:{sans};font-size:12px;color:#8B2E2E;margin-bottom:8px;">'
@@ -4220,7 +4220,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("option_strategy_report.html", "w") as f:
             f.write(email_html)
-        stockpredictor.log.info("DRY_RUN enabled -- wrote option_strategy_report.html instead of emailing.")
+        log.info("DRY_RUN enabled -- wrote option_strategy_report.html instead of emailing.")
         return
 
     send_option_strategy_email(email_html)

@@ -959,7 +959,7 @@ def run():
     if os.getenv("DRY_RUN", "false").lower() == "true":
         with open("stock_market_report.html", "w") as f:
             f.write(email_html)
-        stockpredictor.log.info("DRY_RUN enabled -- wrote stock_market_report.html instead of emailing.")
+        log.info("DRY_RUN enabled -- wrote stock_market_report.html instead of emailing.")
         return
 
     send_stock_email(email_html, today_str)
