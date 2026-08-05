@@ -3,8 +3,6 @@ import functools
 import re
 import math
 import json
-import time
-import random
 import html
 import requests
 import yfinance as yf
@@ -17,14 +15,6 @@ try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     sync_playwright = None
-try:
-    from yfinance.exceptions import YFRateLimitError
-except ImportError:
-    # Older/newer yfinance versions may not expose this exact class --
-    # fall back to a sentinel that will never match isinstance() so the
-    # rate-limit-specific handling below just degrades to the generic path.
-    class YFRateLimitError(Exception):
-        pass
 # NOTE: transformers/Groq/google-genai imports and all LLM client state now
 # live in llm_backend.py (shared with swing_trade_advisor.py and
 # optionstrategy.py) -- see the llm_backend import below.
@@ -33,6 +23,7 @@ from services.stock_fetcher import fetch_fundamentals
 from models.fundamentals import score_fundamentals
 from models.advanced_fundamentals import fetch_advanced_fundamentals, score_advanced_fundamentals
 from models.market_context import build_market_context, get_resilient_session
+from utils.yf_throttle import call_with_retries
 from services.news_engine import get_news
 from llm.sentiment_score import score_headlines
 from models.scorer import final_score, decision
@@ -578,28 +569,29 @@ def build_ai_portfolio_story_html(portfolio_summary, stock_count, used_live_sear
 
 
 # fetch_data() is called concurrently for every ticker in the run via a
-# ThreadPoolExecutor (see the process_stock dispatch below). Per-call retry
-# with backoff (further down in fetch_data) is not enough on its own:
-# Yahoo Finance's rate limiter is keyed off request *rate* from this IP, so
-# 8-10 threads all issuing yf.download() within the same second or two will
-# trip it almost immediately, and then all 8-10 threads retry in the same
-# rough window and trip it again. _YF_THROTTLE forces every yf.download()
-# call in the process -- across all threads -- to be spaced at least
-# _YF_MIN_INTERVAL_SECONDS apart, turning "10 requests in the same instant"
-# into "10 requests spread over ~15-20s", which is what actually avoids the
-# 429s rather than just retrying into the same wall.
-_YF_MIN_INTERVAL_SECONDS = 2.0
-_yf_throttle_lock = threading.Lock()
-_yf_last_call_time = [0.0]
-
-
-def _yf_throttle():
-    with _yf_throttle_lock:
-        now = time.monotonic()
-        wait = _yf_last_call_time[0] + _YF_MIN_INTERVAL_SECONDS - now
-        if wait > 0:
-            time.sleep(wait)
-        _yf_last_call_time[0] = time.monotonic()
+# ThreadPoolExecutor (see the process_stock dispatch below), and
+# services.stock_fetcher / models.market_context each make their own
+# separate yfinance calls for the same tickers during the same run. All
+# three used to throttle/retry independently (or not at all), which meant
+# Yahoo Finance's rate limiter -- keyed off request *rate from this IP as a
+# whole* -- still got tripped by the combined, uncoordinated traffic even
+# when any single module's own calls looked well-behaved. call_with_retries
+# (utils/yf_throttle.py) is now shared by all of them: it enforces one
+# minimum spacing between *any* yfinance call anywhere in the process, and
+# backs off hard (and holds every other in-flight caller back too) on an
+# actual rate-limit error rather than a generic short retry.
+def _download_or_raise(symbol):
+    df = yf.download(
+        symbol,
+        period="2y",
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+        session=get_resilient_session()
+    )
+    if df is None or df.empty:
+        raise Exception(f"No data for {symbol}")
+    return df
 
 
 def fetch_data(symbol):
@@ -626,50 +618,11 @@ def fetch_data(symbol):
     # dispatched concurrently via ThreadPoolExecutor(max_workers=10) --
     # bursts like that reliably trigger Yahoo Finance's rate limiting
     # (HTTP 429) or plain intermittent drops, and a different, seemingly
-    # random subset of tickers fails each run as a result. Retry a few
-    # times with exponential backoff (+ jitter, so 10 threads don't all
-    # retry in lockstep and immediately re-trigger the same rate limit)
-    # before giving up.
-    max_attempts = 5
-    last_exc = None
-    df = None
-    for attempt in range(max_attempts):
-        # Space every actual call to Yahoo out from every other thread's
-        # calls, not just this ticker's own retries -- see _yf_throttle().
-        _yf_throttle()
-        try:
-            df = yf.download(
-                symbol,
-                period="2y",
-                interval="1d",
-                auto_adjust=True,
-                progress=False,
-                session=get_resilient_session()
-            )
-            if not df.empty:
-                break
-            last_exc = Exception(f"No data for {symbol}")
-        except Exception as exc:
-            last_exc = exc
-
-        if attempt < max_attempts - 1:
-            if isinstance(last_exc, YFRateLimitError):
-                # A 429 means the whole IP is currently rate-limited, not
-                # just this ticker -- a short backoff just re-trips it.
-                # Back off much harder (and increase the shared inter-call
-                # spacing for every other in-flight ticker too) before
-                # trying again.
-                sleep_for = (15 * (attempt + 1)) + random.uniform(0, 5)
-                with _yf_throttle_lock:
-                    _yf_last_call_time[0] = time.monotonic() + sleep_for
-            else:
-                sleep_for = (2 ** attempt) + random.uniform(0, 1)
-            print(f"fetch_data({symbol}): attempt {attempt + 1}/{max_attempts} failed "
-                  f"({last_exc}), retrying in {sleep_for:.1f}s")
-            time.sleep(sleep_for)
-
-    if df is None or df.empty:
-        raise last_exc if last_exc is not None else Exception(f"No data for {symbol}")
+    # random subset of tickers fails each run as a result.
+    # call_with_retries applies the process-wide shared throttle before
+    # each attempt and backs off hard on real rate-limit errors (see
+    # utils/yf_throttle.py) instead of retrying into the same wall.
+    df = call_with_retries(_download_or_raise, symbol, max_attempts=5)
 
     df.reset_index(inplace=True)
 

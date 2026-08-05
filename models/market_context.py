@@ -1,23 +1,32 @@
 import yfinance as yf
 import pandas as pd
 from datetime import timedelta
-import requests
+
+from utils.yf_throttle import get_shared_session, call_with_retries
+
 
 def get_resilient_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive"
-    })
-    return session
+    # NOTE: this used to build a brand new requests.Session() on every
+    # call, which meant yfinance could never reuse a cookie/crumb across
+    # calls -- every single request (this one, stock_controller's
+    # fetch_data, stock_fetcher's fundamentals calls, all of which called
+    # their own version of this) effectively renegotiated auth from
+    # scratch, multiplying the number of requests hitting Yahoo and making
+    # rate-limit (429) errors much more likely. Now this returns one
+    # process-wide session shared by every module that talks to yfinance
+    # (see utils/yf_throttle.py), so the crumb is negotiated once and
+    # reused, and all callers share the same request-rate throttle.
+    return get_shared_session()
 
 
 def fetch_index_context(index_symbol="^NSEI", period="180d"):
     try:
         session = get_resilient_session()
-        df = yf.download(index_symbol, period=period, interval="1d", auto_adjust=True, progress=False, session=session)
+        df = call_with_retries(
+            yf.download,
+            index_symbol, period=period, interval="1d", auto_adjust=True,
+            progress=False, session=session,
+        )
         if df.empty:
             return {
                 "index_symbol": index_symbol,
@@ -121,7 +130,7 @@ def build_market_context(symbol):
     try:
         session = get_resilient_session()
         ticker = yf.Ticker(symbol, session=session)
-        info = ticker.info
+        info = call_with_retries(lambda: ticker.info)
         if info is None:
             info = {}
         sector = info.get("sector", "unknown") if isinstance(info, dict) else "unknown"

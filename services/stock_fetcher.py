@@ -1,30 +1,31 @@
-import time
-import random
 from datetime import date, datetime
 
 import yfinance as yf
 import pandas as pd
-import requests
 
-# Set a realistic User-Agent header for yfinance HTTP requests to avoid 401 Unauthorized errors
-_yf_session = requests.Session()
-_yf_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-})
-# Inject the custom session into yfinance's internal request handling
+from utils.yf_throttle import get_shared_session, call_with_retries, throttle as _yf_pace
+
+# NOTE: this used to create its own module-level requests.Session, separate
+# from the one models/market_context.py and controllers/stock_controller.py
+# each built independently -- three uncoordinated sessions (so three
+# separate cookie/crumb negotiations) and three uncoordinated request
+# streams hitting Yahoo Finance, which is why fundamentals lookups here
+# could get 429'd even in a run where fetch_data() itself was behaving.
+# _yf_session now points at the single process-wide shared session so the
+# crumb is negotiated once and every module's request-rate throttle is the
+# same clock (see utils/yf_throttle.py).
+_yf_session = get_shared_session()
+# Inject the shared session into yfinance's internal request handling too,
+# for the one call below (fetch_stock_data) that doesn't pass a session
+# explicitly.
 yf.utils._requests = _yf_session
 
-def _with_retries(func, symbol, max_attempts=4):
-    for attempt in range(max_attempts):
-        try:
-            return func(symbol)
-        except Exception as e:
-            if "RateLimitError" in str(type(e).__name__) or "429" in str(e) or "Too Many Requests" in str(e):
-                if attempt == max_attempts - 1:
-                    raise
-                time.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
-            else:
-                raise
+
+def _with_retries(func, symbol, max_attempts=5):
+    # Delegates to the shared, rate-limit-aware retry helper so this
+    # module's backoff behavior (and the shared throttle applied before
+    # every attempt) matches every other module that talks to yfinance.
+    return call_with_retries(func, symbol, max_attempts=max_attempts)
 
 
 def format_event_date(value):
@@ -195,12 +196,14 @@ def build_upcoming_event_summary(ticker, info=None):
     }
 
 def fetch_stock_data(symbol):
-    df = yf.download(
+    df = call_with_retries(
+        yf.download,
         symbol,
         period="300d",
         interval="1d",
         auto_adjust=True,
-        progress=False
+        progress=False,
+        session=_yf_session,
     )
 
     df.reset_index(inplace=True)
@@ -340,7 +343,14 @@ def _fetch_ownership_activity_raw(symbol):
     }
 
     try:
-        ticker = yf.Ticker(symbol)
+        ticker = yf.Ticker(symbol, session=_yf_session)
+        # This function makes several separate yfinance HTTP calls
+        # (info, institutional_holders, mutualfund_holders,
+        # insider_purchases) back to back. call_with_retries()/_with_retries
+        # only throttles once at the top of the whole function, so each of
+        # these internal calls needs its own throttle() to keep them spaced
+        # out too -- otherwise they'd fire as an uncoordinated burst.
+        _yf_pace()
         info = ticker.info or {}
 
         # ── Insider / Promoter % ──────────────────────────────────────────
@@ -348,6 +358,7 @@ def _fetch_ownership_activity_raw(symbol):
         result["insider_pct"] = insider_pct
 
         # ── Institutional (FII proxy) % ───────────────────────────────────
+        _yf_pace()
         ih = ticker.institutional_holders
         if ih is not None and not ih.empty:
             # Sum pctHeld across all institutional holders for latest two report dates
@@ -385,6 +396,7 @@ def _fetch_ownership_activity_raw(symbol):
         result["institutional_color"] = color
 
         # ── Mutual Fund / DII % ───────────────────────────────────────────
+        _yf_pace()
         mf = ticker.mutualfund_holders
         if mf is not None and not mf.empty:
             pct_col = next((c for c in mf.columns if "pct" in c.lower() or "percent" in c.lower()), None)
@@ -417,6 +429,7 @@ def _fetch_ownership_activity_raw(symbol):
         # ── Net insider purchase activity ─────────────────────────────────
         net_shares = None
         activity = "Neutral"
+        _yf_pace()
         purchases = ticker.insider_purchases
         if purchases is not None and not purchases.empty:
             if "Net Shares Purchased (Sold)" in purchases.columns:
