@@ -509,16 +509,17 @@ def _try_groq_compound_model(prompt, model_name, max_attempts, max_tokens, log_l
             sources = _extract_groq_sources(response)
             return text, sources, True  # True = had live web search available
         except Exception as e:
-            log.error(
+            if _is_request_too_large(e):
+                log.warning(f"Request too large for {model_name} -- skipping further retries of this payload.")
+                return None
+            if _is_daily_quota_exceeded(e):
+                log.warning(f"Groq daily token quota (TPD) exhausted for {model_name} -- skipping remaining retries.")
+                return None
+
+            log.warning(
                 f"Groq ({model_name}) {log_label} generation failed "
                 f"(attempt {attempt + 1}/{max_attempts}): {e}"
             )
-            if _is_request_too_large(e):
-                log.error(f"Request too large for {model_name} -- skipping further retries of this payload.")
-                return None
-            if _is_daily_quota_exceeded(e):
-                log.error(f"Groq daily token quota (TPD) exhausted for {model_name} -- skipping remaining retries.")
-                return None
             if attempt < max_attempts - 1:
                 wait_s = _parse_groq_retry_seconds(e) or 10
                 log.info(f"Retrying {model_name} in {wait_s:.1f}s...")
@@ -564,7 +565,7 @@ def _try_synthesis_models(prompt, max_tokens, log_label="analysis"):
             text = response.choices[0].message.content.strip()
             return text, True  # True: grounded in real pre-gathered context
         except Exception as e:
-            log.error(f"Groq synthesis over gathered context failed with {model_name} ({log_label}): {e}")
+            log.warning(f"Groq synthesis over gathered context failed with {model_name} ({log_label}): {e}")
             if _is_auth_error(e):
                 # Same key, so every other model would fail identically --
                 # no point burning more requests trying them.

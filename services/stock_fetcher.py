@@ -4,10 +4,10 @@ from datetime import date, datetime
 
 import yfinance as yf
 import pandas as pd
-import requests_cache
+import requests
+
 # Set a realistic User-Agent header for yfinance HTTP requests to avoid 401 Unauthorized errors
-# Use requests_cache to avoid redundant fetches for the same data in the same run
-_yf_session = requests_cache.CachedSession("yfinance.cache", expire_after=3600)
+_yf_session = requests.Session()
 _yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 })
