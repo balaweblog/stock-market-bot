@@ -29,6 +29,7 @@ import json
 import html
 import time
 import requests
+import threading
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -43,6 +44,7 @@ from utils import config
 from utils.logger import log
 from services.stock_fetcher import fetch_stock_data
 from models.market_context import classify_market
+from utils.yf_throttle import get_shared_session, call_with_retries
 from llm import llm_backend  # shared LLM init + fallback chain (see llm_backend.py)
 from utils.compliance import build_compliance_block_html
 
@@ -1440,17 +1442,51 @@ def _fetch_fundamentals(ticker):
     whatever the LLM claimed about the company's financials. Returns a
     dict (fields may be None if unavailable) or None if the fetch fails
     entirely / yfinance isn't installed.
+
+    NOTE: this used to build its own bare `yf.Ticker(ticker)` with no
+    shared session and no throttle/retry, called from up to 10 concurrent
+    threads (see the ThreadPoolExecutor in _deterministic_fundamentals_screen)
+    across the entire ticker universe (100+ symbols) -- completely
+    uncoordinated with controllers.stock_controller's and
+    services.stock_fetcher's own yfinance traffic. That kind of unthrottled
+    concurrent burst is exactly what produces the intermittent "quote not
+    found" 404s seen in practice for perfectly valid tickers (LTIM.NS,
+    TATAMOTORS.NS, etc.) -- those errors are a symptom of Yahoo's
+    session/crumb handling breaking down under load, not those symbols
+    actually being delisted. This now routes through the same shared
+    session + process-wide throttle + rate-limit-aware retry used
+    everywhere else (utils/yf_throttle.py), and results are cached per
+    ticker for the life of the process since _verify_fundamentals() and
+    check_candidate() were each independently calling this for the same
+    ticker (2x the necessary yfinance calls for every qualifying
+    candidate).
     """
     ticker = (ticker or "").strip()
     if not ticker:
         return None
+    if ticker in _fundamentals_cache:
+        return _fundamentals_cache[ticker]
+    with _fundamentals_cache_lock:
+        if ticker in _fundamentals_cache:
+            return _fundamentals_cache[ticker]
+        result = _fetch_fundamentals_uncached(ticker)
+        _fundamentals_cache[ticker] = result
+        return result
+
+
+_fundamentals_cache = {}
+_fundamentals_cache_lock = threading.Lock()
+
+
+def _fetch_fundamentals_uncached(ticker):
     try:
         import yfinance as yf
     except ImportError:
         log.warning("yfinance not installed -- fundamentals verification skipped.")
         return None
-    try:
-        yt = yf.Ticker(ticker)
+
+    def _raw():
+        yt = yf.Ticker(ticker, session=get_shared_session())
         info = yt.info or {}
         result = {
             "debt_to_equity": info.get("debtToEquity"),
@@ -1483,9 +1519,14 @@ def _fetch_fundamentals(ticker):
                                 result["profit_growth_yoy"] = None  # Turnaround case, not standard growth
                             else:
                                 result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+            elif qf is None or qf.empty:
+                pass
         except Exception as e:
             log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
         return result
+
+    try:
+        return call_with_retries(_raw, max_attempts=5)
     except Exception as e:
         log.warning(f"Could not fetch fundamentals for '{ticker}': {e}")
         return None
