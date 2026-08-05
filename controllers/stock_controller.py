@@ -17,6 +17,14 @@ try:
     from playwright.sync_api import sync_playwright
 except ImportError:
     sync_playwright = None
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:
+    # Older/newer yfinance versions may not expose this exact class --
+    # fall back to a sentinel that will never match isinstance() so the
+    # rate-limit-specific handling below just degrades to the generic path.
+    class YFRateLimitError(Exception):
+        pass
 # NOTE: transformers/Groq/google-genai imports and all LLM client state now
 # live in llm_backend.py (shared with swing_trade_advisor.py and
 # optionstrategy.py) -- see the llm_backend import below.
@@ -569,6 +577,31 @@ def build_ai_portfolio_story_html(portfolio_summary, stock_count, used_live_sear
     """
 
 
+# fetch_data() is called concurrently for every ticker in the run via a
+# ThreadPoolExecutor (see the process_stock dispatch below). Per-call retry
+# with backoff (further down in fetch_data) is not enough on its own:
+# Yahoo Finance's rate limiter is keyed off request *rate* from this IP, so
+# 8-10 threads all issuing yf.download() within the same second or two will
+# trip it almost immediately, and then all 8-10 threads retry in the same
+# rough window and trip it again. _YF_THROTTLE forces every yf.download()
+# call in the process -- across all threads -- to be spaced at least
+# _YF_MIN_INTERVAL_SECONDS apart, turning "10 requests in the same instant"
+# into "10 requests spread over ~15-20s", which is what actually avoids the
+# 429s rather than just retrying into the same wall.
+_YF_MIN_INTERVAL_SECONDS = 2.0
+_yf_throttle_lock = threading.Lock()
+_yf_last_call_time = [0.0]
+
+
+def _yf_throttle():
+    with _yf_throttle_lock:
+        now = time.monotonic()
+        wait = _yf_last_call_time[0] + _YF_MIN_INTERVAL_SECONDS - now
+        if wait > 0:
+            time.sleep(wait)
+        _yf_last_call_time[0] = time.monotonic()
+
+
 def fetch_data(symbol):
     # NOTE: period was previously "300d" (a custom, non-native yfinance
     # period string). That only yields ~205-215 actual trading rows once
@@ -597,10 +630,13 @@ def fetch_data(symbol):
     # times with exponential backoff (+ jitter, so 10 threads don't all
     # retry in lockstep and immediately re-trigger the same rate limit)
     # before giving up.
-    max_attempts = 4
+    max_attempts = 5
     last_exc = None
     df = None
     for attempt in range(max_attempts):
+        # Space every actual call to Yahoo out from every other thread's
+        # calls, not just this ticker's own retries -- see _yf_throttle().
+        _yf_throttle()
         try:
             df = yf.download(
                 symbol,
@@ -617,7 +653,17 @@ def fetch_data(symbol):
             last_exc = exc
 
         if attempt < max_attempts - 1:
-            sleep_for = (2 ** attempt) + random.uniform(0, 1)
+            if isinstance(last_exc, YFRateLimitError):
+                # A 429 means the whole IP is currently rate-limited, not
+                # just this ticker -- a short backoff just re-trips it.
+                # Back off much harder (and increase the shared inter-call
+                # spacing for every other in-flight ticker too) before
+                # trying again.
+                sleep_for = (15 * (attempt + 1)) + random.uniform(0, 5)
+                with _yf_throttle_lock:
+                    _yf_last_call_time[0] = time.monotonic() + sleep_for
+            else:
+                sleep_for = (2 ** attempt) + random.uniform(0, 1)
             print(f"fetch_data({symbol}): attempt {attempt + 1}/{max_attempts} failed "
                   f"({last_exc}), retrying in {sleep_for:.1f}s")
             time.sleep(sleep_for)
