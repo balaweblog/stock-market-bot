@@ -1,15 +1,30 @@
+import time
+import random
 from datetime import date, datetime
 
 import yfinance as yf
 import pandas as pd
-import requests
+import requests_cache
 # Set a realistic User-Agent header for yfinance HTTP requests to avoid 401 Unauthorized errors
-_yf_session = requests.Session()
+# Use requests_cache to avoid redundant fetches for the same data in the same run
+_yf_session = requests_cache.CachedSession("yfinance.cache", expire_after=3600)
 _yf_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 })
 # Inject the custom session into yfinance's internal request handling
 yf.utils._requests = _yf_session
+
+def _with_retries(func, symbol, max_attempts=4):
+    for attempt in range(max_attempts):
+        try:
+            return func(symbol)
+        except Exception as e:
+            if "RateLimitError" in str(type(e).__name__) or "429" in str(e) or "Too Many Requests" in str(e):
+                if attempt == max_attempts - 1:
+                    raise
+                time.sleep((2 ** attempt) + random.uniform(0.5, 1.5))
+            else:
+                raise
 
 
 def format_event_date(value):
@@ -221,7 +236,7 @@ def fetch_stock_data(symbol):
     return df
 
 
-def fetch_fundamentals(symbol):
+def _fetch_fundamentals_raw(symbol):
     # Use custom session with realistic User-Agent for Yahoo Finance requests
     ticker = yf.Ticker(symbol, session=_yf_session)
     info = ticker.info
@@ -236,6 +251,31 @@ def fetch_fundamentals(symbol):
         "beta": info.get("beta") if info.get("beta") is not None else info.get("beta3Year"),
         "upcomingEvents": build_upcoming_event_summary(ticker,info),
     }
+
+def fetch_fundamentals(symbol):
+    return _with_retries(_fetch_fundamentals_raw, symbol)
+
+def _fetch_advanced_fundamentals_raw(symbol):
+    ticker = yf.Ticker(symbol, session=_yf_session)
+    info = ticker.info
+
+    return {
+        "forwardPE": info.get("forwardPE"),
+        "pegRatio": info.get("pegRatio"),
+        "priceToSales": info.get("priceToSalesTrailing12Months"),
+        "ebitdaMargins": info.get("ebitdaMargins"),
+        "profitMargins": info.get("profitMargins"),
+        "operatingMargins": info.get("operatingMargins"),
+        "currentRatio": info.get("currentRatio"),
+        "quickRatio": info.get("quickRatio"),
+        "freeCashflow": info.get("freeCashflow"),
+        "operatingCashflow": info.get("operatingCashflow"),
+        "revenueGrowth": info.get("revenueGrowth"),
+        "earningsGrowth": info.get("earningsGrowth"),
+    }
+
+def fetch_advanced_fundamentals(symbol):
+    return _with_retries(_fetch_advanced_fundamentals_raw, symbol)
 
 
 def _safe_pct(value):
@@ -262,7 +302,7 @@ def _direction_arrow(current, previous):
     return "→", "#64748b"
 
 
-def fetch_ownership_activity(symbol):
+def _fetch_ownership_activity_raw(symbol):
     """
     Fetches institutional, mutual-fund, insider ownership data from yfinance.
 
@@ -375,29 +415,22 @@ def fetch_ownership_activity(symbol):
         result["mutualfund_color"] = color
 
         # ── Net insider purchase activity ─────────────────────────────────
-        try:
-            ip = ticker.insider_purchases
-            if ip is not None and not ip.empty:
-                # Row index labels vary; look for "Net Shares Purchased (Sold)" row
-                shares_col = next((c for c in ip.columns if "share" in str(c).lower()), None)
-                label_col = ip.columns[0]  # first col is the label
-                if shares_col:
-                    net_row = ip[ip[label_col].astype(str).str.contains("Net Shares", case=False, na=False)]
-                    if not net_row.empty:
-                        net_val = net_row[shares_col].iloc[0]
-                        try:
-                            net_val = int(float(net_val))
-                            result["net_insider_shares"] = net_val
-                            if net_val > 0:
-                                result["net_insider_activity"] = "Net Buy"
-                            elif net_val < 0:
-                                result["net_insider_activity"] = "Net Sell"
-                            else:
-                                result["net_insider_activity"] = "Neutral"
-                        except (TypeError, ValueError):
-                            pass
-        except Exception:
-            pass
+        net_shares = None
+        activity = "Neutral"
+        purchases = ticker.insider_purchases
+        if purchases is not None and not purchases.empty:
+            if "Net Shares Purchased (Sold)" in purchases.columns:
+                try:
+                    net_shares = int(purchases["Net Shares Purchased (Sold)"].iloc[0])
+                    if net_shares > 0:
+                        activity = "Net Buy"
+                    elif net_shares < 0:
+                        activity = "Net Sell"
+                except (ValueError, TypeError, IndexError):
+                    pass
+
+        result["net_insider_activity"] = activity
+        result["net_insider_shares"] = net_shares
 
         # Insider direction arrow based on net activity
         if result["net_insider_activity"] == "Net Buy":

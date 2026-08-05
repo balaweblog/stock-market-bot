@@ -1,19 +1,28 @@
-pandas
-numpy
-yfinance
-ta
-requests
-feedparser
-transformers
-torch
-beautifulsoup4
-google-generativeai
-ratelimit
-requests-cache
-weasyprint
-groq
-pyqt5
-pyqtwebengine
-playwright
-google-genai
-mistralai
+# Core dependencies — pinned to known-good versions
+pandas==3.0.3
+numpy==1.26.4
+yfinance==1.4.1
+ta==0.11.0
+requests==2.34.2
+feedparser==6.0.12
+beautifulsoup4==4.15.0
+ratelimit==2.2.1
+requests-cache==1.3.2
+
+# LLM providers
+groq==1.5.0
+google-generativeai==0.8.6
+google-genai==2.14.0
+mistralai==2.7.2
+
+# ML / Sentiment (heavy — consider separate requirements-ml.txt)
+transformers==4.40.2
+torch==2.2.2
+
+# Rendering & reporting
+weasyprint==69.0
+playwright==1.61.0
+
+# GUI (only needed for local desktop use)
+pyqt5==5.15.11
+pyqtwebengine==5.15.7

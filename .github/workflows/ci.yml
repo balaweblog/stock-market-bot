@@ -1,0 +1,50 @@
+name: CI — Lint & Compile Check
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pyflakes
+
+      - name: Check for syntax errors & undefined names
+        run: |
+          flake8 --select=E9,F63,F7,F82 --show-source --statistics \
+            controllers/ utils/ models/ services/ llm/
+
+      - name: Compile all controllers
+        run: |
+          for f in controllers/*.py; do
+            echo "Compiling $f..."
+            python -m py_compile "$f"
+          done
+          echo "All controllers compiled successfully."
+
+      - name: Compile utility modules
+        run: |
+          for f in utils/*.py models/*.py services/*.py llm/*.py; do
+            if [ -f "$f" ]; then
+              echo "Compiling $f..."
+              python -m py_compile "$f"
+            fi
+          done
+          echo "All utility modules compiled successfully."

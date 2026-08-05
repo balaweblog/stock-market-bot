@@ -55,6 +55,7 @@ import smtplib
 from email.mime.text import MIMEText
 
 import yfinance as yf
+import pandas as pd
 
 from utils import config
 from utils.logger import log
@@ -158,16 +159,13 @@ TICKER_MAP = _load_ticker_map()
 
 def fetch_weekly_returns(watchlist):
     """
-    Real trailing ~1-week % price move per watchlist stock, computed from
-    actual close prices (yfinance) rather than an LLM guess.
-
-    Returns {stock_name: pct_change_float_or_None}. None means either the
-    stock has no ticker mapping (see STOCK_TICKER_MAP_JSON / add it to
-    DEFAULT_WATCHLIST_TICKERS) or the price fetch failed for it.
+    Returns a dict {name: pct_return} for the last ~week's performance
+    of each ticker in the watchlist, fetched in a single batch.
     """
-    results = {name: None for name in watchlist}
-
+    results = {}
+    valid_tickers = {name: TICKER_MAP[name] for name in watchlist if TICKER_MAP.get(name)}
     unmapped = [name for name in watchlist if not TICKER_MAP.get(name)]
+    
     if unmapped:
         log.warning(
             "No ticker mapping for: %s -- weekly return will show n/a for "
@@ -175,23 +173,39 @@ def fetch_weekly_returns(watchlist):
             "STOCK_TICKER_MAP_JSON." % ", ".join(unmapped)
         )
 
-    for name in watchlist:
-        ticker = TICKER_MAP.get(name)
-        if not ticker:
-            continue
-        try:
-            hist = yf.Ticker(ticker).history(period="12d", interval="1d", auto_adjust=True)
-            closes = hist["Close"].dropna()
-            if len(closes) < 2:
-                log.warning(f"Not enough price history to compute weekly return for {name} ({ticker}).")
-                continue
-            recent = float(closes.iloc[-1])
-            # ~5 trading days back approximates "last week"; clamp for short history.
-            week_ago = float(closes.iloc[max(0, len(closes) - 6)])
-            if week_ago:
-                results[name] = round((recent - week_ago) / week_ago * 100, 2)
-        except Exception as e:
-            log.warning(f"Could not compute weekly return for {name} ({ticker}): {e}")
+    if not valid_tickers:
+        return results
+
+    try:
+        tickers_list = list(valid_tickers.values())
+        hist_data = yf.download(tickers_list, period="12d", interval="1d", auto_adjust=True, progress=False)
+        is_multi = isinstance(hist_data.columns, pd.MultiIndex)
+        
+        for name, ticker in valid_tickers.items():
+            try:
+                if is_multi:
+                    if "Close" not in hist_data.columns.levels[0] or ticker not in hist_data["Close"]:
+                        log.warning(f"No 'Close' price history found for {name} ({ticker}).")
+                        continue
+                    closes = hist_data["Close"][ticker].dropna()
+                else:
+                    if "Close" not in hist_data or hist_data["Close"].empty:
+                        log.warning(f"No 'Close' price history found for {name} ({ticker}).")
+                        continue
+                    closes = hist_data["Close"].dropna()
+                
+                if len(closes) < 2:
+                    log.warning(f"Not enough price history to compute weekly return for {name} ({ticker}).")
+                    continue
+                
+                recent = float(closes.iloc[-1])
+                week_ago = float(closes.iloc[max(0, len(closes) - 6)])
+                if week_ago:
+                    results[name] = round((recent - week_ago) / week_ago * 100, 2)
+            except Exception as e:
+                log.warning(f"Could not compute weekly return for {name} ({ticker}): {e}")
+    except Exception as e:
+        log.warning(f"Batch yfinance download failed: {e}")
 
     return results
 
@@ -240,7 +254,8 @@ Find and summarize the most important developments across these topics: {topic_l
 
 For each topic, search for what actually happened in the window above (index levels/moves, RBI actions, inflation prints, FII/DII net flows, Fed decisions, crude/gold moves, notable IPOs, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "market_sentiment": "Bullish | Neutral | Bearish",
@@ -251,7 +266,7 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (
       "topic": "one of: {topic_list}",
       "headline": "Short headline",
       "summary": "2-3 sentence summary",
-      "investor_impact": "How this specifically affects an active equity investor holding a diversified Indian large/mid-cap stock portfolio -- not just a restatement of the headline",
+      "investor_impact": "How this specifically affects a long-term equity investor holding major Indian indices and blue-chips -- not just a restatement of the headline",
       "confidence": "High | Medium | Low"
     }}
   ]
@@ -276,22 +291,23 @@ For EACH of the following stocks, research recent news, price action, and corpor
 
 For each stock, look for: earnings/results, management commentary, analyst rating or target-price changes, M&A or capex announcements, regulatory action, order wins/losses, and any other news specifically naming this company.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "stocks": [
     {{
-      "stock_name": "Exact name as given above",
+      "stock_name": "Exact stock name as given above",
       "news_timeline": [
         {{
           "date": "DD Month YYYY",
           "headline": "Short headline",
           "summary": "2-3 sentence summary",
-          "why_it_matters": "One sentence",
-          "impact_on_stock": "Positive | Neutral | Negative",
-          "confidence": "High | Medium | Low"
+          "source_url": "URL if available"
         }}
       ],
+      "impact_on_stock": "Positive | Neutral | Negative",
+      "confidence": "High | Medium | Low",
       "corporate_actions": "Earnings, buybacks, splits, bonus issues, board changes, M&A, or capex announcements this week -- or 'No material disclosed changes found this window' if none verifiable",
       "weekly_return_pct": "Approximate % price move this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'weekly_return_pct' only.",
       "analyst_view": "Any analyst rating/target-price change mentioned, or 'No update found this window'",
@@ -325,16 +341,17 @@ For EACH of these sectors, summarize the past week's performance and outlook: {l
 
 {NO_FABRICATION_NOTE}
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "sectors": [
     {{
-      "sector": "Exact sector name as given above",
-      "weekly_performance": "1-2 sentences on how the sector index/theme moved this window",
-      "key_news": "1-2 sentences on the most important dated news item(s)",
-      "outlook": "1-2 sentences, next 2-4 weeks",
-      "rating": "Integer 1-5 (5 = most favorable outlook)"
+      "sector": "Sector Name",
+      "weekly_performance": "One sentence summarizing the sector's performance or trend this week",
+      "key_news": "One sentence on a major policy, earnings trend, or macro event impacting this sector",
+      "outlook": "One sentence forward-looking view for the next 2-4 weeks",
+      "rating": "A number from 1 to 5 (integer, e.g., 4) representing overall attractiveness right now"
     }}
   ]
 }}
@@ -357,7 +374,8 @@ def build_synthesis_prompt(market_data, stocks_data, sectors_data, watchlist, to
 
 The investor's watchlist is exactly these {len(watchlist)} stocks: {stock_list}.
 
-Using ONLY the material above, produce a synthesis for an active equity investor. Respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+Using ONLY the material above, produce a synthesis for an active equity investor. OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"]
@@ -390,8 +408,9 @@ def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
     text, sources, live = generate_analysis(prompt, max_tokens=3000)
     if not text:
-        log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
-        sys.exit(1)
+        err_msg = "No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email."
+        log.error(err_msg)
+        raise RuntimeError(err_msg)
     _require_live_or_abort(live, "Stage 1 (market/macro)")
     data = _parse_json_object(text)
     if not isinstance(data, dict):
@@ -512,8 +531,9 @@ def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, stocks_data, sectors_data, WATCHLIST, today_str)
     text = _plain_generate(prompt)
     if not text:
-        log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
-        sys.exit(1)
+        err_msg = "No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email."
+        log.error(err_msg)
+        raise RuntimeError(err_msg)
     data = _parse_json_object(text)
     if not isinstance(data, dict):
         log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
@@ -957,12 +977,13 @@ def run():
     )
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("stock_market_report.html", "w") as f:
+        with open("stock_market_report.html", "w", encoding="utf-8") as f:
             f.write(email_html)
         log.info("DRY_RUN enabled -- wrote stock_market_report.html instead of emailing.")
         return
 
-    send_stock_email(email_html, today_str)
+    if not send_stock_email(email_html, today_str):
+        log.critical("Failed to send stock market email report.")
 
 
 if __name__ == "__main__":

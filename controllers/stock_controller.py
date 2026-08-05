@@ -1,4 +1,5 @@
 import os
+import functools
 import re
 import math
 import json
@@ -9,9 +10,7 @@ import requests
 import yfinance as yf
 import pandas as pd
 import ta
-import smtplib
 import traceback
-from email.mime.text import MIMEText
 from datetime import datetime
 from zoneinfo import ZoneInfo
 try:
@@ -36,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from utils.logger import log
 from services.commodity_tracker import CommodityTracker
 from utils.compliance import build_compliance_block_html
+from utils import email_service
 from models.track_record import update_track_record, build_track_record_html
 from models.support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
 from llm import llm_backend
@@ -117,7 +117,8 @@ def load_run_history():
             data.setdefault("commodities", {})
             data.setdefault("track_record", {"open": {}, "closed": []})
             return data
-    except Exception:
+    except Exception as e:
+        log.warning(f"Failed to load run history (returning default): {e}")
         return {"stocks": {}, "commodities": {}, "track_record": {"open": {}, "closed": []}}
 
 
@@ -131,8 +132,8 @@ def save_run_history(history):
     location in that case.
     """
     try:
-        with open(RUN_HISTORY_PATH, "w") as f:
-            json.dump(history, f, indent=2, default=str)
+        with open(RUN_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
     except Exception as e:
         log.error(f"Failed to save run history to {RUN_HISTORY_PATH}: {e}")
 
@@ -194,7 +195,7 @@ def _tavily_search(query, max_results=2):
                 # this short is what keeps the *combined* prompt (every
                 # stock's worth of context at once) inside a sane token
                 # budget.
-                "content": (r.get("content") or "")[:140],
+                "content": (r.get("content") or "")[:450],
             })
         return results
     except Exception as e:
@@ -212,7 +213,9 @@ def _gather_ai_stocks_story_context(stock_names, today_str):
     if not os.getenv("TAVILY_API_KEY"):
         return "", []
 
+    import threading
     sources = []
+    sources_lock = threading.Lock()
     blocks_by_stock = {}
 
     def _fetch_one(name):
@@ -230,8 +233,9 @@ def _gather_ai_stocks_story_context(stock_names, today_str):
             for r in results:
                 if not r["url"]:
                     continue
-                if (r["title"], r["url"]) not in sources:
-                    sources.append((r["title"], r["url"]))
+                with sources_lock:
+                    if (r["title"], r["url"]) not in sources:
+                        sources.append((r["title"], r["url"]))
                 blocks_by_stock.setdefault(name, []).append(f"{r['title']}: {r['content']}")
 
     if not blocks_by_stock:
@@ -1424,19 +1428,6 @@ def get_recommended_entry(signal, total_score, latest, market_context, entry_con
     return choose_stock_entry(signal, total_score, latest, market_context, entry_context)
 
 
-def truncate_text(text, limit=350):
-    if not text:
-        return text
-    if len(text) <= limit:
-        return text
-    # Prefer to cut at sentence boundary
-    cut = text[:limit]
-    last_period = cut.rfind('. ')
-    if last_period != -1 and last_period > limit - 100:
-        return cut[:last_period + 1] + '...'
-    return cut.rstrip() + '...'
-
-
 def get_date_with_suffix(d):
     day = d.day
     if 4 <= day <= 20 or 24 <= day <= 30:
@@ -1450,20 +1441,6 @@ def get_date_with_suffix(d):
 # Email
 # -----------------------------
 def send_email(report_html, mode, pdf_attachment=None, pdf_filename="stock_report.pdf"):
-    if not all([EMAIL_FROM, EMAIL_PASSWORD, EMAIL_TO]):
-        print(
-            "Email credentials not found. "
-            "Please set EMAIL_FROM, EMAIL_PASSWORD, and EMAIL_TO environment variables."
-        )
-        return
-
-    to_recipients = parse_email_list(EMAIL_TO)
-    cc_recipients = parse_email_list(EMAIL_CC)
-
-    if not to_recipients:
-        print("No valid TO recipients found. Please set EMAIL_TO with a comma-separated list of emails.")
-        return
-
     subject = "Equity & Commodity Research Briefing"
     if mode == "real_time":
         subject = f"Intraday Update — {subject}"
@@ -1477,37 +1454,12 @@ def send_email(report_html, mode, pdf_attachment=None, pdf_filename="stock_repor
     formatted_time = now_ist.strftime("%I:%M %p")
     subject += f" - {formatted_date} .{formatted_time} IST"
 
-    if pdf_attachment:
-        msg = MIMEMultipart("mixed")
-        msg.attach(MIMEText(report_html, "html"))
-        attachment_part = MIMEApplication(pdf_attachment, _subtype="pdf", Name=pdf_filename)
-        attachment_part["Content-Disposition"] = f'attachment; filename="{pdf_filename}"'
-        msg.attach(attachment_part)
-    else:
-        msg = MIMEText(report_html, "html")
-
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(to_recipients)
-    if cc_recipients:
-        msg["Cc"] = ", ".join(cc_recipients)
-
-    all_recipients = to_recipients + cc_recipients
-
-    try:
-        server = smtplib.SMTP("smtp.gmail.com", 587)
-        server.starttls()
-        server.login(EMAIL_FROM, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
-        server.quit()
-    except smtplib.SMTPAuthenticationError:
-        print(
-            "SMTP Authentication Error: The username or password you entered is not correct. "
-            "Please check your credentials and App Password if using Gmail."
-        )
-    except Exception as e:
-        print(f"An error occurred while sending the email: {e}")
-        traceback.print_exc()
+    return email_service.send_email(
+        subject=subject,
+        html_body=report_html,
+        pdf_attachment=pdf_attachment,
+        pdf_filename=pdf_filename
+    )
 
 
 def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stories=None):
@@ -1700,13 +1652,13 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                             color:#92400E;
                             font-weight:bold;
                             margin-top:3px;">
-                    {events['next_upcoming_event_label']}
+                    {html.escape(str(events['next_upcoming_event_label']))}
                 </div>
 
                 <div style="font-size:14px;
                             color:#B45309;
                             margin-top:3px;">
-                    {events['next_upcoming_event_date']}
+                    {html.escape(str(events['next_upcoming_event_date']))}
                 </div>
 
                 {extra_details_html}
@@ -1738,7 +1690,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
                                 <td style="vertical-align:top;">
-                                    <h3 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:17px;color:#14213D;line-height:1.25;">{stock_name} <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;">{ticker}</span></h3>
+                                    <h3 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:17px;color:#14213D;line-height:1.25;">{html.escape(str(stock_name))} <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;">{html.escape(str(ticker))}</span></h3>
                                     <div class="llm-thesis" style="margin:8px 0 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:13px;color:#3C4256;line-height:1.55;max-height:140px;overflow:hidden;">{llm_display}</div>
                                 </td>
                                 <td style="width:150px;text-align:right;vertical-align:top;">
@@ -1825,7 +1777,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                     <td style="padding:0 16px 16px;">
                         <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
                             <tr>
-                                <td style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {news_text or 'No recent headlines.'}</td>
+                                <td style="padding-top:10px;border-top:1px solid #eef2f7;font-size:13px;color:#475569;"><strong>News:</strong> {html.escape(str(news_text)) if news_text else 'No recent headlines.'}</td>
                             </tr>
                         </table>
                     </td>
@@ -2335,6 +2287,7 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
     """
 
 
+@functools.lru_cache(maxsize=256)
 def classify_market(ticker):
     """
     Classifies a ticker as India or US based on its exchange suffix.
@@ -3355,9 +3308,9 @@ def main(mode, use_llm, detailed_llm=False):
     pdf_bytes = build_pdf_attachment(report_html)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("report.html", "w") as f:
+        with open("report.html", "w", encoding="utf-8") as f:
             f.write(report_html)
-        with open("email.html", "w") as f:
+        with open("email.html", "w", encoding="utf-8") as f:
             f.write(email_html)
         if pdf_bytes:
             with open("report.pdf", "wb") as f:
@@ -3366,8 +3319,10 @@ def main(mode, use_llm, detailed_llm=False):
         else:
             log.info("Report saved to report.html and email.html only -- PDF rendering failed or unavailable (DRY_RUN enabled)")
     else:
-        send_email(email_html, mode, pdf_attachment=pdf_bytes, pdf_filename="stock_report.pdf")
-        log.info("Email report sent successfully.")
+        if not send_email(email_html, mode, pdf_attachment=pdf_bytes, pdf_filename="stock_report.pdf"):
+            log.critical("Failed to send stock analysis email report.")
+        else:
+            log.info("Email report sent successfully.")
     log.info("Stock analysis run finished.")
 
 

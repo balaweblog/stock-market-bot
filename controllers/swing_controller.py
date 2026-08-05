@@ -36,8 +36,8 @@ from zoneinfo import ZoneInfo
 
 import smtplib
 from email.mime.text import MIMEText
-
 import pandas as pd
+from utils import email_service
 
 from utils import config
 from utils.logger import log
@@ -97,7 +97,7 @@ def _env_float(name, default):
     try:
         return float(raw.strip())
     except ValueError:
-        print(f"WARNING: env var {name}='{raw}' is not a valid number -- using default {default}.")
+        log.warning(f"env var {name}='{raw}' is not a valid number -- using default {default}.")
         return default
 
 
@@ -265,14 +265,14 @@ def _log_rejection_history(rejected, today_str, log_path=REJECTION_HISTORY_LOG):
             return
         path = Path(log_path)
         write_header = not path.exists()
-        with path.open("a", newline="") as f:
+        with path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f, fieldnames=["date", "ticker", "name", "metric", "threshold", "actual_value", "margin_missed_by"]
             )
             if write_header:
                 writer.writeheader()
             writer.writerows(rows)
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not write rejection history log: {e}")
 
 
@@ -314,8 +314,8 @@ THRESHOLD_ADJUSTMENT_LOG = os.getenv("THRESHOLD_ADJUSTMENT_LOG", "swing_trade_th
 # one boolean flag someone set months ago and forgot about.
 _CONFIRM_AUTO_ADJUST_BACKTESTED = os.getenv("CONFIRM_AUTO_ADJUST_BACKTESTED", "false").lower() == "true"
 if AUTO_ADJUST_THRESHOLDS and not _CONFIRM_AUTO_ADJUST_BACKTESTED:
-    print(
-        "WARNING: AUTO_ADJUST_THRESHOLDS=true but CONFIRM_AUTO_ADJUST_BACKTESTED is "
+    log.warning(
+        "AUTO_ADJUST_THRESHOLDS=true but CONFIRM_AUTO_ADJUST_BACKTESTED is "
         "not set -- forcing auto-adjustment OFF for this run. Rejection-history "
         "near-misses alone cannot distinguish 'this threshold is miscalibrated' from "
         "'quality setups are genuinely rare right now' -- only a walk-forward "
@@ -359,17 +359,18 @@ def _load_history_rows(log_path=REJECTION_HISTORY_LOG):
         return []
     rows = []
     try:
-        with path.open(newline="") as f:
+        with path.open(newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for r in reader:
                 try:
                     r["threshold"] = float(r["threshold"])
                     r["actual_value"] = float(r["actual_value"])
                     r["margin_missed_by"] = float(r["margin_missed_by"])
-                except (KeyError, ValueError, TypeError):
+                except (KeyError, ValueError, TypeError) as e:
+                    log.debug(f"Skipping malformed row: {e}")
                     continue
                 rows.append(r)
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not read rejection history log '{log_path}': {e}")
     return rows
 
@@ -384,13 +385,13 @@ def _log_threshold_adjustments(applied, log_path=THRESHOLD_ADJUSTMENT_LOG):
     try:
         path = Path(log_path)
         write_header = not path.exists()
-        with path.open("a", newline="") as f:
+        with path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["date", "constant", "old_value", "new_value", "reason"])
             if write_header:
                 writer.writeheader()
             for gname, old, new, reason in applied:
                 writer.writerow({"date": today_str, "constant": gname, "old_value": old, "new_value": new, "reason": reason})
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not write threshold adjustment log: {e}")
 
 
@@ -600,12 +601,12 @@ def _log_watchlist(rejected, today_str_iso, log_path=WATCHLIST_LOG):
             return
         path = Path(log_path)
         write_header = not path.exists()
-        with path.open("a", newline="") as f:
+        with path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["date_added", "ticker", "name", "sector"])
             if write_header:
                 writer.writeheader()
             writer.writerows(rows)
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not write watchlist log: {e}")
 
 
@@ -630,9 +631,9 @@ def _load_and_recheck_watchlist(log_path=WATCHLIST_LOG, max_age_days=WATCHLIST_M
         return [], []
 
     try:
-        with path.open(newline="") as f:
+        with path.open(newline="", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not read watchlist log '{log_path}': {e}")
         return [], []
 
@@ -649,7 +650,8 @@ def _load_and_recheck_watchlist(log_path=WATCHLIST_LOG, max_age_days=WATCHLIST_M
             added = datetime.strptime(row["date_added"], "%Y-%m-%d").date()
             if (today - added).days > max_age_days:
                 continue  # stale -- drop silently, it's had its chance
-        except (KeyError, ValueError):
+        except (KeyError, ValueError) as e:
+            log.warning(f"Skipping malformed date for {ticker}: {e}")
             pass  # malformed date -- keep checking it rather than losing it
 
         stub = {"name": row.get("name") or ticker, "ticker": ticker, "sector": row.get("sector") or ""}
@@ -684,11 +686,11 @@ def _rewrite_watchlist(rows, log_path=WATCHLIST_LOG):
     _load_and_recheck_watchlist) -- best-effort, silent-on-failure."""
     try:
         path = Path(log_path)
-        with path.open("w", newline="") as f:
+        with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["date_added", "ticker", "name", "sector"])
             writer.writeheader()
             writer.writerows(rows)
-    except Exception as e:
+    except OSError as e:
         log.warning(f"Could not rewrite watchlist log: {e}")
 
 
@@ -1211,7 +1213,11 @@ def _attach_risk_plan(stocks):
     seeing, not hiding).
     """
     for stock in stocks:
-        plan = risk.compute_volatility_adjusted_plan(stock.get("ticker"), min_risk_reward=MIN_RISK_REWARD)
+        try:
+            plan = risk.compute_volatility_adjusted_plan(stock.get("ticker"), min_risk_reward=MIN_RISK_REWARD)
+        except Exception as e:
+            log.warning(f"Risk plan computation failed for {stock.get('ticker')}: {e}")
+            plan = {"error": str(e)}
         stock["_atr_risk_plan"] = plan
     return stocks
 
@@ -1321,7 +1327,11 @@ def _fetch_weekly_technicals(ticker):
         if len(close) < 30:
             return None
 
+        import pandas as pd
         weekly_close = close.resample("W").last().dropna()
+        # Drop current incomplete week to avoid distorted signals
+        if len(weekly_close) > 1 and weekly_close.index[-1] > pd.Timestamp.now(tz=weekly_close.index.tz) - pd.Timedelta(days=2):
+            weekly_close = weekly_close.iloc[:-1]
         if len(weekly_close) < 55:
             result = {"insufficient_history": True, "weeks_available": len(weekly_close)}
             if len(weekly_close) >= 20:
@@ -1333,15 +1343,25 @@ def _fetch_weekly_technicals(ticker):
         sma50w = weekly_close.rolling(50).mean()
 
         delta = weekly_close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / loss.replace(0, float("nan"))
         rsi = 100 - (100 / (1 + rs))
 
         ema12 = weekly_close.ewm(span=12, adjust=False).mean()
         ema26 = weekly_close.ewm(span=26, adjust=False).mean()
-        macd_line = ema12 - ema26
-        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+
+        # Check for recent bullish MACD crossover (within last 3 bars)
+        recent_bullish_crossover = False
+        for i in range(-1, -4, -1):
+            try:
+                if macd.iloc[i] > macd_signal.iloc[i] and macd.iloc[i-1] <= macd_signal.iloc[i-1]:
+                    recent_bullish_crossover = True
+                    break
+            except IndexError:
+                break
 
         rsi_now = rsi.iloc[-1]
         rsi_prev = rsi.iloc[-3] if len(rsi) > 3 else None
@@ -1353,8 +1373,9 @@ def _fetch_weekly_technicals(ticker):
             "sma50w": round(float(sma50w.iloc[-1]), 2),
             "rsi14w": round(float(rsi_now), 1) if pd.notna(rsi_now) else None,
             "rsi14w_prev": round(float(rsi_prev), 1) if rsi_prev is not None and pd.notna(rsi_prev) else None,
-            "macd": round(float(macd_line.iloc[-1]), 3),
-            "macd_signal": round(float(signal_line.iloc[-1]), 3),
+            "macd": round(float(macd.iloc[-1]), 3),
+            "macd_signal": round(float(macd_signal.iloc[-1]), 3),
+            "recent_bullish_crossover": recent_bullish_crossover,
         }
     except Exception as e:
         log.warning(f"Could not compute weekly technicals for '{ticker}': {e}")
@@ -1403,8 +1424,11 @@ def _verify_technicals(stock):
         if tech.get("rsi14w_prev") is not None and tech["rsi14w"] < tech["rsi14w_prev"]:
             notes.append((f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.", "soft"))
 
-    if tech["macd"] < tech["macd_signal"]:
-        notes.append(("MACD line is currently below its signal line -- consolidation phase prior to bullish momentum crossover.", "soft"))
+    if not tech.get("recent_bullish_crossover"):
+        if tech["macd"] < tech["macd_signal"]:
+            notes.append(("MACD line is currently below its signal line -- consolidation phase prior to bullish momentum crossover.", "soft"))
+        else:
+            notes.append(("MACD line is above signal, but no recent bullish crossover (within last 3 bars) detected.", "soft"))
 
     return notes
 
@@ -1455,7 +1479,10 @@ def _fetch_fundamentals(ticker):
                     if income_row is not None:
                         latest, year_ago = qf.loc[income_row].iloc[0], qf.loc[income_row].iloc[year_ago_idx]
                         if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
-                            result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+                            if year_ago <= 0 or latest <= 0:
+                                result["profit_growth_yoy"] = None  # Turnaround case, not standard growth
+                            else:
+                                result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
         except Exception as e:
             log.warning(f"Could not compute quarterly growth for '{ticker}': {e}")
         return result
@@ -1602,7 +1629,9 @@ def _verify_fundamentals(stock):
 
     roe = data.get("roe")
     if roe is not None:
-        roe_pct = roe * 100 if abs(roe) <= 1 else roe
+        # yfinance returns ROE as a decimal ratio (e.g., 0.15 = 15%)
+        # Values with abs > 10 are likely already in percentage form
+        roe_pct = roe * 100 if abs(roe) < 10 else roe
         if roe_pct < MIN_ROE_PCT:
             notes.append((f"ROE is {roe_pct:.1f}% -- weak (below the {_fmt_num(MIN_ROE_PCT)}% threshold), contradicts the 'high/improving ROCE/ROE' requirement.", "hard"))
     else:
@@ -1689,12 +1718,18 @@ def _deterministic_fundamentals_screen(sectors, exclude_tickers):
     """
     qualified, rejected = [], []
     seen_this_call = set()
+    
+    # Gather candidates
+    candidates = []
     for name, ticker, sector, bucket in universe.tickers_for_sectors(sectors):
         ticker_u = ticker.strip().upper()
         if ticker_u in exclude_tickers or ticker_u in seen_this_call:
             continue
         seen_this_call.add(ticker_u)
+        candidates.append((name, ticker, sector, bucket))
 
+    def check_candidate(cand):
+        name, ticker, sector, bucket = cand
         stub = {"name": name, "ticker": ticker, "sector": sector, "market_cap_bucket": bucket}
         notes = _verify_fundamentals(stub)
         blocking = [n for n, sev in notes if sev in ("hard", "nodata")]
@@ -1702,11 +1737,10 @@ def _deterministic_fundamentals_screen(sectors, exclude_tickers):
         if blocking:
             record = dict(stub)
             record["_verification_notes"] = notes
-            rejected.append(record)
-            continue
+            return (False, record)
 
         data = _fetch_fundamentals(ticker) or {}
-        qualified.append({
+        qual = {
             "name": name,
             "ticker": ticker,
             "sector": sector,
@@ -1718,7 +1752,22 @@ def _deterministic_fundamentals_screen(sectors, exclude_tickers):
                 f"profit +{data.get('profit_growth_yoy')}% YoY (fetched directly, not "
                 "model-reported)."
             ),
-        })
+        }
+        return (True, qual)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(check_candidate, cand): cand for cand in candidates}
+        for future in as_completed(futures):
+            try:
+                is_qual, record = future.result()
+                if is_qual:
+                    qualified.append(record)
+                else:
+                    rejected.append(record)
+            except Exception as e:
+                log.error(f"Error checking candidate in deterministic screen: {e}")
+
     return qualified, rejected
 
 
@@ -2222,55 +2271,20 @@ def build_email_html(analysis_html, today_str, sources, used_live_search, adjust
 
 
 def send_swing_trade_email(html_body):
-    if not all([config.EMAIL_FROM, config.EMAIL_PASSWORD, config.EMAIL_TO]):
-        log.error(
-            "Email credentials not found. Please set EMAIL_FROM, EMAIL_PASSWORD, "
-            "and EMAIL_TO (the same env vars main.py uses)."
-        )
-        return False
-
-    to_recipients = config.parse_email_list(config.EMAIL_TO)
-    cc_recipients = config.parse_email_list(getattr(config, "EMAIL_CC", "") or "")
-
-    if not to_recipients:
-        log.error("No valid TO recipients found in EMAIL_TO.")
-        return False
-
     now_ist = datetime.now(ZoneInfo("UTC")).astimezone(ZoneInfo("Asia/Kolkata"))
     time_str = now_ist.strftime("%I:%M %p IST")
     note_label = "Weekly Swing Trade Research Note" if now_ist.weekday() == 0 else "Swing Trade Research Note"
     subject = f"{note_label} — {config.get_date_with_suffix(now_ist)} · {time_str}"
 
-    msg = MIMEText(html_body, "html")
-    msg["Subject"] = subject
-    msg["From"] = config.EMAIL_FROM
-    msg["To"] = ", ".join(to_recipients)
-    if cc_recipients:
-        msg["Cc"] = ", ".join(cc_recipients)
-
-    all_recipients = to_recipients + cc_recipients
-
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-            server.starttls()
-            server.login(config.EMAIL_FROM, config.EMAIL_PASSWORD)
-            server.sendmail(config.EMAIL_FROM, all_recipients, msg.as_string())
-        log.info("Swing trade email sent successfully.")
-        return True
-    except smtplib.SMTPAuthenticationError:
-        log.error(
-            "SMTP Authentication Error: check EMAIL_FROM/EMAIL_PASSWORD "
-            "(use a Gmail App Password, not the account password)."
-        )
-    except Exception as e:
-        log.error(f"Failed to send swing trade email: {e}")
-        traceback.print_exc()
-    return False
+    return email_service.send_email(
+        subject=subject,
+        html_body=html_body
+    )
 
 
 def _require_live_or_abort(used_live, stage_label):
     if not used_live and os.getenv("REQUIRE_LIVE_DATA", "true").lower() == "true":
-        log.error(
+        msg = (
             f"Live web search was not used for {stage_label} this run (Groq's "
             "live-search model was unavailable or the backend fell back to "
             "Gemini/local), so the output would only reflect stale training-data "
@@ -2278,7 +2292,8 @@ def _require_live_or_abort(used_live, stage_label):
             "REQUIRE_LIVE_DATA=false to override and allow a clearly-labeled "
             "stale-data email instead."
         )
-        sys.exit(1)
+        log.error(msg)
+        raise RuntimeError(msg)
 
 
 def run():
@@ -2328,7 +2343,7 @@ def run():
         )
         email_html = build_email_html(analysis_html, today_str, [], False, _adjustments_html(applied_adjustments))
         if os.getenv("DRY_RUN", "false").lower() == "true":
-            with open("swing_trade_report.html", "w") as f:
+            with open("swing_trade_report.html", "w", encoding="utf-8") as f:
                 f.write(email_html)
             log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
             return
@@ -2389,12 +2404,13 @@ def run():
             )
 
             if not growth_analysis:
-                log.error(
+                msg = (
                     "No LLM backend produced Stage 1 output (no GROQ_API_KEY/"
                     "GOOGLE_API_KEY set and local model unavailable/failed). "
                     "Aborting without sending an email."
                 )
-                sys.exit(1)
+                log.error(msg)
+                raise RuntimeError(msg)
             _require_live_or_abort(growth_live, "Stage 1 (fundamentals screen)")
 
             for s in growth_sources:
@@ -2460,10 +2476,9 @@ def run():
         )
 
         if not tech_analysis:
-            log.error(
-                "No LLM backend produced Stage 2 output. Aborting without sending an email."
-            )
-            sys.exit(1)
+            msg = "No LLM backend produced Stage 2 output. Aborting without sending an email."
+            log.error(msg)
+            raise RuntimeError(msg)
         _require_live_or_abort(tech_live, "Stage 2 (technicals)")
 
         for s in tech_sources:
@@ -2573,7 +2588,7 @@ def run():
             outcomes.log_recommendation(s, today_str_iso=datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d"))
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("swing_trade_report.html", "w") as f:
+        with open("swing_trade_report.html", "w", encoding="utf-8") as f:
             f.write(email_html)
         log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
         return

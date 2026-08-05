@@ -124,7 +124,9 @@ _KNOWN_SCHEME_CODES = {
     "Nippon India Gold Savings Fund":                        "118663",
 }
 
-_SSL_CONTEXT = ssl._create_unverified_context() if hasattr(ssl, "_create_unverified_context") else None
+_SSL_CONTEXT = (ssl._create_unverified_context() 
+                if os.getenv("ALLOW_UNVERIFIED_SSL", "false").lower() == "true" 
+                else ssl.create_default_context())
 
 
 def _amfi_get(url):
@@ -140,7 +142,7 @@ def _amfi_get(url):
         with urllib.request.urlopen(req, **kwargs) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        log.debug(f"AMFI fetch failed ({url!r}): {exc}")
+        log.warning(f"AMFI fetch failed ({url!r}): {exc}")
         return None
 
 
@@ -185,8 +187,8 @@ def _annualised_return(nav_series, years):
                     return None
                 cagr = (latest_nav / past_nav) ** (1 / years) - 1
                 return round(cagr * 100, 2)
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning(f"Error computing annualised return: {exc}")
     return None
 
 
@@ -226,8 +228,8 @@ def _fetch_amfi_fund_snapshot(fund_name):
             nav_30d  = float(nav_list[min(22, len(nav_list)-1)]["nav"])  # ~22 trading days
             if nav_30d > 0:
                 ret_1m = round((nav_now / nav_30d - 1) * 100, 2)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning(f"Error computing monthly return: {exc}")
 
     scheme_type = str(meta.get("scheme_type", "")).lower()
     scheme_cat  = meta.get("scheme_category", "") or ""
@@ -293,7 +295,11 @@ def _enrich_funds_with_amfi(funds_data):
             amfi_val = snap.get(key)
             if amfi_val is None:
                 continue
-            if str(f.get(key, "")).strip() in _EMPTY_VALUES:
+            
+            # Authoritative keys: always use AMFI data when available
+            if key in ("nav_latest", "one_year_return_pct", "three_year_return_pct", "monthly_return_pct"):
+                f[key] = amfi_val
+            elif str(f.get(key, "")).strip() in _EMPTY_VALUES:
                 f[key] = amfi_val
         # Always attach source metadata for the Data Inputs section
         f["_amfi_code"]     = snap.get("_amfi_code")
@@ -368,7 +374,8 @@ Find and summarize the most important developments across these topics: {topic_l
 
 For each topic, search for what actually happened in the window above (index levels/moves, RBI policy actions, inflation prints, GDP releases, FII/DII net flows, Fed decisions, crude/gold/DXY moves, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "market_sentiment": "Bullish | Neutral | Bearish",
@@ -421,7 +428,8 @@ For EACH of the following Indian mutual funds, research recent news, portfolio/A
 
 For each fund, look for: AMC announcements, fund manager changes, portfolio additions/exits or sector-weight shifts disclosed in the latest factsheet, AUM changes, category-average/benchmark comparison, and any news specifically naming this fund or its major holdings. Where pre-fetched facts are provided above, use those values directly for nav_latest, fund_category, one_year_return_pct, three_year_return_pct -- do not override them with guesses.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "funds": [
@@ -473,7 +481,8 @@ For EACH of these sectors, summarize the past month's performance and outlook: {
 
 {NO_FABRICATION_NOTE}
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "sectors": [
@@ -543,8 +552,9 @@ def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
     text, sources, live = generate_analysis(prompt, max_tokens=3000, validate_fn=_valid_market_json)
     if not text:
-        log.error("No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email.")
-        sys.exit(1)
+        err_msg = "No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email."
+        log.error(err_msg)
+        raise RuntimeError(err_msg)
     _require_live_or_abort(live, "Stage 1 (market/macro)")
     data = _parse_json_object(text)
     if not isinstance(data, dict):
@@ -689,8 +699,9 @@ def run_synthesis_stage(market_data, funds_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, funds_data, sectors_data, PORTFOLIO, today_str)
     text = _plain_generate(prompt)
     if not text:
-        log.error("No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email.")
-        sys.exit(1)
+        err_msg = "No LLM backend produced Stage 4 (synthesis) output. Aborting without sending an email."
+        log.error(err_msg)
+        raise RuntimeError(err_msg)
     data = _parse_json_object(text)
     if not isinstance(data, dict):
         log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
@@ -1129,12 +1140,13 @@ def run():
     )
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("mutual_fund_report.html", "w") as f:
+        with open("mutual_fund_report.html", "w", encoding="utf-8") as f:
             f.write(email_html)
         log.info("DRY_RUN enabled -- wrote mutual_fund_report.html instead of emailing.")
         return
 
-    send_portfolio_email(email_html, today_str)
+    if not send_portfolio_email(email_html, today_str):
+        log.critical("Failed to send mutual fund email report.")
 
 
 if __name__ == "__main__":

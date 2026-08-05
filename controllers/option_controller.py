@@ -137,8 +137,8 @@ def _describe_http_error(e):
         snippet = ""
         try:
             snippet = resp.text[:200].replace("\n", " ")
-        except Exception:
-            pass
+        except (AttributeError, ValueError, TypeError) as _e:
+            log.debug(f"Could not extract snippet from HTTP error: {_e}")
         return f"HTTP {resp.status_code} ({type(e).__name__}){' -- ' + snippet if snippet else ''}"
     return f"{type(e).__name__}: {e}"
 
@@ -972,7 +972,7 @@ def _fill_horizons_from_bhavcopy(data, notes, symbol="NIFTY"):
             f"instead (last trading day's CLOSE, not live/intraday){staleness_note}."
         )
         return True
-    except Exception as e:
+    except (ValueError, TypeError, KeyError, IndexError, AttributeError) as e:
         notes.append(f"Bhavcopy was fetched but could not be parsed: {e}")
         return False
 
@@ -1007,7 +1007,7 @@ def fetch_live_market_data():
                 data["vix_source"] = "Yahoo Finance (^INDIAVIX)"
                 if len(vix_hist) >= 2:
                     prev = float(vix_hist["Close"].iloc[-2])
-                    data["vix_change_pct"] = round((data["vix"] - prev) / prev * 100, 2)
+                    data["vix_change_pct"] = round(((data["vix"] - prev) / prev * 100) if prev and prev > 0 else 0.0, 2)
                 rank, pct, days_used = compute_iv_rank_percentile(vix_hist["Close"], data["vix"])
                 data["iv_rank"] = rank
                 data["iv_percentile"] = pct
@@ -1161,10 +1161,11 @@ def _norm_pdf(x):
 
 
 def _iv_to_frac(iv):
+    """Convert IV to decimal fraction. Values > 1.0 are treated as percentages."""
     if iv is None:
         return None
     iv = float(iv)
-    return iv / 100.0 if iv > 3 else iv
+    return iv / 100.0 if iv > 1.0 else iv
 
 
 def time_to_expiry_years(expiry_dt, now=None):
@@ -1210,7 +1211,7 @@ def bs_greeks(spot, strike, t_years, iv, opt_type, r=RISK_FREE_RATE, q=DIVIDEND_
         gamma = disc_q * pdf_d1 / (spot * sigma * sqrt_t)
         vega = spot * disc_q * pdf_d1 * sqrt_t / 100.0
         return {"delta": delta, "gamma": gamma, "theta": theta, "vega": vega}
-    except (ValueError, ZeroDivisionError, OverflowError):
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
         return None
 
 
@@ -1263,7 +1264,7 @@ def compute_pop(spot, t_years, iv, payoff_fn, breakevens, r=RISK_FREE_RATE, q=DI
             mid = (lo + hi) / 2.0
             if payoff_fn(mid) > 0:
                 prob_profit += cdf_le(hi) - cdf_le(lo)
-    except (ValueError, ZeroDivisionError, OverflowError):
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
         return None
     return round(max(0.0, min(1.0, prob_profit)) * 100, 1)
 
@@ -1302,7 +1303,7 @@ def compute_touch_probability(spot, t_years, iv, barrier, r=RISK_FREE_RATE, q=DI
         exponent = 2.0 * mu * a / (sigma ** 2)
         # Clamp exponent to avoid overflow in exp() for extreme parameters
         prob = _norm_cdf(d_plus) + math.exp(min(exponent, 700.0)) * _norm_cdf(d_minus)
-    except (ValueError, ZeroDivisionError, OverflowError):
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
         return None
     return round(max(0.0, min(1.0, prob)) * 100, 1)
 
@@ -2489,7 +2490,8 @@ RISK & SELECTION RULES:
   risk/reward comes from strike selection within these defined-risk
   structures, not from adding undefined-risk ones.
 
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else:
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
   "horizons": [
@@ -3513,8 +3515,8 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
         over_cap = float(str(aggregate_pct).replace("%", "").strip()) > AGGREGATE_CAP_PCT
         if over_cap:
             agg_color = "#8B2E2E"
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as e:
+        log.warning(f"Failed to parse aggregate_pct '{aggregate_pct}': {e}")
 
     verdict = (
         f"⚠ EXCEEDS the {AGGREGATE_CAP_PCT:.0f}% worst-case combined cap -- reduce position size before entering."
@@ -3843,8 +3845,8 @@ def repair_rejected_legs(horizons, live_data, sources=None):
     repair_prompt = build_repair_prompt(rejected, live_data)
     try:
         repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(repair_prompt)
-    except Exception:
-        log.warning("Repair pass call failed; keeping original rejection(s).")
+    except Exception as e:
+        log.warning(f"Repair pass call failed; keeping original rejection(s). Exception: {e}", exc_info=True)
         return horizons
 
     if not repair_text:
@@ -4218,12 +4220,13 @@ def run():
     email_html = build_email_html(horizons_html, today_str, sources, used_live_search, session_label, live_data)
 
     if os.getenv("DRY_RUN", "false").lower() == "true":
-        with open("option_strategy_report.html", "w") as f:
+        with open("option_strategy_report.html", "w", encoding="utf-8") as f:
             f.write(email_html)
         log.info("DRY_RUN enabled -- wrote option_strategy_report.html instead of emailing.")
         return
 
-    send_option_strategy_email(email_html)
+    if not send_option_strategy_email(email_html):
+        log.critical("Email delivery failed")
 
 
 if __name__ == "__main__":
