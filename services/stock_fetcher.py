@@ -454,3 +454,7 @@ def _fetch_ownership_activity_raw(symbol):
         pass  # Return default result with available=False
 
     return result
+
+
+def fetch_ownership_activity(symbol):
+    return _with_retries(_fetch_ownership_activity_raw, symbol)
