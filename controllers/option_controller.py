@@ -3844,7 +3844,9 @@ def repair_rejected_legs(horizons, live_data, sources=None):
 
     repair_prompt = build_repair_prompt(rejected, live_data)
     try:
-        repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(repair_prompt)
+        repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(
+            repair_prompt, validate_fn=lambda t: _parse_analysis_json(t)[0] is not None
+        )
     except Exception as e:
         log.warning(f"Repair pass call failed; keeping original rejection(s). Exception: {e}", exc_info=True)
         return horizons
@@ -3982,7 +3984,9 @@ def reformat_unparseable_analysis(analysis, live_data):
     """
     reformat_prompt = build_reformat_prompt(analysis, live_data)
     try:
-        reformatted_text, _sources, _used_search = swing.generate_analysis(reformat_prompt)
+        reformatted_text, _sources, _used_search = swing.generate_analysis(
+            reformat_prompt, validate_fn=lambda t: _parse_analysis_json(t)[0] is not None
+        )
     except Exception as e:
         log.warning(f"Reformat pass call failed; keeping original unparseable output. Exception: {e}", exc_info=True)
         return None, None, None, analysis
@@ -4174,7 +4178,9 @@ def run():
     )
     prompt = build_prompt(live_data)
 
-    analysis, sources, used_live_search = swing.generate_analysis(prompt)
+    analysis, sources, used_live_search = swing.generate_analysis(
+        prompt, validate_fn=lambda t: _parse_analysis_json(t)[0] is not None
+    )
     if not analysis:
         log.error(
             "No LLM backend produced output. Aborting without sending an email."
