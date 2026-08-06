@@ -2256,6 +2256,40 @@ def _action_plan_next_action_html(status_key, current_price, buy_level, stop_los
     return f"{label}{reasons_html}"
 
 
+# Gold/Silver are bought and sold in rupee amounts, not "% allocation" or
+# tranche counts the way equity positions are -- GOLD_TRANCHE_AMOUNT_INR /
+# SILVER_TRANCHE_AMOUNT_INR is the rupee size of ONE tranche for each metal
+# (env-tunable so this can be set to whatever round number -- 200, 500,
+# 1000 -- matches how the person actually buys gold/silver).
+COMMODITY_TRANCHE_AMOUNT_INR = float(os.getenv("COMMODITY_TRANCHE_AMOUNT_INR", "500"))
+GOLD_TRANCHE_AMOUNT_INR = float(os.getenv("GOLD_TRANCHE_AMOUNT_INR", str(COMMODITY_TRANCHE_AMOUNT_INR)))
+SILVER_TRANCHE_AMOUNT_INR = float(os.getenv("SILVER_TRANCHE_AMOUNT_INR", str(COMMODITY_TRANCHE_AMOUNT_INR)))
+
+
+def _action_plan_next_action_commodity_html(status_key, current_price, buy_level, stop_loss, tranche_amount_inr):
+    """
+    Same sizing as _action_plan_next_action_html (reuses the identical
+    _action_plan_add_sizing()/_action_plan_reduce_sizing() logic -- these
+    already degrade gracefully with total_score/signal_confirmation_status
+    left as None, which is all gold/silver have), but rendered as a
+    concrete rupee amount ("Buy ₹1,000" / "Sell ₹500" / "Sell all")
+    instead of a tranche count + %, since commodities are bought/sold in
+    rupee amounts, not equity-style position tranches.
+    """
+    if status_key == "in_zone":
+        tranches, reasons = _action_plan_add_sizing(current_price, buy_level, None, None)
+        amount = tranches * tranche_amount_inr
+        label = f"Buy ₹{amount:,.0f}"
+    elif status_key == "sell_signal":
+        tranches, reasons, is_full_exit = _action_plan_reduce_sizing(current_price, stop_loss, None)
+        label = "Sell all" if is_full_exit else f"Sell ₹{tranches * tranche_amount_inr:,.0f}"
+    else:
+        return _ACTION_PLAN_NEXT_ACTION[status_key]
+
+    reasons_html = f'<div style="margin-top:2px;font-size:10px;color:#8A8F9C;">{html.escape(", ".join(reasons))}</div>'
+    return f"{label}{reasons_html}"
+
+
 def _classify_buy_zone(current_price, buy_level, signal=""):
     """
     Classifies where the current price sits relative to the recommended
@@ -2302,10 +2336,16 @@ def _action_plan_profit_booking(status_key, buy_level, target):
 
 
 def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None,
-                           current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None):
+                           current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None,
+                           tranche_amount_inr=None):
     sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
-    next_action = _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status)
+    if tranche_amount_inr is not None:
+        # Commodities (gold/silver): render "Buy ₹X" / "Sell ₹X" / "Sell all"
+        # instead of the equity-style "Add N (~%)" / "Reduce N" tranches.
+        next_action = _action_plan_next_action_commodity_html(status_key, current_price, buy_level, stop_loss, tranche_amount_inr)
+    else:
+        next_action = _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status)
     profit_booking = _action_plan_profit_booking(status_key, buy_level, target)
     add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
     name_display = f"{name} <span style=\"color:#8A8F9C;font-size:11px;\">{ticker_label}</span>" if ticker_label else name
@@ -2375,7 +2415,7 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
     us_rows = sorted_rows("US")
     india_rows = sorted_rows("India")
 
-    def commodity_row(name, data, levels, plan):
+    def commodity_row(name, data, levels, plan, tranche_amount_inr):
         if not data:
             return ""
         current_price = data.get("current")
@@ -2409,10 +2449,11 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
         if status_key == "unknown":
             return ""
         return _action_plan_row_html(name, "₹", buy_level, target, status_key, sans=sans,
-                                      current_price=current_price, stop_loss=stop_loss)
+                                      current_price=current_price, stop_loss=stop_loss,
+                                      tranche_amount_inr=tranche_amount_inr)
 
-    gold_row = commodity_row("Gold (22K)", (commodity_data or {}).get("gold"), gold_levels, gold_plan)
-    silver_row = commodity_row("Silver", (commodity_data or {}).get("silver"), silver_levels, silver_plan)
+    gold_row = commodity_row("Gold (22K)", (commodity_data or {}).get("gold"), gold_levels, gold_plan, GOLD_TRANCHE_AMOUNT_INR)
+    silver_row = commodity_row("Silver", (commodity_data or {}).get("silver"), silver_levels, silver_plan, SILVER_TRANCHE_AMOUNT_INR)
 
     body = ""
     if us_rows:
