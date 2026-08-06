@@ -655,6 +655,29 @@ def fetch_data(symbol):
             f"Available columns: {', '.join(df.columns)}"
         )
 
+    # Yahoo Finance frequently appends a placeholder row for the current
+    # session before that session's OHLC data actually exists yet -- most
+    # visible on .NS/.BO (NSE/BSE) tickers, whose local trading-day
+    # boundary sits at a different UTC offset than when this run's fetch
+    # happens, so "today" can show up as a row of all-NaN open/high/low/
+    # close/volume well before US tickers hit the same problem (or at all,
+    # depending on run time). Every downstream consumer does
+    # `latest = df.iloc[-1]` without checking for this, so a NaN row here
+    # doesn't raise anywhere -- it just silently turns into "₹nan" prices,
+    # a blank "Today's Move", and a "trend: unknown" for that stock further
+    # down the pipeline, while the signal itself still gets computed (NaN
+    # comparisons are simply False, not an error) as if nothing were wrong.
+    # Dropping any row missing core OHLC data here, once, at the source,
+    # means every downstream `iloc[-1]` is guaranteed to be real data.
+    ohlc_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+    if ohlc_cols:
+        df = df[df[ohlc_cols].notna().all(axis=1)].reset_index(drop=True)
+
+    if df.empty:
+        raise Exception(
+            f"No valid (non-NaN) OHLC rows for {symbol} after dropping incomplete/placeholder rows."
+        )
+
     return df
 
 
@@ -1516,6 +1539,15 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         signal = decision(total_score)
 
         latest = df.iloc[-1]
+        # Belt-and-suspenders: fetch_data() now drops incomplete/placeholder
+        # rows at the source, but if a NaN close ever reaches here anyway
+        # (e.g. some future change to fetch_data, or NaNs introduced by an
+        # indicator calc), fail loudly here rather than silently computing
+        # a "real-looking" signal (HOLD/BUY/SELL) on top of a NaN price --
+        # that's what previously let SBIN/TCS/ICICIBANK/etc. show a
+        # confident signal alongside "₹nan" and a blank "Today's Move".
+        if pd.isna(latest.get("close")):
+            raise Exception(f"Latest close price is NaN for {ticker} -- refusing to compute a signal on invalid data.")
         prev_close = df.iloc[-2]["close"] if len(df) >= 2 else None
         prev_close_change_pct = None
         if prev_close is not None and prev_close != 0 and pd.notna(prev_close) and pd.notna(latest["close"]):
