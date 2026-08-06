@@ -3896,6 +3896,110 @@ def repair_rejected_legs(horizons, live_data, sources=None):
     return horizons
 
 
+def build_reformat_prompt(raw_analysis, live_data):
+    """
+    BUG FIX: _parse_analysis_json() previously had no fallback when the model
+    ignored the "respond with ONLY raw JSON" instruction entirely and wrote a
+    prose/markdown report instead (this happens most often on the weaker
+    fallback backends -- Gemini Flash free tier or the local Qwen2.5-1.5B --
+    which are more prone to dropping strict output-format instructions than
+    the primary backend). In that case _parse_analysis_json() has no `{...}`
+    to extract at all, returns (None, None, None), and run() gave up straight
+    to the raw-text-dump branch with no retry.
+
+    This builds a second-pass prompt that hands the model its own prior
+    (unparseable) answer back and asks it to losslessly convert it into the
+    required JSON shape -- no new analysis, no re-reading the live data, just
+    a reformat. Reusing the model's own content (rather than re-running the
+    full analysis prompt) keeps this cheap and avoids getting a second,
+    possibly-inconsistent, set of numbers.
+    """
+    live_data_block = format_live_data_block(live_data)
+    return f"""Your previous response below was supposed to be ONLY a raw JSON object, but it was not valid JSON (it likely included markdown formatting, prose, or headers instead of / around the JSON). Convert it into the required JSON shape now. Do not re-analyze the market or change any figures, strikes, or conclusions -- just losslessly reformat your own content below into valid JSON.
+
+YOUR PREVIOUS RESPONSE:
+{raw_analysis}
+
+--------------------------------------------------------------------------------
+LIVE DATA (for reference only, to correctly copy expiry dates / figures if needed):
+{live_data_block}
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "horizons": [
+    {{
+      "horizon": "Weekly",
+      "expiry_date": "...",
+      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "n/a",
+      "bias_reason": "...",
+      "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
+      "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
+      "strike_rationale": "...",
+      "confidence": "High",
+      "data_status": "live"
+    }},
+    {{
+      "horizon": "Next Week",
+      "expiry_date": "...",
+      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "n/a",
+      "bias_reason": "...",
+      "strategy_name": "One of allowed defined-risk structures",
+      "legs": "Comma-separated string",
+      "strike_rationale": "...",
+      "confidence": "High",
+      "data_status": "live"
+    }},
+    {{
+      "horizon": "Monthly",
+      "expiry_date": "...",
+      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
+      "next_week_bias": "n/a",
+      "bias_reason": "...",
+      "strategy_name": "One of allowed defined-risk structures",
+      "legs": "Comma-separated string",
+      "strike_rationale": "...",
+      "confidence": "High",
+      "data_status": "live"
+    }}
+  ],
+  "portfolio_view": "..."
+}}
+"""
+
+
+def reformat_unparseable_analysis(analysis, live_data):
+    """
+    Second-pass rescue for a totally unparseable first response (see
+    build_reformat_prompt() docstring). Returns (horizons, aggregate_pct,
+    portfolio_view, reformatted_text) -- reformatted_text is the text that
+    should now be treated as "the analysis" going forward (for the raw-text
+    fallback branch, if this rescue attempt also fails), or the original
+    `analysis` unchanged if the reformat call itself couldn't be attempted.
+    """
+    reformat_prompt = build_reformat_prompt(analysis, live_data)
+    try:
+        reformatted_text, _sources, _used_search = swing.generate_analysis(reformat_prompt)
+    except Exception as e:
+        log.warning(f"Reformat pass call failed; keeping original unparseable output. Exception: {e}", exc_info=True)
+        return None, None, None, analysis
+
+    if not reformatted_text:
+        log.warning("Reformat pass produced no output; keeping original unparseable output.")
+        return None, None, None, analysis
+
+    horizons, aggregate_pct, portfolio_view = _parse_analysis_json(reformatted_text)
+    if not horizons:
+        log.warning("Reformat pass still produced unparseable JSON; falling back to raw text display.")
+        return None, None, None, reformatted_text
+
+    log.info("Reformat pass recovered valid JSON from an initially unparseable response.")
+    return horizons, aggregate_pct, portfolio_view, reformatted_text
+
+
 _OFFICIAL_SOURCE_DOMAINS = (
     "nseindia.com", "nsearchives.nseindia.com", "bseindia.com",
     "rbi.org.in", "sebi.gov.in", "sgx.com", "moneycontrol.com",
@@ -4088,6 +4192,12 @@ def run():
         sys.exit(1)
 
     horizons, _model_aggregate_pct, portfolio_view = _parse_analysis_json(analysis)
+    if not horizons:
+        # The model ignored the "respond with ONLY raw JSON" instruction and
+        # returned prose/markdown instead -- try one cheap reformat pass
+        # before giving up and emailing an unstructured raw-text dump.
+        log.warning("Initial response was not valid JSON; attempting a reformat pass.")
+        horizons, _model_aggregate_pct, portfolio_view, analysis = reformat_unparseable_analysis(analysis, live_data)
     sources = _filter_sources(sources)
     if horizons:
         # --- DETERMINISTIC STRIKE SELECTION ---
