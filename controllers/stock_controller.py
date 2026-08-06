@@ -1977,35 +1977,49 @@ def build_quick_summary_groups(rows):
 
 
 def build_data_quality_banner(items, section_name="items"):
-    """Build a compact banner that surfaces missing or weak data quality issues."""
+    """
+    Build a compact banner that surfaces missing or weak data quality issues.
+
+    BUG FIX: this used to check item.get("recommendation") and
+    item.get("decision_note") -- neither key has ever existed on a stock's
+    summary_entry (see process_stock(); the actual field is "signal", and
+    there's no free-text decision-note equivalent). Both checks failed for
+    every single item on every run, which is why this banner always showed
+    every stock as "missing core fields" even when the data was fine.
+    Checks the fields that actually exist and actually matter: "signal"
+    and "current_price" -- the two fields the rest of the report (badges,
+    buy-zone classification, Action Plan) treats as required. Fields like
+    recommended_buy_level/target/stop_loss are legitimately absent for
+    some valid Hold signals (see _classify_buy_zone's own "unknown"
+    handling), so they're intentionally not treated as a quality issue
+    here.
+
+    ERROR entries are excluded -- they're already surfaced by their own
+    dedicated banner (build_error_summary_html), so counting them here too
+    would just double-flag the same failures under a second, vaguer label.
+    """
     if not items:
         return ""
 
-    missing_count = 0
-    for item in items:
-        if not item:
-            continue
-        if not item.get("recommendation") or not str(item.get("recommendation", "")).strip():
-            missing_count += 1
-        if not item.get("decision_note") or not str(item.get("decision_note", "")).strip():
-            missing_count += 1
-        if item.get("current_price") in (None, "", "null", "None"):
-            missing_count += 1
+    scoped_items = [item for item in items if item and str(item.get("signal") or "").upper() != "ERROR"]
+    if not scoped_items:
+        return ""
 
-    if missing_count == 0:
+    def is_missing(item):
+        signal_missing = not str(item.get("signal") or "").strip()
+        price_missing = item.get("current_price") in (None, "", "null", "None")
+        return signal_missing or price_missing
+
+    missing_items = sum(1 for item in scoped_items if is_missing(item))
+    if missing_items == 0:
         return ""
 
     display_name = section_name.replace("_", " ").strip() or "items"
-    missing_items = sum(1 for item in items if item and (
-        not item.get("recommendation") or not str(item.get("recommendation", "")).strip()
-        or not item.get("decision_note") or not str(item.get("decision_note", "")).strip()
-        or item.get("current_price") in (None, "", "null", "None")
-    ))
     return f"""
         <tr>
           <td style="padding:0 28px 10px;" class="email-padding">
             <div style="border:1px solid #fde68a;border-left:4px solid #d97706;border-radius:4px;background:#fff7ed;padding:10px 12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#92400e;">
-              <strong>Data quality:</strong> {missing_items}/{len(items)} {display_name} are missing core fields or have incomplete context. Review the source data before acting on the recommendation.
+              <strong>Data quality:</strong> {missing_items}/{len(scoped_items)} {display_name} are missing core fields (signal or current price). Review the source data before acting on the recommendation.
             </div>
           </td>
         </tr>
@@ -2115,13 +2129,30 @@ def build_quick_summary(rows):
 
 
 # Thresholds for the Action Plan table's buy-zone classification. Tunable
-# via env vars without touching code. ADD_ALLOCATION_PCT is the generic
-# allocation size suggested when a stock is in its buy zone -- main.py
-# doesn't currently size positions per-stock (see position_sizing.py for
-# the risk-based stop/target sizing, which is separate from allocation %).
-ADD_ALLOCATION_PCT = int(os.getenv("ADD_ALLOCATION_PCT", "25"))
+# via env vars without touching code.
 SLIGHTLY_ABOVE_BUY_ZONE_PCT = float(os.getenv("SLIGHTLY_ABOVE_BUY_ZONE_PCT", "6"))
 IN_BUY_ZONE_TOLERANCE_PCT = float(os.getenv("IN_BUY_ZONE_TOLERANCE_PCT", "1.5"))
+
+# BUG FIX: "Next Action" used to be one flat, identical string for every
+# in-zone stock ("Add 25% allocation") and every sell-signal stock
+# ("Exit / Reduce") regardless of how strong the underlying evidence
+# actually was -- a stock sitting exactly at its buy level with a mediocre
+# score got the same "Add 25%" instruction as one trading well below it
+# with a high conviction score, and a stock with a fresh sell signal but
+# price still near entry got the same "Exit / Reduce" as one that had
+# already blown through its stop-loss. That's not actionable: it reads
+# like the same canned text no matter what the data says.
+#
+# _action_plan_add_sizing()/_action_plan_reduce_sizing() below replace
+# both with a concrete tranche count (Add 1/2/3, Reduce 1/2, or a full
+# exit) sized from price vs. buy level, the blended conviction score, and
+# whether technicals/fundamentals agree -- with the specific factors that
+# drove the number shown underneath it, so "Add 2" or "Reduce 1" is
+# self-explanatory instead of a bigger unexplained magic number.
+ACTION_PLAN_MAX_TRANCHES = int(os.getenv("ACTION_PLAN_MAX_TRANCHES", "3"))
+ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE = int(os.getenv("ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE", "25"))
+ACTION_PLAN_DEEP_DISCOUNT_PCT = float(os.getenv("ACTION_PLAN_DEEP_DISCOUNT_PCT", "3"))
+ACTION_PLAN_HIGH_CONVICTION_SCORE = float(os.getenv("ACTION_PLAN_HIGH_CONVICTION_SCORE", "75"))
 
 _ACTION_PLAN_STATUS_DISPLAY = {
     "in_zone":        ("In buy zone",            "#2F5233", "#E7EEE4"),
@@ -2131,13 +2162,98 @@ _ACTION_PLAN_STATUS_DISPLAY = {
     "unknown":        ("—",                       "#8A8F9C", "#F4F2ED"),
 }
 
+# "in_zone" and "sell_signal" are now sized dynamically (see
+# _action_plan_add_sizing()/_action_plan_reduce_sizing()) -- this dict only
+# covers the states that stay flat text regardless of price/score, since
+# there's nothing to size ("Wait for dip" / "Don't add" aren't a quantity).
 _ACTION_PLAN_NEXT_ACTION = {
-    "in_zone":        f"Add {ADD_ALLOCATION_PCT}% allocation",
     "slightly_above": "Wait for dip",
     "overextended":   "Don't add",
-    "sell_signal":    "Exit / Reduce",
     "unknown":        "—",
 }
+
+
+def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status):
+    """
+    Sizes an "Add" recommendation into a concrete number of tranches
+    (1..ACTION_PLAN_MAX_TRANCHES) instead of one flat percentage for every
+    in-zone stock. +1 tranche each for:
+    - a real discount to the buy level (not just sitting at it) --
+      ACTION_PLAN_DEEP_DISCOUNT_PCT or more below it
+    - high conviction (total_score, the blended tech+fundamentals+sentiment
+      score) at or above ACTION_PLAN_HIGH_CONVICTION_SCORE
+    Capped at 1 tranche whenever technicals and fundamentals are actively
+    conflicting (signal_confirmation_status == "conflicted"), regardless of
+    discount or score -- that's exactly the situation where sizing up is
+    least justified.
+    Returns (tranches, reasons) -- reasons is the short list of factors
+    that drove the number, for display under the action.
+    """
+    conf_status = str(signal_confirmation_status or "").lower()
+    if conf_status == "conflicted":
+        return 1, ["conflicting technical/fundamental signals -- sizing capped"]
+
+    tranches = 1
+    reasons = []
+    if current_price is not None and buy_level:
+        pct_vs_buy = (current_price - buy_level) / buy_level * 100
+        if pct_vs_buy <= -ACTION_PLAN_DEEP_DISCOUNT_PCT:
+            tranches += 1
+            reasons.append(f"{abs(round(pct_vs_buy))}% below buy level")
+    if total_score is not None and total_score >= ACTION_PLAN_HIGH_CONVICTION_SCORE:
+        tranches += 1
+        reasons.append(f"high conviction score ({round(total_score)}/100)")
+
+    tranches = min(tranches, ACTION_PLAN_MAX_TRANCHES)
+    if not reasons:
+        reasons.append("at buy level, no extra conviction signal yet")
+    return tranches, reasons
+
+
+def _action_plan_reduce_sizing(current_price, stop_loss, signal_confirmation_status):
+    """
+    Sizes a "Reduce" recommendation into a concrete number of tranches, or
+    a full exit once severity maxes out. +1 tranche each for:
+    - the stop-loss actually being breached (not just a sell signal on
+      other grounds -- price trading at/below stop_loss)
+    - technicals and fundamentals actively conflicting
+      (signal_confirmation_status == "conflicted") -- no reason to keep
+      holding through active disagreement.
+    Returns (tranches, reasons, is_full_exit).
+    """
+    tranches = 1
+    reasons = ["sell signal active"]
+    if current_price is not None and stop_loss is not None and current_price <= stop_loss:
+        tranches += 1
+        reasons.append("stop-loss breached")
+    conf_status = str(signal_confirmation_status or "").lower()
+    if conf_status == "conflicted":
+        tranches += 1
+        reasons.append("conflicting technical/fundamental signals")
+
+    tranches = min(tranches, ACTION_PLAN_MAX_TRANCHES)
+    return tranches, reasons, tranches >= ACTION_PLAN_MAX_TRANCHES
+
+
+def _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status):
+    """
+    Builds the "Next Action" cell content: a concrete sized action for
+    in_zone/sell_signal (see the two sizing functions above), plus a small
+    grey line underneath naming the factors that drove the size -- or the
+    flat text from _ACTION_PLAN_NEXT_ACTION for every other status.
+    """
+    if status_key == "in_zone":
+        tranches, reasons = _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status)
+        pct = tranches * ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE
+        label = f"Add {tranches} <span style=\"color:#8A8F9C;font-weight:400;\">(~{pct}%)</span>"
+    elif status_key == "sell_signal":
+        tranches, reasons, is_full_exit = _action_plan_reduce_sizing(current_price, stop_loss, signal_confirmation_status)
+        label = "Exit fully" if is_full_exit else f"Reduce {tranches}"
+    else:
+        return _ACTION_PLAN_NEXT_ACTION[status_key]
+
+    reasons_html = f'<div style="margin-top:2px;font-size:10px;color:#8A8F9C;">{html.escape(", ".join(reasons))}</div>'
+    return f"{label}{reasons_html}"
 
 
 def _classify_buy_zone(current_price, buy_level, signal=""):
@@ -2185,10 +2301,11 @@ def _action_plan_profit_booking(status_key, buy_level, target):
     return "Hold"
 
 
-def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None):
+def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None,
+                           current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None):
     sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
-    next_action = _ACTION_PLAN_NEXT_ACTION[status_key]
+    next_action = _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status)
     profit_booking = _action_plan_profit_booking(status_key, buy_level, target)
     add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
     name_display = f"{name} <span style=\"color:#8A8F9C;font-size:11px;\">{ticker_label}</span>" if ticker_label else name
@@ -2246,6 +2363,8 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             entry.get("stock_name") or entry.get("ticker") or "—",
             currency_symbol, buy_level, target, status_key,
             ticker_label=entry.get("ticker"), sans=sans,
+            current_price=current_price, stop_loss=entry.get("stop_loss"),
+            total_score=entry.get("total_score"), signal_confirmation_status=entry.get("signal_confirmation_status"),
         )
         market_key = classify_market(entry.get("ticker"))
         stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
@@ -2278,10 +2397,19 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
                     break
             if target is not None:
                 break
+        stop_loss = None
+        for src in (plan or {}, levels or {}):
+            for key in ("stop_loss", "stoploss", "recommended_stop_loss"):
+                if isinstance(src, dict) and src.get(key) is not None:
+                    stop_loss = src.get(key)
+                    break
+            if stop_loss is not None:
+                break
         status_key = _classify_buy_zone(current_price, buy_level)
         if status_key == "unknown":
             return ""
-        return _action_plan_row_html(name, "₹", buy_level, target, status_key, sans=sans)
+        return _action_plan_row_html(name, "₹", buy_level, target, status_key, sans=sans,
+                                      current_price=current_price, stop_loss=stop_loss)
 
     gold_row = commodity_row("Gold (22K)", (commodity_data or {}).get("gold"), gold_levels, gold_plan)
     silver_row = commodity_row("Silver", (commodity_data or {}).get("silver"), silver_levels, silver_plan)
@@ -2333,6 +2461,28 @@ def classify_market(ticker):
     return "US"
 
 
+# India Stocks is further split into "Core" (the portfolio's primary
+# long-term holdings) and "Non-Core" (everything else in the India list),
+# rendered as two separate sub-sections within the India Stocks block.
+INDIA_CORE_SYMBOLS = {"ICICIBANK", "SBIN", "TCS", "SUNPHARMA", "ITC", "LT", "COALINDIA"}
+
+
+def classify_india_core(ticker):
+    """
+    Returns "Core" or "Non-Core" for an India ticker (ignored for US
+    tickers). Matches on the base symbol with the .NS/.BO exchange suffix
+    stripped, so it works regardless of which exchange suffix is used.
+    """
+    if not ticker:
+        return "Non-Core"
+    base_symbol = ticker.upper().strip()
+    for suffix in (".NS", ".BO"):
+        if base_symbol.endswith(suffix):
+            base_symbol = base_symbol[: -len(suffix)]
+            break
+    return "Core" if base_symbol in INDIA_CORE_SYMBOLS else "Non-Core"
+
+
 def get_section_html(title, count, items):
     """
     Generates the HTML for a section of the report.
@@ -2351,7 +2501,7 @@ def get_section_html(title, count, items):
 
 def get_market_section_html(market_label, market_groups):
     """
-    Generates the HTML for an entire market block (e.g. US Stocks / India Stocks),
+    Generates the HTML for an entire market block (e.g. US Stocks),
     with its own Buy / Hold / Sell / Errors sub-sections nested inside.
     """
     total = sum(len(items) for items in market_groups.values())
@@ -2368,6 +2518,43 @@ def get_market_section_html(market_label, market_groups):
     body = ""
     for title in ["Buy", "Hold", "Sell", "Errors"]:
         body += get_section_html(title, len(market_groups[title]), market_groups[title])
+
+    return header + body
+
+
+def get_india_market_section_html(market_label, india_groups):
+    """
+    Generates the HTML for the India Stocks block, split into two
+    sub-sections -- Core and Non-Core -- each with its own nested
+    Buy / Hold / Sell / Errors sub-sections (see get_market_section_html,
+    which this mirrors for a single market/sub-group).
+    """
+    total = sum(len(items) for sub_groups in india_groups.values() for items in sub_groups.values())
+    if total == 0:
+        return ""
+
+    header = f"""
+        <tr>
+          <td style="padding:20px 28px 6px;" class="email-padding">
+            <h2 style="margin:0;font-family:Georgia,'Times New Roman',serif;font-weight:400;font-size:18px;color:#14213D;border-bottom:1px solid #B08D57;padding-bottom:8px;letter-spacing:0.01em;">{market_label} <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;color:#8A8F9C;font-weight:600;">({total})</span></h2>
+          </td>
+        </tr>
+    """
+    body = ""
+    for sub_label in ["Core", "Non-Core"]:
+        sub_groups = india_groups[sub_label]
+        sub_total = sum(len(items) for items in sub_groups.values())
+        if sub_total == 0:
+            continue
+        body += f"""
+        <tr>
+          <td style="padding:12px 28px 0;" class="email-padding">
+            <h3 style="margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.08em;">{sub_label} <span style="color:#8A8F9C;font-weight:600;">({sub_total})</span></h3>
+          </td>
+        </tr>
+        """
+        for title in ["Buy", "Hold", "Sell", "Errors"]:
+            body += get_section_html(title, len(sub_groups[title]), sub_groups[title])
 
     return header + body
 
@@ -2505,6 +2692,21 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
         '</tr>'
     )
 
+    def _heatmap_row_html(pr, name, summary_entry):
+        signal = summary_entry.get("signal", "n/a")
+        dot, color, action = _heatmap_signal_style(pr)
+        move_html = _heatmap_move_html(summary_entry.get("day_change_pct"))
+        trend_html = _heatmap_trend_label(summary_entry.get("trend"))
+        return (
+            f'<tr>'
+            f'<td style="padding:7px 8px 7px 14px;font-family:{sans};font-size:12px;font-weight:600;color:#14213D;border-bottom:1px solid #EFEDE7;">{name}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;border-bottom:1px solid #EFEDE7;text-align:right;">{move_html}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
+            f'</tr>'
+        )
+
     body = ""
     for market_key, market_label in market_sections:
         entries = by_market.get(market_key) or []
@@ -2516,21 +2718,27 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
             f'font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
             f'letter-spacing:0.05em;">{market_label} ({len(entries)})</td></tr>'
         )
-        body += col_header
-        for pr, score, name, summary_entry in entries:
-            signal = summary_entry.get("signal", "n/a")
-            dot, color, action = _heatmap_signal_style(pr)
-            move_html = _heatmap_move_html(summary_entry.get("day_change_pct"))
-            trend_html = _heatmap_trend_label(summary_entry.get("trend"))
-            body += (
-                f'<tr>'
-                f'<td style="padding:7px 8px 7px 14px;font-family:{sans};font-size:12px;font-weight:600;color:#14213D;border-bottom:1px solid #EFEDE7;">{name}</td>'
-                f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}</td>'
-                f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;border-bottom:1px solid #EFEDE7;text-align:right;">{move_html}</td>'
-                f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}</td>'
-                f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
-                f'</tr>'
-            )
+        if market_key == "India":
+            # India Stocks is further split into Core / Non-Core sub-groups
+            # (see INDIA_CORE_SYMBOLS / classify_india_core), each with its
+            # own column header + rows, mirroring the detailed section below.
+            core_entries = [e for e in entries if classify_india_core(e[3].get("ticker")) == "Core"]
+            non_core_entries = [e for e in entries if classify_india_core(e[3].get("ticker")) != "Core"]
+            for sub_label, sub_entries in (("Core", core_entries), ("Non-Core", non_core_entries)):
+                if not sub_entries:
+                    continue
+                body += (
+                    f'<tr><td colspan="5" style="padding:5px 10px 5px 22px;background:#FAF9F6;'
+                    f'font-family:{sans};font-size:10px;font-weight:700;color:#B08D57;text-transform:uppercase;'
+                    f'letter-spacing:0.06em;">{sub_label} ({len(sub_entries)})</td></tr>'
+                )
+                body += col_header
+                for pr, score, name, summary_entry in sub_entries:
+                    body += _heatmap_row_html(pr, name, summary_entry)
+        else:
+            body += col_header
+            for pr, score, name, summary_entry in entries:
+                body += _heatmap_row_html(pr, name, summary_entry)
 
     # Commodities group (Gold & Silver) -- appended last, mirroring the
     # US/India market groups above. Reuses the same buy-trigger signal
@@ -2953,30 +3161,40 @@ def main(mode, use_llm, detailed_llm=False):
                     new_stock_history[ticker] = prior_entry
 
     # This block is now correctly dedented and will run only once
-    # Stocks are grouped first by market (US / India), then by signal (Buy/Hold/Sell/Errors)
+    # Stocks are grouped first by market (US / India), then -- for India --
+    # by Core / Non-Core, then by signal (Buy/Hold/Sell/Errors). US stays a
+    # flat Buy/Hold/Sell/Errors grouping since the Core/Non-Core split is
+    # India-specific.
     groups = {
         "US": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
-        "India": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
+        "India": {
+            "Core": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
+            "Non-Core": {"Buy": [], "Hold": [], "Sell": [], "Errors": []},
+        },
     }
-    for pr, score, name, row_html, _, market in rows:
-        market_key = market if market in groups else "US"
-        if pr == 1:
-            groups[market_key]["Buy"].append((score, name, row_html))
-        elif pr == 2:
-            groups[market_key]["Hold"].append((score, name, row_html))
-        elif pr == 3:
-            groups[market_key]["Sell"].append((score, name, row_html))
+    for pr, score, name, row_html, summary_entry, market in rows:
+        signal_key = "Buy" if pr == 1 else "Hold" if pr == 2 else "Sell" if pr == 3 else "Errors"
+        if market == "India":
+            core_key = classify_india_core(summary_entry.get("ticker"))
+            groups["India"][core_key][signal_key].append((score, name, row_html))
         else:
-            groups[market_key]["Errors"].append((score, name, row_html))
+            groups["US"][signal_key].append((score, name, row_html))
 
-    for market_key in groups:
-        for key in groups[market_key]:
-            groups[market_key][key].sort(key=lambda item: item[0], reverse=True)
+    for key in groups["US"]:
+        groups["US"][key].sort(key=lambda item: item[0], reverse=True)
+    for core_key in groups["India"]:
+        for key in groups["India"][core_key]:
+            groups["India"][core_key][key].sort(key=lambda item: item[0], reverse=True)
 
-    buy_count = len(groups["US"]["Buy"]) + len(groups["India"]["Buy"])
-    hold_count = len(groups["US"]["Hold"]) + len(groups["India"]["Hold"])
-    sell_count = len(groups["US"]["Sell"]) + len(groups["India"]["Sell"])
-    err_count = len(groups["US"]["Errors"]) + len(groups["India"]["Errors"])
+    india_buy = len(groups["India"]["Core"]["Buy"]) + len(groups["India"]["Non-Core"]["Buy"])
+    india_hold = len(groups["India"]["Core"]["Hold"]) + len(groups["India"]["Non-Core"]["Hold"])
+    india_sell = len(groups["India"]["Core"]["Sell"]) + len(groups["India"]["Non-Core"]["Sell"])
+    india_err = len(groups["India"]["Core"]["Errors"]) + len(groups["India"]["Non-Core"]["Errors"])
+
+    buy_count = len(groups["US"]["Buy"]) + india_buy
+    hold_count = len(groups["US"]["Hold"]) + india_hold
+    sell_count = len(groups["US"]["Sell"]) + india_sell
+    err_count = len(groups["US"]["Errors"]) + india_err
 
     # Format date for the report header
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -3159,7 +3377,7 @@ def main(mode, use_llm, detailed_llm=False):
     # and could be silently truncated out of the visible email even though
     # it was fully computed (see "At a Glance" / Quick Summary above, which
     # are compact and always render near the top regardless of this order).
-    section_html = get_market_section_html("🇮🇳 India Stocks", groups["India"])
+    section_html = get_india_market_section_html("🇮🇳 India Stocks", groups["India"])
     section_html += get_market_section_html("🇺🇸 US Stocks", groups["US"])
 
     # Commodity section (Gold & Silver) — built BEFORE stock sections so it appears
