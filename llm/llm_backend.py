@@ -757,17 +757,62 @@ def generate_analysis(
     """
     # -------------------------------------------------------------------
     # Prompt size safety net – Groq returns 413 if the request payload is
-    # too large (typically when the prompt exceeds ~4 KB). We proactively
+    # too large (typically when the prompt exceeds ~4\u202fKB). We proactively
     # truncate overly long prompts to avoid hitting that error and then
     # let the normal fallback chain handle the shortened request.
+    #
+    # IMPORTANT: callers in this project build prompts as
+    #   <intro/context> + <live data block> + <analysis instructions> +
+    #   <OUTPUT FORMAT -- respond with ONLY raw JSON ...> + <schema>
+    # -- i.e. the live-data block (long, and least critical to keep in
+    # full) comes BEFORE the format contract, not after. Blindly keeping
+    # only the first MAX_PROMPT_CHARS chars therefore risks silently
+    # slicing off the "respond with ONLY raw JSON" instruction and the
+    # schema itself -- which doesn't make the call fail, it just makes
+    # every tier respond with normal prose instead of JSON, and that
+    # failure is easy to miss since nothing errors. To avoid that, when a
+    # format-contract marker is present we always keep everything from
+    # that marker to the end intact, and truncate only the (earlier,
+    # data-heavy) portion before it.
     # -------------------------------------------------------------------
     MAX_PROMPT_CHARS = 3000  # empirical safe ceiling; can be tuned via env
     if len(prompt) > MAX_PROMPT_CHARS:
-        log.warning(
-            f"Prompt length ({len(prompt)}) exceeds safe limit ({MAX_PROMPT_CHARS}); "
-            "truncating to avoid Groq 413 errors."
-        )
-        prompt = prompt[:MAX_PROMPT_CHARS]
+        format_marker = None
+        for marker in ("OUTPUT FORMAT", "Respond with ONLY raw JSON"):
+            marker_idx = prompt.find(marker)
+            if marker_idx != -1:
+                format_marker = marker_idx
+                break
+
+        if format_marker is not None:
+            tail = prompt[format_marker:]
+            head_budget = MAX_PROMPT_CHARS - len(tail)
+            if head_budget < 200:
+                # The format contract alone is close to (or over) the
+                # ceiling -- keep it whole anyway (a working JSON
+                # response is useless without it) and log that the
+                # ceiling had to be exceeded, rather than truncate the
+                # instructions themselves.
+                log.warning(
+                    f"Prompt length ({len(prompt)}) exceeds safe limit ({MAX_PROMPT_CHARS}), and "
+                    f"the OUTPUT FORMAT/schema block alone is {len(tail)} chars -- keeping it whole "
+                    "and truncating only the data/context ahead of it instead of risking a "
+                    "prose-instead-of-JSON response."
+                )
+                head_budget = 200
+            head = prompt[:head_budget]
+            prompt = f"{head}\n\n[...truncated for length...]\n\n{tail}"
+            log.warning(
+                f"Prompt length ({len(prompt)}) exceeds safe limit ({MAX_PROMPT_CHARS}); "
+                "truncating the data/context section only, and keeping the OUTPUT FORMAT "
+                "instructions and schema intact so tiers still respond with JSON."
+            )
+        else:
+            log.warning(
+                f"Prompt length ({len(prompt)}) exceeds safe limit ({MAX_PROMPT_CHARS}); "
+                "truncating to avoid Groq 413 errors."
+            )
+            prompt = prompt[:MAX_PROMPT_CHARS]
 
     if validate_fn is None:
         validate_fn = lambda t: bool(t and t.strip())
