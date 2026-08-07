@@ -3,7 +3,7 @@ optionstrategy.py
 
 Standalone companion to main.py, structured the same way as
 swing_trade_advisor.py. Runs a single "recommend the best risk-defined
-Nifty options strategy across Weekly / Monthly
+Nifty options strategy across Weekly / Next Week / Next to Next Week
 horizons" prompt against whichever free LLM backend main.py already knows
 how to set up (Groq free tier -> Gemini 2.5 Flash free tier -> local
 Qwen2.5-1.5B fallback), then emails the result to the same recipients
@@ -97,7 +97,7 @@ EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_P
 # threshold -- see compute_bid_ask_spread_pct().
 MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
 
-HORIZON_ORDER = ["Weekly", "Next Week", "Monthly"]
+HORIZON_ORDER = ["Weekly", "Next Week", "Next to Next Week"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
 TOTAL_CAPITAL_INR = float(os.getenv("OPTIONS_TOTAL_CAPITAL_INR", "1000000"))
 RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
@@ -107,7 +107,7 @@ RISK_FREE_RATE = float(os.getenv("OPTIONS_RISK_FREE_RATE", "0.065"))
 # the index as if it paid no dividend at all (q=0), which biases delta,
 # theta, POP, and touch-probability for the underlying's expected drift --
 # the bias compounds with time-to-expiry, so it matters most for the
-# Monthly horizon. Default is a reasonable long-run estimate;
+# Next to Next Week horizon (the furthest-dated of the three). Default is a reasonable long-run estimate;
 # override via env if you track the live trailing yield.
 DIVIDEND_YIELD = float(os.getenv("OPTIONS_DIVIDEND_YIELD", "0.012"))
 
@@ -522,9 +522,11 @@ def _pick_horizon_expiry_dates(dt_list):
         return {}
     weekly_dt = dts[0]
     next_week_dt = dts[1] if len(dts) > 1 else dts[0]
-    same_month = [dt for dt in dts if (dt.year, dt.month) == (weekly_dt.year, weekly_dt.month)]
-    monthly_dt = same_month[-1] if len(same_month) > 1 else (dts[-1] if len(dts) > 1 else weekly_dt)
-    return {"Weekly": weekly_dt, "Next Week": next_week_dt, "Monthly": monthly_dt}
+    # Third-nearest expiry -- i.e. the expiry that follows "Next Week".
+    # Falls back to the last available date (or Next Week's / Weekly's own
+    # date) when the feed doesn't have three distinct expiries yet.
+    next_to_next_week_dt = dts[2] if len(dts) > 2 else (dts[-1] if len(dts) > 1 else weekly_dt)
+    return {"Weekly": weekly_dt, "Next Week": next_week_dt, "Next to Next Week": next_to_next_week_dt}
 
 
 def _pick_horizon_expiries(expiry_dates):
@@ -2458,7 +2460,7 @@ def build_prompt(live_data=None):
 Analyze current market conditions and determine the optimal strategy stance for three distinct horizons:
 1. Weekly -- (current/nearest weekly expiry)
 2. Next Week -- (next week's expiry)
-3. Monthly -- (current month-end expiry)
+3. Next to Next Week -- (the weekly expiry after Next Week, i.e. two weeks out)
 
 --------------------------------------------------------------------------------
 STRATEGY & LEGS CONSTRAINT:
@@ -2520,11 +2522,11 @@ CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no 
       "data_status": "live"
     }},
     {{
-      "horizon": "Monthly",
-      "expiry_date": "The actual expiry date for Monthly copied EXACTLY as shown in the LIVE DATA FEED above.",
+      "horizon": "Next to Next Week",
+      "expiry_date": "The actual expiry date for Next to Next Week copied EXACTLY as shown in the LIVE DATA FEED above.",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data for Monthly.",
+      "bias_reason": "One or two sentences grounded in the live data for Next to Next Week.",
       "strategy_name": "One of allowed defined-risk structures",
       "legs": "Comma-separated string, e.g. 'Sell 23800 PE, Buy 23600 PE'",
       "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
@@ -2532,7 +2534,7 @@ CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no 
       "data_status": "live"
     }}
   ],
-  "portfolio_view": "One paragraph on overall market gap risk and multi-horizon portfolio diversification across Weekly, Next Week, and Monthly setups."
+  "portfolio_view": "One paragraph on overall market gap risk and multi-horizon portfolio diversification across Weekly, Next Week, and Next to Next Week setups."
 }}
 """
 
@@ -3663,7 +3665,7 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
             <td style="background:#14213D;padding:26px 28px 22px;" class="email-padding">
               <div style="font-family:{sans};font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:#B08D57;">Market Intelligence &nbsp;&bull;&nbsp; Derivatives Desk</div>
               <h1 style="margin:8px 0 0;font-family:{serif};font-weight:400;font-size:23px;line-height:1.3;color:#ffffff;letter-spacing:0.01em;">Nifty Options Strategy Note</h1>
-              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Monthly &mdash; Risk-Defined Only</p>
+              <p style="margin:6px 0 0;font-family:{sans};font-size:12px;color:#B7BEC9;">Weekly &middot; Next Week &middot; Next to Next Week &mdash; Risk-Defined Only</p>
             </td>
           </tr>
           <tr>
@@ -3956,7 +3958,7 @@ CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no 
       "data_status": "live"
     }},
     {{
-      "horizon": "Monthly",
+      "horizon": "Next to Next Week",
       "expiry_date": "...",
       "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
       "next_week_bias": "n/a",
