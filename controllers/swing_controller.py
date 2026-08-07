@@ -1313,9 +1313,46 @@ def _verify_risk_reward(stock):
     return notes
 
 
+_technicals_cache = {}
+_technicals_cache_lock = threading.Lock()
+
+
 def _fetch_weekly_technicals(ticker):
+    """
+    Fetches OHLC price history for `ticker` and derives the weekly
+    technicals (SMA20w/50w, RSI, MACD) used to independently verify the
+    strategy's uptrend / RSI / MACD filters.
+
+    NOTE: this used to call fetch_stock_data(ticker) once, bare, with no
+    retry and no cache -- called repeatedly for the same ticker across a
+    run (watchlist recheck, Stage-2 verification, near-miss reporting),
+    and from concurrent candidate checks alongside stock_controller's and
+    _fetch_fundamentals's own yfinance/NSE traffic. A single transient
+    hiccup (rate-limit, timeout, momentary session/crumb failure) was
+    enough to permanently mark an otherwise-good candidate "price history
+    fetch failed" for the rest of the run -- exactly the same failure mode
+    _fetch_fundamentals_uncached had before it was moved onto
+    call_with_retries (see that function's docstring). This now retries
+    transient failures the same way, and caches the result per ticker for
+    the life of the process so a retried, successful fetch doesn't get
+    thrown away and re-fetched (and re-risked) on the next call site.
+    """
+    ticker = (ticker or "").strip()
+    if not ticker:
+        return None
+    if ticker in _technicals_cache:
+        return _technicals_cache[ticker]
+    with _technicals_cache_lock:
+        if ticker in _technicals_cache:
+            return _technicals_cache[ticker]
+        result = _fetch_weekly_technicals_uncached(ticker)
+        _technicals_cache[ticker] = result
+        return result
+
+
+def _fetch_weekly_technicals_uncached(ticker):
     try:
-        df = fetch_stock_data(ticker)
+        df = call_with_retries(lambda: fetch_stock_data(ticker), max_attempts=5)
         if df is None or len(df) < 30 or "close" not in df.columns:
             return None
 
@@ -1329,7 +1366,6 @@ def _fetch_weekly_technicals(ticker):
         if len(close) < 30:
             return None
 
-        import pandas as pd
         weekly_close = close.resample("W").last().dropna()
         # Drop current incomplete week to avoid distorted signals
         if len(weekly_close) > 1 and weekly_close.index[-1] > pd.Timestamp.now(tz=weekly_close.index.tz) - pd.Timedelta(days=2):

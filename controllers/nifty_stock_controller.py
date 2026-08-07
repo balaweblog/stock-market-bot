@@ -421,6 +421,50 @@ def run_market_stage(today_str, lookback_note):
     return data, sources, live
 
 
+def _filter_to_requested_stocks(stocks, batch):
+    """
+    Keeps only the stock objects whose stock_name matches one of the
+    stocks actually requested in this batch (normalized, case/whitespace-
+    insensitive match against WATCHLIST's names) -- and drops everything
+    else.
+
+    Without this, a live-search-grounded LLM call occasionally returns
+    extra stock objects beyond what build_stock_prompt() asked for: a
+    peer/comparison stock mentioned in a news article, a similarly-named
+    company, or an outright hallucinated name -- even though the prompt
+    explicitly says "Exact stock name as given above" and "one object per
+    stock listed above". Previously run_stock_stage() appended whatever
+    list came back with no check at all, so any such extra entry rode
+    straight through into the email as if it were part of WATCHLIST. Stock
+    identity here is the whole point (this report is a review of a fixed
+    personal watchlist, not stock discovery), so an unrequested name is
+    always dropped rather than shown -- logged so it's visible, not just
+    silently discarded. Also dedupes to the first entry per requested
+    stock, in case the model repeats one.
+    """
+    wanted = {name.strip().casefold(): name for name in batch}
+    kept, seen = [], set()
+    for s in stocks if isinstance(stocks, list) else []:
+        if not isinstance(s, dict):
+            continue
+        raw_name = str(s.get("stock_name") or "").strip()
+        key = raw_name.casefold()
+        canonical = wanted.get(key)
+        if canonical is None:
+            log.warning(
+                f"Dropping unrequested stock '{raw_name}' returned for batch "
+                f"({', '.join(batch)}) -- not one of WATCHLIST's exact names."
+            )
+            continue
+        if canonical in seen:
+            log.warning(f"Duplicate entry for '{canonical}' in this batch's response -- keeping the first.")
+            continue
+        seen.add(canonical)
+        s["stock_name"] = canonical  # normalize to the exact WATCHLIST spelling
+        kept.append(s)
+    return kept
+
+
 def run_stock_stage(today_str, lookback_note):
     all_stocks, sources, used_live = [], [], False
     for batch in _chunks(WATCHLIST, STOCK_PER_BATCH):
@@ -435,7 +479,7 @@ def run_stock_stage(today_str, lookback_note):
         data = _parse_json_object(text)
         stocks = data.get("stocks") if isinstance(data, dict) else None
         if isinstance(stocks, list):
-            all_stocks.extend(stocks)
+            all_stocks.extend(_filter_to_requested_stocks(stocks, batch))
         else:
             log.warning(f"Could not parse stock JSON for batch: {', '.join(batch)}")
         for src in s:
@@ -578,6 +622,24 @@ def _section_title(text):
     )
 
 
+def _stock_section_title(text, count):
+    """
+    Same section-title treatment as _section_title(), but bolded, in the
+    gold accent color instead of navy, and with the total number of stocks
+    analyzed this run appended -- so the Watchlist Stock Analysis header
+    stands out from the other (default-styled) section headers and states
+    its count up front rather than requiring a scroll-and-count.
+    """
+    stock_word = "stock" if count == 1 else "stocks"
+    return (
+        f'<h2 style="margin:22px 0 10px;font-family:{SERIF};font-weight:700;'
+        f'font-size:18px;color:#B08D57;border-bottom:2px solid #B08D57;padding-bottom:6px;">'
+        f'{_esc(text)} '
+        f'<span style="font-size:13px;font-weight:700;color:#4A5063;">'
+        f'({count} {stock_word} analyzed)</span></h2>'
+    )
+
+
 def render_executive_summary(market_data, synthesis_data):
     sentiment = market_data.get("market_sentiment", "Neutral")
     color = _sentiment_color(sentiment)
@@ -657,7 +719,7 @@ def _action_now_text(stock_data):
 
 def render_stock_cards(stocks_data):
     if not stocks_data:
-        return _section_title("2. Watchlist Stock Analysis") + (
+        return _stock_section_title("2. Watchlist Stock Analysis (Last 7 Days)", 0) + (
             f'<p style="font-family:{SANS};font-size:12.5px;color:#B0473F;">No stock data could be generated this run.</p>'
         )
     cards = []
@@ -768,7 +830,7 @@ def render_stock_cards(stocks_data):
           </tr>
         </table>
         """)
-    return _section_title("2. Watchlist Stock Analysis (Last 7 Days)") + "".join(cards)
+    return _stock_section_title("2. Watchlist Stock Analysis (Last 7 Days)", len(stocks_data)) + "".join(cards)
 
 
 def render_market_news(market_data):

@@ -573,6 +573,49 @@ def _valid_funds_json(text):
     return isinstance(funds, list) or isinstance(funds, dict)
 
 
+def _filter_to_requested_funds(funds, batch):
+    """
+    Keeps only the fund objects whose fund_name matches one of the funds
+    actually requested in this batch (normalized, case/whitespace-insensitive
+    match against MF_PORTFOLIO's names) -- and drops everything else.
+
+    Without this, a live-search-grounded LLM call occasionally returns
+    extra fund objects beyond what build_fund_prompt() asked for: a
+    similarly-named fund that turned up in its search results, a peer/
+    comparison fund mentioned in a news article, or an outright
+    hallucinated name -- even though the prompt explicitly says "Exact
+    fund name as given above" and "one object per fund listed above".
+    Previously run_fund_stage() appended whatever list came back with no
+    check at all, so any such extra entry rode straight through
+    _enrich_funds_with_amfi() and into render_fund_cards(), showing up in
+    the email as if it were part of MF_PORTFOLIO. Fund identity here is
+    the whole point (this report is a review of a fixed personal
+    portfolio, not fund discovery), so an unrequested name is always
+    dropped rather than shown -- logged so it's visible, not just silently
+    discarded. Also dedupes to the first entry per requested fund, in case
+    the model repeats one.
+    """
+    wanted = {name.strip().casefold(): name for name in batch}
+    kept, seen = [], set()
+    for f in funds if isinstance(funds, list) else []:
+        raw_name = str((f or {}).get("fund_name") or "").strip()
+        key = raw_name.casefold()
+        canonical = wanted.get(key)
+        if canonical is None:
+            log.warning(
+                f"Dropping unrequested fund '{raw_name}' returned for batch "
+                f"({', '.join(batch)}) -- not one of MF_PORTFOLIO's exact names."
+            )
+            continue
+        if canonical in seen:
+            log.warning(f"Duplicate entry for '{canonical}' in this batch's response -- keeping the first.")
+            continue
+        seen.add(canonical)
+        f["fund_name"] = canonical  # normalize to the exact PORTFOLIO spelling
+        kept.append(f)
+    return kept
+
+
 def run_fund_stage(today_str, lookback_note):
     all_funds, sources, used_live = [], [], False
     for batch in _chunks(PORTFOLIO, FUNDS_PER_BATCH):
@@ -603,7 +646,7 @@ def run_fund_stage(today_str, lookback_note):
             # batch has only one fund -- normalize instead of dropping it.
             funds = [funds]
         if isinstance(funds, list):
-            all_funds.extend(funds)
+            all_funds.extend(_filter_to_requested_funds(funds, batch))
         else:
             snippet_len = 400
             head = text[:snippet_len]
@@ -746,6 +789,24 @@ def _section_title(text):
     )
 
 
+def _fund_section_title(text, count):
+    """
+    Same section-title treatment as _section_title(), but bolded, in the
+    gold accent color instead of navy, and with the total number of funds
+    analyzed this run appended -- so the Fund-wise Analysis header stands
+    out from the other (default-styled) section headers and states its
+    count up front rather than requiring a scroll-and-count.
+    """
+    fund_word = "fund" if count == 1 else "funds"
+    return (
+        f'<h2 style="margin:22px 0 10px;font-family:{SERIF};font-weight:700;'
+        f'font-size:18px;color:#B08D57;border-bottom:2px solid #B08D57;padding-bottom:6px;">'
+        f'{_esc(text)} '
+        f'<span style="font-size:13px;font-weight:700;color:#4A5063;">'
+        f'({count} {fund_word} analyzed)</span></h2>'
+    )
+
+
 def render_executive_summary(market_data, synthesis_data):
     sentiment = market_data.get("market_sentiment", "Neutral")
     color = _sentiment_color(sentiment)
@@ -804,7 +865,7 @@ def _action_now_text(fund_data):
 
 def render_fund_cards(funds_data):
     if not funds_data:
-        return _section_title("2. Fund-wise Analysis") + (
+        return _fund_section_title("2. Fund-wise Analysis (Last 30 Days)", 0) + (
             f'<p style="font-family:{SANS};font-size:12.5px;color:#B0473F;">No fund data could be generated this run.</p>'
         )
     cards = []
@@ -920,7 +981,7 @@ def render_fund_cards(funds_data):
           </tr>
         </table>
         """)
-    return _section_title("2. Fund-wise Analysis (Last 30 Days)") + "".join(cards)
+    return _fund_section_title("2. Fund-wise Analysis (Last 30 Days)", len(funds_data)) + "".join(cards)
 
 
 def render_market_news(market_data):
