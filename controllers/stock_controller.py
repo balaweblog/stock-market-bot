@@ -35,7 +35,7 @@ from utils.logger import log
 from services.commodity_tracker import CommodityTracker
 from utils.compliance import build_compliance_block_html
 from utils import email_service
-from models.track_record import update_track_record, build_track_record_html
+from models.track_record import update_track_record
 from models.support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
 from llm import llm_backend
 
@@ -2337,9 +2337,14 @@ def _action_plan_profit_booking(status_key, buy_level, target):
 
 def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None,
                            current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None,
-                           tranche_amount_inr=None):
+                           tranche_amount_inr=None, signal=None):
     sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
+    # Buy-call rows get a faint green row background (distinct from the
+    # "Current Status" pill's own color, which reflects buy-zone proximity
+    # rather than the underlying signal) so a Buy call is easy to spot at
+    # a glance while scanning the table.
+    row_bg = " background:#F4FAF3;" if str(signal or "").upper().startswith("BUY") else ""
     if tranche_amount_inr is not None:
         # Commodities (gold/silver): render "Buy ₹X" / "Sell ₹X" / "Sell all"
         # instead of the equity-style "Add N (~%)" / "Reduce N" tranches.
@@ -2350,7 +2355,7 @@ def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, 
     add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
     name_display = f"{name} <span style=\"color:#8A8F9C;font-size:11px;\">{ticker_label}</span>" if ticker_label else name
     return f"""
-        <tr>
+        <tr style="{row_bg}">
             <td style="padding:7px 10px;font-size:12px;font-weight:700;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{name_display}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{add_below}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};border-top:1px solid #EDEAE2;">
@@ -2405,6 +2410,7 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             ticker_label=entry.get("ticker"), sans=sans,
             current_price=current_price, stop_loss=entry.get("stop_loss"),
             total_score=entry.get("total_score"), signal_confirmation_status=entry.get("signal_confirmation_status"),
+            signal=signal,
         )
         market_key = classify_market(entry.get("ticker"))
         stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
@@ -3530,7 +3536,6 @@ def main(mode, use_llm, detailed_llm=False):
         rows, commodity_data=commodity_data, commodity_buy_signals=new_commodity_history
     )
     concentration_alert_html = build_concentration_alert_html(rows)
-    track_record_html = build_track_record_html(track_record_state)
 
     footer_html = (
         build_compliance_block_html(
@@ -3559,7 +3564,6 @@ def main(mode, use_llm, detailed_llm=False):
         error_summary_html
         + quick_jump_html
         + ai_portfolio_story_html
-        + track_record_html
         + market_takeaway_html
         + quick_summary_html
         + action_plan_html
@@ -3584,7 +3588,6 @@ def main(mode, use_llm, detailed_llm=False):
         report_html_header
         + quick_jump_html
         + ai_portfolio_story_html
-        + track_record_html
         + market_takeaway_html
         + quick_summary_html
         + action_plan_html
