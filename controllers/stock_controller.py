@@ -2898,7 +2898,13 @@ def build_error_summary_html(groups):
     """
     failed_names = []
     for market in groups.values():
-        failed_names.extend(name for _score, name, _html in market["Errors"])
+        if "Errors" in market:
+            # Flat grouping (e.g. US): {"Buy": [...], "Hold": [...], "Errors": [...]}
+            failed_names.extend(name for _score, name, _html in market["Errors"])
+        else:
+            # Nested grouping (e.g. India): {"Core": {...}, "Non-Core": {...}}
+            for sub_group in market.values():
+                failed_names.extend(name for _score, name, _html in sub_group["Errors"])
 
     if not failed_names:
         return ""
