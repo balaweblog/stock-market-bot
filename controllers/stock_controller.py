@@ -1832,6 +1832,12 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
             "day_change_pct": prev_close_change_pct,
             "trend": market_context.get("trend"),
             "signal_confirmation_status": signal_confirmation["status"],
+            # Added so _action_plan_add_sizing() can weigh trend strength and
+            # reward:risk instead of just discount-to-buy-level + score --
+            # both were already computed above for the stock card but were
+            # never threaded through to the Action Plan sizing logic.
+            "adx": latest.get("adx"),
+            "risk_reward_ratio": entry_context.get("risk_reward_ratio"),
         }
 
         print(f"{stock_name} ({ticker}) -> {signal} | Conviction: {conviction_rating['label']} {conviction_rating['icons_text']} | Risk: {risk_meter['label']}")
@@ -1948,7 +1954,8 @@ def build_quick_summary_groups(rows):
         upcoming_events = row.get("upcoming_events") or {}
 
         if "BUY" in signal and current_price is not None and recommended_buy_level is not None and current_price < recommended_buy_level:
-            market_bucket[group_key].append(f"✅ Buy: {stock_name} below ₹{recommended_buy_level}")
+            buy_currency_symbol = "₹" if market_key == "India" else "$"
+            market_bucket[group_key].append(f"✅ Buy: {stock_name} below {buy_currency_symbol}{recommended_buy_level}")
             continue
 
         results_date = upcoming_events.get("results_announcement_date")
@@ -2154,6 +2161,35 @@ ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE = int(os.getenv("ACTION_PLAN_ALLOCATION_P
 ACTION_PLAN_DEEP_DISCOUNT_PCT = float(os.getenv("ACTION_PLAN_DEEP_DISCOUNT_PCT", "3"))
 ACTION_PLAN_HIGH_CONVICTION_SCORE = float(os.getenv("ACTION_PLAN_HIGH_CONVICTION_SCORE", "75"))
 
+# --- Multi-factor Add sizing (replaces the old binary "+1 per factor" rule) ---
+# The old version only asked two yes/no questions (discount>=3%? score>=75?),
+# so almost every in-zone stock landed on the same "Add 2 (~50%)" because
+# most stocks clear neither, one, or both thresholds by a hair -- there was
+# no room for "clearly not there yet" vs "just barely qualifies" vs
+# "overwhelming case". This version scores each factor continuously (how
+# far below the buy level, how far above/below conviction floor, etc.) and
+# adds two factors the old version ignored entirely: trend strength (ADX)
+# and reward:risk ratio. Sector crowding is applied as a penalty separately
+# in build_action_plan_table_html (needs the whole Buy list, not just one
+# stock, to know what's already crowded).
+#
+# Continuous points per factor (weights, not hard yes/no):
+#   discount to buy level : 0..2   (scales up to ACTION_PLAN_DISCOUNT_FULL_PCT below buy level)
+#   conviction score      : 0..2   (scales between FLOOR and CEILING)
+#   trend strength (ADX)  : 0..1   (full point once ADX clears the trending threshold)
+#   reward:risk ratio      : 0..1  (full point once RR clears the minimum)
+#   sector crowding        : -1    (applied by the caller when this stock's
+#                                    sector already dominates the Buy list)
+# Total score range: -1 .. 6, bucketed into tranches below.
+ACTION_PLAN_DISCOUNT_FULL_PCT = float(os.getenv("ACTION_PLAN_DISCOUNT_FULL_PCT", "8"))
+ACTION_PLAN_CONVICTION_FLOOR = float(os.getenv("ACTION_PLAN_CONVICTION_FLOOR", "55"))
+ACTION_PLAN_CONVICTION_CEILING = float(os.getenv("ACTION_PLAN_CONVICTION_CEILING", "85"))
+ACTION_PLAN_TREND_ADX_THRESHOLD = float(os.getenv("ACTION_PLAN_TREND_ADX_THRESHOLD", "25"))
+ACTION_PLAN_MIN_RR_FOR_POINT = float(os.getenv("ACTION_PLAN_MIN_RR_FOR_POINT", "2"))
+# Score cutoffs that decide how many tranches the weighted total buys.
+ACTION_PLAN_SCORE_FOR_3_TRANCHES = float(os.getenv("ACTION_PLAN_SCORE_FOR_3_TRANCHES", "4.5"))
+ACTION_PLAN_SCORE_FOR_2_TRANCHES = float(os.getenv("ACTION_PLAN_SCORE_FOR_2_TRANCHES", "2"))
+
 _ACTION_PLAN_STATUS_DISPLAY = {
     "in_zone":        ("In buy zone",            "#2F5233", "#E7EEE4"),
     "slightly_above": ("Slightly above buy zone", "#A6812F", "#FDF3D9"),
@@ -2173,19 +2209,43 @@ _ACTION_PLAN_NEXT_ACTION = {
 }
 
 
-def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status):
+def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status,
+                             adx=None, risk_reward_ratio=None, sector_crowded=False):
     """
     Sizes an "Add" recommendation into a concrete number of tranches
-    (1..ACTION_PLAN_MAX_TRANCHES) instead of one flat percentage for every
-    in-zone stock. +1 tranche each for:
-    - a real discount to the buy level (not just sitting at it) --
-      ACTION_PLAN_DEEP_DISCOUNT_PCT or more below it
-    - high conviction (total_score, the blended tech+fundamentals+sentiment
-      score) at or above ACTION_PLAN_HIGH_CONVICTION_SCORE
-    Capped at 1 tranche whenever technicals and fundamentals are actively
-    conflicting (signal_confirmation_status == "conflicted"), regardless of
-    discount or score -- that's exactly the situation where sizing up is
-    least justified.
+    (1..ACTION_PLAN_MAX_TRANCHES) using a weighted blend of factors instead
+    of two yes/no thresholds. Each factor contributes a continuous number
+    of points (see the ACTION_PLAN_* constants above for the scales):
+
+    - discount to buy level (0..2 pts): the further below the buy level the
+      current price already is, the more points -- a stock sitting exactly
+      at its level earns 0, one ACTION_PLAN_DISCOUNT_FULL_PCT below earns
+      the full 2.
+    - conviction score (0..2 pts): scaled between ACTION_PLAN_CONVICTION_FLOOR
+      (0 pts) and ACTION_PLAN_CONVICTION_CEILING (2 pts), so a 76 and a 95
+      score no longer size identically just because both cleared one flat
+      "high conviction" bar.
+    - trend strength (0..1 pt): a full point once ADX clears
+      ACTION_PLAN_TREND_ADX_THRESHOLD -- a stock can look cheap and
+      high-scoring but still be range-bound/choppy rather than trending,
+      which the old version had no way to see.
+    - reward:risk (0..1 pt): a full point once the target-vs-stop ratio
+      clears ACTION_PLAN_MIN_RR_FOR_POINT -- a good discount isn't worth
+      much if the stop-loss is nearly as close as the target.
+    - sector crowding (-1 pt): passed in by the caller when this stock's
+      sector already dominates the current Buy list (see
+      build_action_plan_table_html) -- discourages piling further into a
+      sector that's already a concentration risk, even if this one stock's
+      own numbers look great in isolation.
+
+    The weighted total (roughly -1..6) is bucketed into tranches by
+    ACTION_PLAN_SCORE_FOR_2_TRANCHES / ACTION_PLAN_SCORE_FOR_3_TRANCHES.
+
+    Conflicting technicals/fundamentals (signal_confirmation_status ==
+    "conflicted") still overrides everything else and caps at 1 tranche --
+    that's the one case where no combination of other factors should size
+    up, since the underlying signals themselves disagree.
+
     Returns (tranches, reasons) -- reasons is the short list of factors
     that drove the number, for display under the action.
     """
@@ -2193,18 +2253,44 @@ def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confir
     if conf_status == "conflicted":
         return 1, ["conflicting technical/fundamental signals -- sizing capped"]
 
-    tranches = 1
+    score = 0.0
     reasons = []
+
     if current_price is not None and buy_level:
         pct_vs_buy = (current_price - buy_level) / buy_level * 100
-        if pct_vs_buy <= -ACTION_PLAN_DEEP_DISCOUNT_PCT:
-            tranches += 1
-            reasons.append(f"{abs(round(pct_vs_buy))}% below buy level")
-    if total_score is not None and total_score >= ACTION_PLAN_HIGH_CONVICTION_SCORE:
-        tranches += 1
-        reasons.append(f"high conviction score ({round(total_score)}/100)")
+        discount = max(0.0, -pct_vs_buy)
+        discount_pts = min(2.0, discount / ACTION_PLAN_DISCOUNT_FULL_PCT * 2.0)
+        score += discount_pts
+        if discount_pts > 0:
+            reasons.append(f"{round(discount)}% below buy level")
 
-    tranches = min(tranches, ACTION_PLAN_MAX_TRANCHES)
+    if total_score is not None:
+        span = max(ACTION_PLAN_CONVICTION_CEILING - ACTION_PLAN_CONVICTION_FLOOR, 1e-6)
+        conviction_pts = min(2.0, max(0.0, (total_score - ACTION_PLAN_CONVICTION_FLOOR) / span * 2.0))
+        score += conviction_pts
+        if conviction_pts > 0:
+            reasons.append(f"conviction score {round(total_score)}/100")
+
+    if adx is not None and adx >= ACTION_PLAN_TREND_ADX_THRESHOLD:
+        score += 1.0
+        reasons.append(f"trending (ADX {round(adx)})")
+
+    if risk_reward_ratio is not None and risk_reward_ratio >= ACTION_PLAN_MIN_RR_FOR_POINT:
+        score += 1.0
+        reasons.append(f"favorable {risk_reward_ratio}:1 reward/risk")
+
+    if sector_crowded:
+        score -= 1.0
+        reasons.append("sector already concentrated in Buy list -- sizing trimmed")
+
+    if score >= ACTION_PLAN_SCORE_FOR_3_TRANCHES:
+        tranches = 3
+    elif score >= ACTION_PLAN_SCORE_FOR_2_TRANCHES:
+        tranches = 2
+    else:
+        tranches = 1
+    tranches = max(1, min(tranches, ACTION_PLAN_MAX_TRANCHES))
+
     if not reasons:
         reasons.append("at buy level, no extra conviction signal yet")
     return tranches, reasons
@@ -2235,7 +2321,8 @@ def _action_plan_reduce_sizing(current_price, stop_loss, signal_confirmation_sta
     return tranches, reasons, tranches >= ACTION_PLAN_MAX_TRANCHES
 
 
-def _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status):
+def _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status,
+                                   adx=None, risk_reward_ratio=None, sector_crowded=False):
     """
     Builds the "Next Action" cell content: a concrete sized action for
     in_zone/sell_signal (see the two sizing functions above), plus a small
@@ -2243,7 +2330,10 @@ def _action_plan_next_action_html(status_key, current_price, buy_level, stop_los
     flat text from _ACTION_PLAN_NEXT_ACTION for every other status.
     """
     if status_key == "in_zone":
-        tranches, reasons = _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status)
+        tranches, reasons = _action_plan_add_sizing(
+            current_price, buy_level, total_score, signal_confirmation_status,
+            adx=adx, risk_reward_ratio=risk_reward_ratio, sector_crowded=sector_crowded,
+        )
         pct = tranches * ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE
         label = f"Add {tranches} <span style=\"color:#8A8F9C;font-weight:400;\">(~{pct}%)</span>"
     elif status_key == "sell_signal":
@@ -2337,7 +2427,8 @@ def _action_plan_profit_booking(status_key, buy_level, target):
 
 def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None,
                            current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None,
-                           tranche_amount_inr=None, signal=None):
+                           tranche_amount_inr=None, signal=None,
+                           adx=None, risk_reward_ratio=None, sector_crowded=False):
     sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
     # Buy-call rows get a faint green row background (distinct from the
@@ -2350,13 +2441,18 @@ def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, 
         # instead of the equity-style "Add N (~%)" / "Reduce N" tranches.
         next_action = _action_plan_next_action_commodity_html(status_key, current_price, buy_level, stop_loss, tranche_amount_inr)
     else:
-        next_action = _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status)
+        next_action = _action_plan_next_action_html(
+            status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status,
+            adx=adx, risk_reward_ratio=risk_reward_ratio, sector_crowded=sector_crowded,
+        )
     profit_booking = _action_plan_profit_booking(status_key, buy_level, target)
     add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
+    current_price_display = f"{currency_symbol}{current_price:,.2f}" if current_price is not None else "—"
     name_display = f"{name} <span style=\"color:#8A8F9C;font-size:11px;\">{ticker_label}</span>" if ticker_label else name
     return f"""
         <tr style="{row_bg}">
             <td style="padding:7px 10px;font-size:12px;font-weight:700;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{name_display}</td>
+            <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{current_price_display}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{add_below}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};border-top:1px solid #EDEAE2;">
                 <span style="display:inline-block;padding:2px 8px;border-radius:999px;background:{bg};color:{color};font-size:11px;font-weight:700;">{label}</span>
@@ -2387,10 +2483,36 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
 
     def group_header_row(label):
         return (
-            f'<tr><td colspan="5" style="padding:10px 10px 6px;font-family:{sans};'
+            f'<tr><td colspan="6" style="padding:10px 10px 6px;font-family:{sans};'
             f'font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
             f'letter-spacing:0.05em;background:#F4F2ED;">{label}</td></tr>'
         )
+
+    # Sector-crowding pre-pass: mirrors build_concentration_alert_html's
+    # logic (same SECTOR_CONCENTRATION_THRESHOLD_PCT), computed here too so
+    # _action_plan_add_sizing can penalize adding to a sector that's already
+    # dominating a market's current Buy list, rather than sizing each stock
+    # purely on its own numbers with no view of portfolio-level crowding.
+    sector_counts_by_market = {"US": {}, "India": {}}
+    for entry in (summary_rows or []):
+        if (entry.get("priority") or 4) != 1:  # only current Buy signals count
+            continue
+        raw_sector = (entry.get("sector") or "").strip()
+        sector = raw_sector if raw_sector and raw_sector.lower() != "unknown" else "Unknown"
+        market_key = classify_market(entry.get("ticker"))
+        sector_counts_by_market.setdefault(market_key, {})
+        sector_counts_by_market[market_key][sector] = sector_counts_by_market[market_key].get(sector, 0) + 1
+
+    def _is_sector_crowded(market_key, sector):
+        raw_sector = (sector or "").strip()
+        sector = raw_sector if raw_sector and raw_sector.lower() != "unknown" else "Unknown"
+        if sector == "Unknown":
+            return False
+        counts = sector_counts_by_market.get(market_key) or {}
+        total = sum(counts.values())
+        if total < 2:
+            return False
+        return (counts.get(sector, 0) / total * 100) >= SECTOR_CONCENTRATION_THRESHOLD_PCT
 
     stock_rows_by_market = {"US": [], "India": []}
     for entry in (summary_rows or []):
@@ -2403,7 +2525,8 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
         status_key = _classify_buy_zone(current_price, buy_level, signal)
         if status_key == "unknown":
             continue
-        currency_symbol = "₹" if classify_market(entry.get("ticker")) == "India" else "$"
+        market_key = classify_market(entry.get("ticker"))
+        currency_symbol = "₹" if market_key == "India" else "$"
         row_html_str = _action_plan_row_html(
             entry.get("stock_name") or entry.get("ticker") or "—",
             currency_symbol, buy_level, target, status_key,
@@ -2411,8 +2534,9 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             current_price=current_price, stop_loss=entry.get("stop_loss"),
             total_score=entry.get("total_score"), signal_confirmation_status=entry.get("signal_confirmation_status"),
             signal=signal,
+            adx=entry.get("adx"), risk_reward_ratio=entry.get("risk_reward_ratio"),
+            sector_crowded=_is_sector_crowded(market_key, entry.get("sector")),
         )
-        market_key = classify_market(entry.get("ticker"))
         stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
 
     def sorted_rows(market_key):
@@ -2481,6 +2605,7 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
               <tr style="background:#14213D;">
                 <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#B08D57;text-transform:uppercase;letter-spacing:0.05em;">Stock</td>
+                <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Current Price</td>
                 <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Add Below</td>
                 <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Current Status</td>
                 <td style="padding:8px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">Next Action</td>
@@ -2699,6 +2824,40 @@ def _heatmap_move_html(day_change_pct):
     return f'<span style="color:{color};font-weight:700;">{day_change_pct:+.2f}%</span>'
 
 
+# Single-day move (in %) big enough that, if it runs counter to the
+# 20/50-day Trend label, it's worth flagging -- Trend is a cumulative
+# 20/50-day return (see models/market_context.py), so it barely moves on
+# any one day and can legitimately stay "Bullish"/"Bearish" the same day a
+# stock gaps hard the other way. That's not a data bug, but a reader
+# scanning the heatmap can easily mistake "Trend" for "today's direction"
+# since the two columns sit side by side. This threshold flags the cases
+# worth a second look without flagging routine day-to-day noise.
+HEATMAP_TREND_DIVERGENCE_PCT = 3.0
+
+
+def _heatmap_divergence_badge(day_change_pct, raw_trend):
+    """Returns a small inline warning badge (or '') when today's move runs
+    opposite the 20/50-day Trend by more than HEATMAP_TREND_DIVERGENCE_PCT
+    -- e.g. a sharp single-day drop next to a still-Bullish trend label.
+    Purely a "these two numbers look contradictory, check the story"
+    signal; it does not mean either figure is wrong."""
+    if day_change_pct is None:
+        return ""
+    trend_label = _heatmap_trend_label(raw_trend)
+    if trend_label == "📈 Bullish" and day_change_pct <= -HEATMAP_TREND_DIVERGENCE_PCT:
+        pass
+    elif trend_label == "📉 Bearish" and day_change_pct >= HEATMAP_TREND_DIVERGENCE_PCT:
+        pass
+    else:
+        return ""
+    return (
+        '<span title="Today\'s move runs opposite the 20/50-day trend -- worth a second look" '
+        'style="display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;'
+        'font-size:10px;font-weight:700;color:#8A5A00;background:#FFF3D6;border:1px solid #8A5A0033;'
+        'white-space:nowrap;">⚠️ vs trend</span>'
+    )
+
+
 def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals=None):
     """
     Portfolio Heatmap: a single scannable table (Symbol / Signal / Today's
@@ -2734,7 +2893,7 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
         f'<td style="padding:6px 8px 6px 14px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;">Symbol</td>'
         f'<td style="padding:6px 8px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;">Signal</td>'
         f'<td style="padding:6px 8px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;text-align:right;">Today\'s Move</td>'
-        f'<td style="padding:6px 8px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;">Trend</td>'
+        f'<td style="padding:6px 8px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;">Trend (20/50d)</td>'
         f'<td style="padding:6px 8px 6px 8px;font-family:{sans};font-size:10px;font-weight:700;color:#8A8F9C;text-transform:uppercase;letter-spacing:0.06em;text-align:right;">Action</td>'
         '</tr>'
     )
@@ -2742,14 +2901,16 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
     def _heatmap_row_html(pr, name, summary_entry):
         signal = summary_entry.get("signal", "n/a")
         dot, color, action = _heatmap_signal_style(pr)
-        move_html = _heatmap_move_html(summary_entry.get("day_change_pct"))
+        day_change_pct = summary_entry.get("day_change_pct")
+        move_html = _heatmap_move_html(day_change_pct)
         trend_html = _heatmap_trend_label(summary_entry.get("trend"))
+        divergence_html = _heatmap_divergence_badge(day_change_pct, summary_entry.get("trend"))
         return (
             f'<tr>'
             f'<td style="padding:7px 8px 7px 14px;font-family:{sans};font-size:12px;font-weight:600;color:#14213D;border-bottom:1px solid #EFEDE7;">{name}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;border-bottom:1px solid #EFEDE7;text-align:right;">{move_html}</td>'
-            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}{divergence_html}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
             f'</tr>'
         )
