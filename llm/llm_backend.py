@@ -643,7 +643,18 @@ def _try_mistral_web_search(prompt, max_tokens=1500, log_label="analysis"):
         log.info(f"Mistral fallback skipped for {log_label}: MISTRAL_API_KEY is not configured.")
         return None
     try:
-        from mistralai import Mistral
+        # mistralai>=2.7 has no top-level `mistralai/__init__.py` -- the
+        # package now ships `mistralai.client` (plus `mistralai.azure.client`
+        # / `mistralai.gcp.client` variants), and `Mistral` lives there. The
+        # old `from mistralai import Mistral` therefore raises ImportError
+        # unconditionally on 2.7.x, even when the package is installed fine
+        # -- it's not a missing-package signal on this version, just a moved
+        # symbol. Try the new location first, fall back to the old one in
+        # case an older mistralai version is pinned.
+        try:
+            from mistralai.client import Mistral
+        except ImportError:
+            from mistralai import Mistral
     except ImportError:
         log.info(f"Mistral fallback skipped for {log_label}: the `mistralai` package isn't installed (pip install mistralai).")
         return None
