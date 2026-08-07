@@ -772,6 +772,16 @@ def generate_analysis(
     if validate_fn is None:
         validate_fn = lambda t: bool(t and t.strip())
 
+    def _validate(text, tier_name):
+        ok = validate_fn(text)
+        if not ok:
+            preview = (text or "").strip().replace("\n", " ")[:200]
+            log.warning(
+                f"{tier_name} returned a reply for {log_label} but it didn't match the "
+                f"expected format -- rejecting and trying the next tier. Reply preview: {preview!r}"
+            )
+        return ok
+
     max_tokens = min(max_tokens, MAX_TOKENS_CEILING)
     backend = init_llm_generator()
     log.info(f"{log_label} using LLM backend: {backend}")
@@ -795,7 +805,7 @@ def generate_analysis(
                 prompt, model_name, max_attempts=compound_attempts[model_name],
                 max_tokens=max_tokens, log_label=log_label,
             )
-            if result is not None and validate_fn(result[0]):
+            if result is not None and _validate(result[0], model_name):
                 return result
             if model_name != compound_order[-1]:
                 log.info(f"{model_name} unavailable for {log_label} -- trying {compound_order[compound_order.index(model_name) + 1]}...")
@@ -818,41 +828,41 @@ def generate_analysis(
                 synth_result = _try_synthesis_models(grounded_prompt, max_tokens=max_tokens, log_label=log_label)
                 if synth_result is not None:
                     text, live = synth_result
-                    if validate_fn(text):
+                    if _validate(text, "Gathered-context synthesis"):
                         return text, gathered_sources, live
             else:
                 log.warning(f"Gathered‑context tier returned no usable results for {log_label} -- skipping.")
 
         if gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None):
             grounded = _try_gemini_grounded(prompt, log_label=log_label)
-            if grounded is not None and validate_fn(grounded[0]):
+            if grounded is not None and _validate(grounded[0], "Gemini grounded"):
                 return grounded
 
         mistral_result = _try_mistral_web_search(prompt, max_tokens=max_tokens, log_label=log_label)
-        if mistral_result is not None and validate_fn(mistral_result[0]):
+        if mistral_result is not None and _validate(mistral_result[0], "Mistral web-search"):
             return mistral_result
 
         if not require_live:
             plain_result = _try_synthesis_models(prompt, max_tokens=max_tokens, log_label=f"{log_label} (no search)")
             if plain_result is not None:
                 text, _live = plain_result
-                if validate_fn(text):
+                if _validate(text, "no-search synthesis"):
                     return text, [], False
 
     elif backend == "gemini":
         grounded = _try_gemini_grounded(prompt, log_label=log_label)
-        if grounded is not None and validate_fn(grounded[0]):
+        if grounded is not None and _validate(grounded[0], "Gemini grounded"):
             return grounded
 
         mistral_result = _try_mistral_web_search(prompt, max_tokens=max_tokens, log_label=log_label)
-        if mistral_result is not None and validate_fn(mistral_result[0]):
+        if mistral_result is not None and _validate(mistral_result[0], "Mistral web-search"):
             return mistral_result
 
         if not require_live and gemini_client is not None:
             try:
                 response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
                 text = response.text.strip()
-                if validate_fn(text):
+                if _validate(text, "Gemini (no search)"):
                     return text, [], False
             except Exception as e:
                 log.error(f"Gemini (no search) generation failed for {log_label}: {e}")
@@ -870,7 +880,7 @@ def generate_analysis(
     local_backend = init_llm_generator(force_local=True)
     if local_backend == "local" and llm_pipeline is not None:
         text = _generate_local(prompt, max_new_tokens=min(max_tokens, 1200), log_label=log_label)
-        if text and validate_fn(text):
+        if text and _validate(text, "local model"):
             return text, [], False
 
     return "", [], False
