@@ -210,7 +210,68 @@ def fetch_weekly_returns(watchlist):
     return results
 
 
-def _chunks(items, size):
+# -----------------------------
+# Market Regime Dashboard -- indices/FX/commodity computed from real
+# price data, not the LLM (same rationale as fetch_weekly_returns above)
+# -----------------------------
+# yfinance covers index levels, VIX, USD/INR, and Brent Crude directly,
+# so those rows are computed deterministically here. FII/DII net flow
+# and the 10Y G-Sec yield have no free/reliable yfinance equivalent for
+# India, so those two rows are instead requested as structured fields in
+# Stage 1's prompt (see build_market_prompt's "key_indicators" block)
+# and merged in by run_market_stage().
+DASHBOARD_INDEX_TICKERS = {
+    "NIFTY 50": "^NSEI",
+    "NIFTY Bank": "^NSEBANK",
+    "NIFTY IT": "^CNXIT",
+    "India VIX": "^INDIAVIX",
+    "USD/INR": "INR=X",
+    "Brent Crude": "BZ=F",
+}
+
+
+def fetch_market_dashboard_indices():
+    """
+    Returns {name: {"current": float, "wow_pct": float}} for each ticker
+    in DASHBOARD_INDEX_TICKERS, using the same batched
+    yf.download(period="12d") + "value ~6 trading days ago" approach as
+    fetch_weekly_returns(). A name is simply omitted if its price
+    history couldn't be fetched or is too short to compute a WoW change --
+    render_market_dashboard() shows "n/a" for anything missing.
+    """
+    results = {}
+    try:
+        tickers_list = list(DASHBOARD_INDEX_TICKERS.values())
+        hist_data = yf.download(tickers_list, period="12d", interval="1d", auto_adjust=True, progress=False)
+        is_multi = isinstance(hist_data.columns, pd.MultiIndex)
+
+        for name, ticker in DASHBOARD_INDEX_TICKERS.items():
+            try:
+                if is_multi:
+                    if "Close" not in hist_data.columns.levels[0] or ticker not in hist_data["Close"]:
+                        log.warning(f"No 'Close' price history found for {name} ({ticker}).")
+                        continue
+                    closes = hist_data["Close"][ticker].dropna()
+                else:
+                    if "Close" not in hist_data or hist_data["Close"].empty:
+                        log.warning(f"No 'Close' price history found for {name} ({ticker}).")
+                        continue
+                    closes = hist_data["Close"].dropna()
+
+                if len(closes) < 2:
+                    log.warning(f"Not enough price history to compute WoW change for {name} ({ticker}).")
+                    continue
+
+                recent = float(closes.iloc[-1])
+                week_ago = float(closes.iloc[max(0, len(closes) - 6)])
+                wow_pct = round((recent - week_ago) / week_ago * 100, 2) if week_ago else None
+                results[name] = {"current": round(recent, 2), "wow_pct": wow_pct}
+            except Exception as e:
+                log.warning(f"Could not compute dashboard snapshot for {name} ({ticker}): {e}")
+    except Exception as e:
+        log.warning(f"Batch yfinance download for market dashboard failed: {e}")
+
+    return results
     size = max(1, size)
     return [items[i:i + size] for i in range(0, len(items), size)]
 
@@ -260,6 +321,14 @@ CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no 
 {{
   "market_sentiment": "Bullish | Neutral | Bearish",
   "sentiment_reason": "One or two sentences on why",
+  "key_indicators": {{
+    "fii_flow_cr": "Most recent single-session FII net equity flow in \u20b9 crore as a plain signed number string (e.g. '-1245' or '850'), or null if not verifiable",
+    "fii_flow_date": "Date that FII figure is for (DD Month YYYY), or null",
+    "dii_flow_cr": "Most recent single-session DII net equity flow in \u20b9 crore as a plain signed number string, or null if not verifiable",
+    "dii_flow_date": "Date that DII figure is for (DD Month YYYY), or null",
+    "gsec_10y_yield_pct": "Latest India 10-year G-Sec yield as a plain number string (e.g. '6.98'), or null if not verifiable",
+    "gsec_10y_wow_change_bps": "Week-over-week change in the 10Y yield in basis points, as a signed plain number string (e.g. '+4' or '-3'), or null if not verifiable"
+  }},
   "developments": [
     {{
       "date": "DD Month YYYY",
@@ -320,7 +389,8 @@ CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no 
       "decision_note": "One short sentence on why this stock is attractive, neutral, or unattractive for a short-term or swing-trading investor",
       "assessment": "Positive | Neutral | Negative",
       "short_term_outlook": "1-4 week outlook, 1-2 sentences",
-      "recommendation": "Strong Buy | Buy | Hold | Review | Reduce | Exit"
+      "recommendation": "Strong Buy | Buy | Hold | Review | Reduce | Exit",
+      "action": "One of exactly these five values: ACCUMULATE | CONTINUE SIP | HOLD | REDUCE SIP | EXIT / REPLACE -- the SIP-investor action this week. Use ACCUMULATE for a clear buying opportunity (dip into strength, positive catalyst); CONTINUE SIP when the long-term thesis is intact and regular SIP investing should carry on unchanged; HOLD when the picture is genuinely mixed and it's a wait-and-watch week; REDUCE SIP when conviction has weakened and future SIP amounts should be trimmed (but the thesis isn't broken); EXIT / REPLACE when the thesis is broken and the position should be exited or swapped for a stronger alternative."
     }}
   ]
 }}
@@ -378,8 +448,15 @@ Using ONLY the material above, produce a synthesis for an active equity investor
 CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
 
 {{
-  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"]
+  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"],
+  "this_week_changes": [
+    {{
+      "change": "A short declarative statement of ONE significant shift this week, e.g. 'Banking leadership strengthened' or 'IT sector weakened' -- grounded in a specific WoW %, rating, flow figure, or news item already present in the material above",
+      "direction": "Positive | Negative | Neutral -- from a long-term equity investor's perspective"
+    }}
+  ]
 }}
+Exactly 5 items in this_week_changes, ranked by significance (most important first) -- draw from index leadership/laggards, sector rotation, FII/DII flow direction, VIX/crude/currency moves, and notable stock-level shifts in the material above. Do NOT claim a trend "reversed" or "turned" from a prior period unless the material above explicitly states what the prior period looked like -- describe what happened THIS window only.
 As of {today_str}.
 """
 
@@ -418,6 +495,12 @@ def run_market_stage(today_str, lookback_note):
         data = {}
     data.setdefault("developments", [])
     data.setdefault("market_sentiment", "Neutral")
+    if not isinstance(data.get("key_indicators"), dict):
+        data["key_indicators"] = {}
+    # Deterministic index/FX/commodity snapshot for the Market Regime
+    # Dashboard -- computed from real price history rather than trusted
+    # from the LLM (same rationale as fetch_weekly_returns for stocks).
+    data["dashboard_indices"] = fetch_market_dashboard_indices()
     return data, sources, live
 
 
@@ -571,6 +654,29 @@ def _plain_generate(prompt, max_tokens=3800):
     return None
 
 
+def _normalize_weekly_changes(raw):
+    """
+    Tolerates the LLM returning plain strings instead of {change,
+    direction} objects, or more/fewer than 5 items -- always returns a
+    list of at most 5 {"change": str, "direction": str} dicts so
+    render_weekly_changes() never has to special-case malformed input.
+    """
+    if not isinstance(raw, list):
+        return []
+    normalized = []
+    for item in raw[:5]:
+        if isinstance(item, dict):
+            change = str(item.get("change") or "").strip()
+            direction = str(item.get("direction") or "Neutral").strip()
+        elif isinstance(item, str):
+            change, direction = item.strip(), "Neutral"
+        else:
+            continue
+        if change:
+            normalized.append({"change": change, "direction": direction})
+    return normalized
+
+
 def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
     prompt = build_synthesis_prompt(market_data, stocks_data, sectors_data, WATCHLIST, today_str)
     text = _plain_generate(prompt)
@@ -583,6 +689,7 @@ def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
         log.warning("Stage 4 output could not be parsed as JSON -- proceeding with an empty synthesis section.")
         data = {}
     data.setdefault("top_developments", [])
+    data["this_week_changes"] = _normalize_weekly_changes(data.get("this_week_changes"))
     return data
 
 
@@ -591,6 +698,206 @@ def run_synthesis_stage(market_data, stocks_data, sectors_data, today_str):
 # -----------------------------
 def _esc(v):
     return html.escape(str(v)) if v is not None else ""
+
+
+# -----------------------------
+# Market Regime Dashboard -- per-indicator signal thresholds
+# -----------------------------
+# These thresholds are deliberately simple, hand-picked defaults (not
+# derived from any model) so the 🟢/🟡/🔴 + interpretation is always
+# consistent run-to-run regardless of which LLM backend is active --
+# same philosophy as _reco_color/_sentiment_color below, just per-
+# indicator since "good" means something different for an equity index
+# vs. VIX vs. a flow number vs. a currency pair. Tune freely.
+def _fmt_pct(value, digits=2):
+    if value is None:
+        return "n/a"
+    return f"{value:+.{digits}f}%"
+
+
+def _signal_equity_index(change_pct, leadership_label, weak_label="Weakness", flat_label="Mixed / range-bound"):
+    if change_pct is None:
+        return "\U0001F7E1", "No data"
+    if change_pct >= 0.5:
+        return "\U0001F7E2", leadership_label
+    if change_pct <= -1.0:
+        return "\U0001F534", weak_label
+    if change_pct < 0:
+        return "\U0001F7E1", weak_label
+    return "\U0001F7E1", flat_label
+
+
+def _signal_vix(current, change_pct):
+    if current is None:
+        return "\U0001F7E1", "No data"
+    if current >= 20 or (change_pct is not None and change_pct >= 15):
+        return "\U0001F534", "Risk elevated"
+    if current <= 12 and (change_pct is None or change_pct <= 0):
+        return "\U0001F7E2", "Risk calm"
+    if change_pct is not None and change_pct > 0:
+        return "\U0001F7E1", "Risk rising"
+    return "\U0001F7E1", "Risk easing"
+
+
+def _signal_flow(value_cr, positive_label):
+    if value_cr is None:
+        return "\U0001F7E1", "No data"
+    if value_cr > 0:
+        return "\U0001F7E2", positive_label
+    if value_cr < 0:
+        return "\U0001F534", "Outflow pressure"
+    return "\U0001F7E1", "Flat"
+
+
+def _signal_usdinr(change_pct):
+    if change_pct is None:
+        return "\U0001F7E1", "No data"
+    if change_pct >= 0.5:
+        return "\U0001F534", "Rupee under pressure"
+    if change_pct >= 0.15:
+        return "\U0001F7E1", "Currency pressure"
+    if change_pct <= -0.15:
+        return "\U0001F7E2", "Rupee strength"
+    return "\U0001F7E1", "Range-bound"
+
+
+def _signal_brent(change_pct):
+    if change_pct is None:
+        return "\U0001F7E1", "No data"
+    if change_pct >= 2.0:
+        return "\U0001F534", "Inflation risk"
+    if change_pct > 0:
+        return "\U0001F7E1", "Mild inflation risk"
+    return "\U0001F7E2", "Relief"
+
+
+def _signal_gsec(change_bps):
+    if change_bps is None:
+        return "\U0001F7E1", "No data"
+    if change_bps >= 10:
+        return "\U0001F534", "Sharp yield spike"
+    if change_bps > 0:
+        return "\U0001F7E1", "Valuation impact"
+    return "\U0001F7E2", "Supportive for valuations"
+
+
+def _num(raw):
+    """Best-effort float conversion for LLM-sourced numeric strings; None on failure."""
+    if raw in (None, "", "null", "None"):
+        return None
+    try:
+        return float(str(raw).replace(",", "").replace("+", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def render_market_dashboard(market_data):
+    """
+    Renders the "Market Regime Dashboard" table -- a quantitative,
+    scannable front page: index levels/WoW from yfinance
+    (dashboard_indices, deterministic) plus FII/DII flow and the 10Y
+    G-Sec yield from the LLM's structured key_indicators block (no free
+    reliable API for those), each with a computed 🟢/🟡/🔴 signal and a
+    short interpretation -- deliberately terse, this is meant to be
+    scanned in seconds, unlike the narrative Executive Summary below it.
+    """
+    idx = market_data.get("dashboard_indices") or {}
+    ki = market_data.get("key_indicators") or {}
+
+    def idx_row(name):
+        d = idx.get(name) or {}
+        return d.get("current"), d.get("wow_pct")
+
+    nifty_cur, nifty_wow = idx_row("NIFTY 50")
+    bank_cur, bank_wow = idx_row("NIFTY Bank")
+    it_cur, it_wow = idx_row("NIFTY IT")
+    vix_cur, vix_wow = idx_row("India VIX")
+    usdinr_cur, usdinr_wow = idx_row("USD/INR")
+    brent_cur, brent_wow = idx_row("Brent Crude")
+
+    fii_cr = _num(ki.get("fii_flow_cr"))
+    dii_cr = _num(ki.get("dii_flow_cr"))
+    gsec_yield = _num(ki.get("gsec_10y_yield_pct"))
+    gsec_bps = _num(ki.get("gsec_10y_wow_change_bps"))
+
+    rows_spec = [
+        ("NIFTY 50", f"{nifty_cur:,.0f}" if nifty_cur is not None else "n/a",
+         _fmt_pct(nifty_wow), *_signal_equity_index(nifty_wow, "Bullish")),
+        ("NIFTY Bank", f"{bank_cur:,.0f}" if bank_cur is not None else "n/a",
+         _fmt_pct(bank_wow), *_signal_equity_index(bank_wow, "Banking leadership", "Banking drag")),
+        ("NIFTY IT", f"{it_cur:,.0f}" if it_cur is not None else "n/a",
+         _fmt_pct(it_wow), *_signal_equity_index(it_wow, "IT leadership")),
+        ("India VIX", f"{vix_cur:.2f}" if vix_cur is not None else "n/a",
+         _fmt_pct(vix_wow), *_signal_vix(vix_cur, vix_wow)),
+        ("FII Flow", f"\u20b9{fii_cr:,.0f} Cr" if fii_cr is not None else "n/a",
+         "\u2014", *_signal_flow(fii_cr, "Supportive")),
+        ("DII Flow", f"\u20b9{dii_cr:,.0f} Cr" if dii_cr is not None else "n/a",
+         "\u2014", *_signal_flow(dii_cr, "Cushion")),
+        ("USD/INR", f"{usdinr_cur:.2f}" if usdinr_cur is not None else "n/a",
+         _fmt_pct(usdinr_wow), *_signal_usdinr(usdinr_wow)),
+        ("Brent Crude", f"${brent_cur:.2f}" if brent_cur is not None else "n/a",
+         _fmt_pct(brent_wow), *_signal_brent(brent_wow)),
+        ("10Y G-Sec", f"{gsec_yield:.2f}%" if gsec_yield is not None else "n/a",
+         (f"{gsec_bps:+.0f} bps" if gsec_bps is not None else "n/a"), *_signal_gsec(gsec_bps)),
+    ]
+
+    rows = "".join(
+        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(label)}</td>'
+        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#1B2233;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(current)}</td>'
+        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#4A5063;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(change)}</td>'
+        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;border-top:1px solid #EDEAE2;">{emoji}</td>'
+        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(interp)}</td></tr>'
+        for label, current, change, emoji, interp in rows_spec
+    )
+
+    return _section_title("1. Market Regime Dashboard") + f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
+      <tr style="background:#F4F2ED;">
+        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Indicator</td>
+        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Current</td>
+        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">WoW</td>
+        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Signal</td>
+        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Interpretation</td>
+      </tr>
+      {rows}
+    </table>
+    <p style="margin:6px 0 0;font-family:{SANS};font-size:10.5px;color:#8A8F9C;">Index/VIX/USD-INR/Brent levels and WoW % are computed directly from price history (yfinance). FII/DII flow and the 10Y G-Sec yield come from this run's web search and can be a session or two stale -- verify against NSE/RBI before acting.</p>
+    """
+
+
+def _direction_style(direction):
+    d = (direction or "").strip().lower()
+    if d == "positive":
+        return "#1E7A46", "\U0001F7E2"
+    if d == "negative":
+        return "#B0473F", "\U0001F534"
+    return "#8A6D1D", "\U0001F7E1"
+
+
+def render_weekly_changes(synthesis_data):
+    """
+    "What Changed This Week?" -- the 5 biggest shifts, per Stage 4's
+    synthesis of this run's already-gathered market/stock/sector data
+    (this_week_changes). Renders nothing if synthesis produced no items,
+    so a Stage 4 hiccup doesn't leave an empty/broken-looking section.
+    """
+    changes = synthesis_data.get("this_week_changes") or []
+    if not changes:
+        return ""
+    rows = "".join(
+        f'<tr>'
+        f'<td style="padding:9px 4px 9px 12px;width:22px;vertical-align:top;font-family:{SANS};font-size:13px;font-weight:700;color:#B08D57;">{i + 1}.</td>'
+        f'<td style="padding:9px 12px 9px 10px;vertical-align:top;border-left:3px solid {_direction_style(c.get("direction"))[0]};">'
+        f'<span style="font-family:{SANS};font-size:13.5px;font-weight:700;color:#14213D;">{_direction_style(c.get("direction"))[1]} {_esc(c.get("change", ""))}</span>'
+        f'</td></tr>'
+        for i, c in enumerate(changes)
+    )
+    return _section_title("2. What Changed This Week?") + f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+           style="border-collapse:collapse;background:#FBF9F4;border:1px solid #E7E4DC;border-radius:6px;">
+      {rows}
+    </table>
+    """
 
 
 def _sentiment_color(label):
@@ -613,6 +920,93 @@ def _reco_color(reco):
     if reco in ("reduce", "exit", "sell", "immediate"):
         return "#B0473F"
     return "#4A5063"
+
+
+# -----------------------------
+# Buy / Hold / Reduce / Stop -- 5-action SIP signal
+# -----------------------------
+# Distinct from "recommendation" (a trader-style Strong Buy..Exit scale):
+# this is the SIP-investor action for the week. Kept as a deterministic
+# derivation off recommendation + assessment (same approach as
+# _decision_signal_text/_quality_status below) rather than trusting the
+# LLM's free-text "action" field alone -- an enum this specific still
+# drifts in casing/punctuation/wording across model calls, so the
+# explicit field is normalized and used when it matches one of the five
+# canonical labels, and we fall back to the deterministic mapping
+# otherwise (including for any cached/older response with no "action"
+# field at all).
+ACTION_STYLE = {
+    "ACCUMULATE":     ("#1E7A46", "\U0001F7E2"),
+    "CONTINUE SIP":   ("#1E7A46", "\U0001F7E2"),
+    "HOLD":           ("#8A6D1D", "\U0001F7E1"),
+    "REDUCE SIP":     ("#C8792A", "\U0001F7E0"),
+    "EXIT / REPLACE": ("#B0473F", "\U0001F534"),
+}
+
+_ACTION_NORMALIZE_TABLE = {
+    "accumulate": "ACCUMULATE",
+    "continuesip": "CONTINUE SIP",
+    "hold": "HOLD",
+    "reducesip": "REDUCE SIP",
+    "exitreplace": "EXIT / REPLACE",
+    "exit": "EXIT / REPLACE",
+    "replace": "EXIT / REPLACE",
+    "stop": "EXIT / REPLACE",
+}
+
+
+def _normalize_action(raw):
+    """Matches free-text like 'Continue Sip', 'reduce-sip', 'Exit/Replace'
+    to one of ACTION_STYLE's canonical keys; returns None if it doesn't
+    match anything recognizable."""
+    if not raw:
+        return None
+    key = re.sub(r"[^a-z]", "", str(raw).lower())
+    return _ACTION_NORMALIZE_TABLE.get(key)
+
+
+def _derive_action(stock_data):
+    """
+    Returns (label, color, emoji) for this stock's Buy/Hold/Reduce/Stop
+    signal, one of: ACCUMULATE, CONTINUE SIP, HOLD, REDUCE SIP,
+    EXIT / REPLACE.
+    """
+    explicit = _normalize_action(stock_data.get("action"))
+    if explicit:
+        color, emoji = ACTION_STYLE[explicit]
+        return explicit, color, emoji
+
+    reco = (stock_data.get("recommendation") or "").strip().lower()
+    assess = (stock_data.get("assessment") or "").strip().lower()
+
+    if reco == "strong buy":
+        label = "ACCUMULATE"
+    elif reco == "buy":
+        label = "ACCUMULATE" if assess == "positive" else "CONTINUE SIP"
+    elif reco == "hold":
+        label = "REDUCE SIP" if assess == "negative" else "CONTINUE SIP"
+    elif reco in ("review", ""):
+        label = "REDUCE SIP" if assess == "negative" else "HOLD"
+    elif reco == "reduce":
+        label = "REDUCE SIP"
+    elif reco in ("exit", "sell"):
+        label = "EXIT / REPLACE"
+    else:
+        label = "HOLD"
+
+    color, emoji = ACTION_STYLE[label]
+    return label, color, emoji
+
+
+def _action_legend_html():
+    items = "".join(
+        f'<span style="display:inline-block;margin:0 12px 6px 0;font-family:{SANS};'
+        f'font-size:11px;font-weight:700;color:{color};">{emoji} {_esc(label)}</span>'
+        for label, (color, emoji) in ACTION_STYLE.items()
+    )
+    return (
+        f'<div style="margin:0 0 10px;padding:6px 0;border-bottom:1px solid #EDEAE2;">{items}</div>'
+    )
 
 
 def _section_title(text):
@@ -647,7 +1041,7 @@ def render_executive_summary(market_data, synthesis_data):
     top_dev = synthesis_data.get("top_developments") or []
     items = "".join(f'<li style="margin:0 0 6px;">{_esc(d)}</li>' for d in top_dev[:10])
     return f"""
-    {_section_title("1. Executive Summary")}
+    {_section_title("3. Executive Summary")}
     <div style="display:inline-block;padding:4px 12px;border-radius:20px;background:{color}1A;
                 font-family:{SANS};font-size:12px;font-weight:700;color:{color};margin-bottom:8px;">
       Overall Market Sentiment (7 Days): {_esc(sentiment)}
@@ -706,20 +1100,23 @@ def _quality_status(stock_data):
     return "Needs review", "#B0473F"
 
 
+_ACTION_NOW_TEXT = {
+    "ACCUMULATE": "Attractive entry -- add a lump sum or step up SIP allocation on dips; keep position size disciplined.",
+    "CONTINUE SIP": "Thesis intact -- keep the existing SIP running as scheduled, no change needed this week.",
+    "HOLD": "Mixed signals -- hold the current position/SIP as-is and wait for a clearer catalyst before acting.",
+    "REDUCE SIP": "Conviction has weakened -- trim future SIP amounts and avoid fresh lump-sum entries until it firms up.",
+    "EXIT / REPLACE": "Thesis broken -- exit the position or replace it with a stronger alternative rather than averaging down.",
+}
+
+
 def _action_now_text(stock_data):
-    reco = (stock_data.get("recommendation") or "").strip().lower()
-    if reco in {"strong buy", "buy"}:
-        return "Add on pullbacks or near support; keep position size disciplined."
-    if reco in {"hold", "review"}:
-        return "Wait for confirmation and a clearer catalyst before adding."
-    if reco in {"reduce", "exit", "sell"}:
-        return "Reduce exposure or avoid new entry until the setup improves."
-    return "Monitor the setup and wait for a clearer confirmation signal."
+    label, _, _ = _derive_action(stock_data)
+    return _ACTION_NOW_TEXT.get(label, "Monitor the setup and wait for a clearer confirmation signal.")
 
 
 def render_stock_cards(stocks_data):
     if not stocks_data:
-        return _stock_section_title("2. Watchlist Stock Analysis (Last 7 Days)", 0) + (
+        return _stock_section_title("4. Watchlist Stock Analysis (Last 7 Days)", 0) + (
             f'<p style="font-family:{SANS};font-size:12.5px;color:#B0473F;">No stock data could be generated this run.</p>'
         )
     cards = []
@@ -753,6 +1150,7 @@ def render_stock_cards(stocks_data):
         signal_text, signal_color = _decision_signal_text(st)
         quality_status, quality_color = _quality_status(st)
         action_now = _action_now_text(st)
+        action_label, action_color, action_emoji = _derive_action(st)
 
         snapshot_items = [
             ("Price", st.get("current_price") or "Not disclosed"),
@@ -786,8 +1184,8 @@ def render_stock_cards(stocks_data):
           <tr>
             <td style="padding:10px 14px;background:#14213D;">
               <span style="font-family:{SERIF};font-size:14.5px;color:#ffffff;">{_esc(name)}</span>
-              <span style="float:right;font-family:{SANS};font-size:11px;font-weight:700;color:{_reco_color(reco)};
-                    background:#ffffff;padding:2px 10px;border-radius:12px;">{_esc(reco)}</span>
+              <span style="float:right;font-family:{SANS};font-size:11px;font-weight:700;color:{action_color};
+                    background:#ffffff;padding:2px 10px;border-radius:12px;white-space:nowrap;">{action_emoji} {_esc(action_label)}</span>
             </td>
           </tr>
           <tr>
@@ -830,7 +1228,11 @@ def render_stock_cards(stocks_data):
           </tr>
         </table>
         """)
-    return _stock_section_title("2. Watchlist Stock Analysis (Last 7 Days)", len(stocks_data)) + "".join(cards)
+    return (
+        _stock_section_title("4. Watchlist Stock Analysis (Last 7 Days)", len(stocks_data))
+        + _action_legend_html()
+        + "".join(cards)
+    )
 
 
 def render_market_news(market_data):
@@ -845,7 +1247,7 @@ def render_market_news(market_data):
     )
     if not rows:
         rows = f'<tr><td colspan="3" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No market developments could be generated this run.</td></tr>'
-    return _section_title("3. Market News (Past 7 Days)") + f"""
+    return _section_title("5. Market News (Past 7 Days)") + f"""
     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
       <tr style="background:#F4F2ED;">
         <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Date</td>
@@ -875,7 +1277,7 @@ def render_sector_table(sectors_data):
     )
     if not rows:
         rows = f'<tr><td colspan="5" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No sector data could be generated this run.</td></tr>'
-    return _section_title("4. Sector Performance") + f"""
+    return _section_title("6. Sector Performance") + f"""
     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
       <tr style="background:#F4F2ED;">
         <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Sector</td>
@@ -891,7 +1293,9 @@ def render_sector_table(sectors_data):
 
 def build_email_html(market_data, stocks_data, sectors_data, synthesis_data, sources, used_live_search, today_str):
     sections = (
-        render_executive_summary(market_data, synthesis_data)
+        render_market_dashboard(market_data)
+        + render_weekly_changes(synthesis_data)
+        + render_executive_summary(market_data, synthesis_data)
         + render_stock_cards(stocks_data)
         + render_market_news(market_data)
         + render_sector_table(sectors_data)
