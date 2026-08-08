@@ -78,11 +78,27 @@ AGGREGATE_CAP_PCT = float(os.getenv("OPTIONS_AGGREGATE_CAP_PCT", "15"))
 # math above -- issue #6.
 MAX_LOTS_PER_HORIZON = int(os.getenv("OPTIONS_MAX_LOTS_PER_HORIZON", "5"))
 
-MIN_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MIN_REWARD_RISK_RATIO", "0.5"))
+# Minimum acceptable reward:risk on any strike selection, expressed here as
+# max_profit / max_loss (so a "1:2" reward:risk floor -- risking 2 to make
+# 1 -- is 0.5; "1:1.5" -- risking 1.5 to make 1 -- is 1/1.5 ~= 0.6667).
+# Previously 0.5 (1:2 floor); raised to require a somewhat better payoff per
+# unit of risk on every gated strike selection (see rr_ratio checks below
+# and poor_reward_risk in apply_verified_payoff).
+MIN_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MIN_REWARD_RISK_RATIO", "0.6667"))
 MIN_CREDIT_WIDTH_PCT = float(os.getenv("OPTIONS_MIN_CREDIT_WIDTH_PCT", "15"))
 MAX_PLAUSIBLE_REWARD_RISK_RATIO = float(os.getenv("OPTIONS_MAX_PLAUSIBLE_REWARD_RISK_RATIO", "5"))
 LOTTERY_POP_THRESHOLD_PCT = float(os.getenv("OPTIONS_LOTTERY_POP_THRESHOLD_PCT", "15"))
 CONSIDER_QUALITY_THRESHOLD = float(os.getenv("OPTIONS_CONSIDER_QUALITY_THRESHOLD", "75"))
+
+# Item 19: hard floor on the Liquidity component (see compute_trade_quality_
+# score's liq_score -- 30 is both the flat EOD-fallback placeholder AND the
+# worst score a live spread can get while still clearing MAX_LEG_SPREAD_PCT).
+# Previously liquidity only ever docked 10% off the composite Trade Quality
+# Score and never blocked a recommendation outright -- a horizon with
+# unknown/thin liquidity across the board could still read "✅ Consider".
+# A score at or below this floor now hard-caps the verdict at "⚠ Caution"
+# regardless of how good the EV/R:R/POP math looks.
+MIN_LIQUIDITY_SCORE_FOR_CONSIDER = float(os.getenv("OPTIONS_MIN_LIQUIDITY_SCORE", "35"))
 
 REJECT_IC_SHORT_INSIDE_EM = os.getenv("OPTIONS_REJECT_IC_SHORT_INSIDE_EM", "true").lower() == "true"
 
@@ -96,6 +112,55 @@ EM_DIVERGENCE_THRESHOLD_PCT = float(os.getenv("OPTIONS_EM_DIVERGENCE_THRESHOLD_P
 # sides missing/zero) is always treated as illiquid regardless of this
 # threshold -- see compute_bid_ask_spread_pct().
 MAX_LEG_SPREAD_PCT = float(os.getenv("OPTIONS_MAX_LEG_SPREAD_PCT", "15"))
+
+# Lookback window for the India VIX history used by compute_iv_rank_percentile()
+# to place today's VIX into its historical range/percentile. Previously
+# hardcoded to a strict trailing 1-year ("YoY") window via yf.Ticker(...).
+# history(period="1y") -- that's a reasonable default for a full vol-regime
+# cycle, but a strict YoY window can be skewed by a single old outlier event
+# (e.g. an election spike or a crash) that's no longer representative of the
+# CURRENT regime. Exposed as an env knob so a shorter, more responsive window
+# (e.g. "6mo" for a trailing-2-quarter view) can be used instead without a
+# code change; "1y" keeps today's TTM-equivalent behavior as the default.
+# Any period string accepted by yfinance's history(period=...) works here
+# (e.g. "3mo", "6mo", "1y", "2y"). compute_iv_rank_percentile() itself still
+# requires at least 20 data points regardless of the window chosen.
+IV_RANK_LOOKBACK_PERIOD = os.getenv("OPTIONS_IV_RANK_LOOKBACK_PERIOD", "1y")
+
+# Item 8: a structure that misses the strict MIN_REWARD_RISK_RATIO /
+# MIN_CREDIT_WIDTH_PCT gates by only this much (as a percent shaved off
+# each threshold) is surfaced as a "Watchlist" near-miss candidate instead
+# of being silently dropped when nothing clears the strict gates. 15 means
+# a structure clearing 85% of each strict threshold still qualifies as a
+# near-miss. Watchlist candidates are never promoted to a live "Consider"
+# recommendation and are sized down accordingly (see _sizing_multiplier()).
+NEAR_MISS_TOLERANCE_PCT = float(os.getenv("OPTIONS_NEAR_MISS_TOLERANCE_PCT", "15"))
+
+# Item 10: widens the strike "universe" considered for the Watchlist
+# near-miss pass on single-sided credit verticals (Bear Call / Bull Put)
+# only -- lets a short strike sit as close as this fraction of the full
+# expected-move band to spot and still be scanned as a near-miss candidate.
+# The strict pass that produces a live "ok" trade is untouched (still
+# requires the short strike sit fully outside 1.0x the EM band).
+# Deliberately NOT applied to Iron Condor short strikes: that structure
+# already has a dedicated hard safety check (REJECT_IC_SHORT_INSIDE_EM)
+# against a short strike sitting inside the expected move, so relaxing the
+# band here for IC would just fight that check instead of feeding it -- see
+# the regime-override logic in run() for how IC handles this case instead.
+WATCHLIST_EM_BAND_PCT = float(os.getenv("OPTIONS_WATCHLIST_EM_BAND_PCT", "85"))
+
+# Item 11: "regime override" -- when a neutral Iron Condor can't find ANY
+# strike combination with its short legs genuinely outside the expected
+# move band (the chain itself isn't range-bound enough this run), and the
+# live PCR(OI) shows a directional skew well beyond the plain neutral/
+# decisive cutoff (classify_pcr()'s 0.7 / 1.2 bands), retry deterministic
+# selection with the PCR-implied directional credit spread instead of
+# falling through to the model's raw (also likely ungated) IC guess.
+# REGIME_OVERRIDE_PCR_MARGIN is the extra margin required beyond the bare
+# 0.7/1.2 cutoff before the override fires, so a borderline/neutral-ish
+# PCR reading doesn't flip the whole structure family.
+REGIME_OVERRIDE_ENABLED = os.getenv("OPTIONS_REGIME_OVERRIDE_ENABLED", "true").lower() == "true"
+REGIME_OVERRIDE_PCR_MARGIN = float(os.getenv("OPTIONS_REGIME_OVERRIDE_PCR_MARGIN", "0.1"))
 
 HORIZON_ORDER = ["Weekly", "Next Week", "Next to Next Week"]
 NIFTY_LOT_SIZE = int(os.getenv("NIFTY_LOT_SIZE", "75"))
@@ -159,6 +224,58 @@ def _nse_warm_session(session, timeout, referer_path="/option-chain"):
     time.sleep(0.6)
 
 
+# Item 14: yfinance spot/VIX pulls previously had zero retry -- a single
+# transient blip (rate limit, DNS hiccup, Yahoo's own flakiness) meant an
+# outright reject for that data point with no second attempt, even though
+# NSE's own fetches (fetch_nse_option_chain / fetch_nse_fii_dii above)
+# already retry with backoff. This wraps any zero-arg fetch callable with
+# the same retry-with-delay pattern used elsewhere in this file.
+def _retry_with_delay(fetch_fn, what, max_attempts=3, base_delay=1.5, notes=None):
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fetch_fn()
+        except Exception as e:
+            last_err = e
+            log.warning(f"{what} fetch attempt {attempt}/{max_attempts} failed: {_describe_http_error(e)}")
+            if attempt < max_attempts:
+                time.sleep(base_delay * attempt)
+    msg = f"{what} fetch failed after {max_attempts} attempts: {_describe_http_error(last_err)}"
+    log.warning(msg)
+    if notes is not None:
+        notes.append(msg)
+    return None
+
+
+# Item 14: secondary source for India VIX. yfinance's ^INDIAVIX is the only
+# source that gives us history (needed for compute_iv_rank_percentile), but
+# if it's unavailable this run, NSE's own live indices endpoint at least
+# gives a current VIX level so the prompt isn't missing the figure entirely
+# -- IV rank/percentile just stay unavailable (no history from this
+# endpoint), which is noted separately by the caller.
+def _fetch_nse_vix_snapshot(timeout=12):
+    session = requests.Session()
+    session.headers.update(_NSE_HEADERS)
+    _nse_warm_session(session, timeout, "/market-data/live-market-indices")
+    resp = session.get("https://www.nseindia.com/api/allIndices", timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
+    for row in payload.get("data", []):
+        if str(row.get("index", "")).strip().upper() in ("INDIA VIX", "NIFTY VIX"):
+            last = row.get("last")
+            prev_close = row.get("previousClose")
+            if last is None:
+                return None
+            return {
+                "vix": round(float(last), 2),
+                "vix_change_pct": (
+                    round(((float(last) - float(prev_close)) / float(prev_close)) * 100, 2)
+                    if prev_close else None
+                ),
+            }
+    return None
+
+
 def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_LOT_SIZE):
     """
     Deterministically scans the actual options chain for the best valid structure 
@@ -169,12 +286,24 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
     exp_move = (horizon_snap or {}).get("expected_move")
     
     if not call_ltp or not put_ltp or not spot or not exp_move:
-        return {"ok": False, "reason": "Insufficient live premium/spot data for deterministic selection."}
+        return {"ok": False, "watchlist": False, "reason": "Insufficient live premium/spot data for deterministic selection."}
 
     em_pts = exp_move.get("expected_move_pts", 0)
     band_lo, band_hi = spot - em_pts, spot + em_pts
-    
+    # Item 10: relaxed band used ONLY for the Watchlist near-miss pass on
+    # single-sided credit verticals (see WATCHLIST_EM_BAND_PCT above).
+    relaxed_band_pts = em_pts * (WATCHLIST_EM_BAND_PCT / 100)
+    relaxed_band_lo, relaxed_band_hi = spot - relaxed_band_pts, spot + relaxed_band_pts
+
+    # Item 8: relaxed R:R / credit-width floors used to classify a
+    # structure that misses the strict gates as a Watchlist near-miss
+    # rather than being dropped outright.
+    near_miss_mult = 1 - (NEAR_MISS_TOLERANCE_PCT / 100)
+    rr_near_floor = MIN_REWARD_RISK_RATIO * near_miss_mult
+    credit_width_near_floor = MIN_CREDIT_WIDTH_PCT * near_miss_mult
+
     valid_structures = []
+    near_miss_structures = []
 
     # Real liquidity gate on candidate strikes (see compute_bid_ask_spread_pct /
     # _leg_liquidity_check): when this horizon's snapshot carries actual
@@ -232,11 +361,20 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
         ltp_map = call_ltp if strategy_type == "Bear Call Spread" else put_ltp
         
         for i, short_strike in enumerate(strikes):
-            # Constraint #2: Short strike must be outside expected move
-            if (strategy_type == "Bear Call Spread" and short_strike <= band_hi) or \
-               (strategy_type == "Bull Put Spread" and short_strike >= band_lo):
+            # Constraint #2: Short strike must be outside expected move for
+            # the strict pass; the relaxed band (item 10) only widens how
+            # close to spot a strike can sit and still be scanned at all --
+            # it does NOT relax the RR/credit-width gates below, so a
+            # nearer-to-spot strike still has to clear those on its own.
+            if strategy_type == "Bear Call Spread":
+                band_ok = short_strike > band_hi
+                band_near_ok = short_strike > relaxed_band_hi
+            else:
+                band_ok = short_strike < band_lo
+                band_near_ok = short_strike < relaxed_band_lo
+            if not band_near_ok:
                 continue
-                
+
             for long_strike in strikes[i+1:]:
                 width = abs(long_strike - short_strike)
                 if short_strike not in ltp_map or long_strike not in ltp_map:
@@ -250,17 +388,22 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                 if not stats:
                     continue
                 max_profit, max_loss, rr_ratio, credit_width_pct = stats
-                
+                candidate = {
+                    "short_strike": short_strike,
+                    "long_strike": long_strike,
+                    "rr_ratio": rr_ratio,
+                    "credit_width_pct": credit_width_pct,
+                    "premium": premium,
+                    "width": width
+                }
+
                 # Apply Strict Gates
-                if rr_ratio >= MIN_REWARD_RISK_RATIO and credit_width_pct >= MIN_CREDIT_WIDTH_PCT:
-                    valid_structures.append({
-                        "short_strike": short_strike,
-                        "long_strike": long_strike,
-                        "rr_ratio": rr_ratio,
-                        "credit_width_pct": credit_width_pct,
-                        "premium": premium,
-                        "width": width
-                    })
+                if band_ok and rr_ratio >= MIN_REWARD_RISK_RATIO and credit_width_pct >= MIN_CREDIT_WIDTH_PCT:
+                    valid_structures.append(candidate)
+                elif rr_ratio >= rr_near_floor and credit_width_pct >= credit_width_near_floor:
+                    # Item 8/10: missed the strict gate (on band, R:R, or
+                    # credit-width) but within tolerance -- Watchlist tier.
+                    near_miss_structures.append(candidate)
 
     # 2. Evaluate Iron Condors (Neutral/Range-Bound)
     elif strategy_type == "Iron Condor":
@@ -309,17 +452,24 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                         # width, consistent with how brokers display it.
                         ref_width = max(call_width, put_width)
                         credit_width_pct = (total_premium / ref_width) * 100
+                        candidate = {
+                            "short_call": sc, "long_call": lc,
+                            "short_put": sp, "long_put": lp,
+                            "rr_ratio": rr_ratio,
+                            "credit_width_pct": credit_width_pct,
+                            "premium": total_premium,
+                            "_call_max_loss": call_max_loss,
+                            "_put_max_loss": put_max_loss,
+                        }
 
                         if rr_ratio >= MIN_REWARD_RISK_RATIO and credit_width_pct >= MIN_CREDIT_WIDTH_PCT:
-                            valid_structures.append({
-                                "short_call": sc, "long_call": lc,
-                                "short_put": sp, "long_put": lp,
-                                "rr_ratio": rr_ratio,
-                                "credit_width_pct": credit_width_pct,
-                                "premium": total_premium,
-                                "_call_max_loss": call_max_loss,
-                                "_put_max_loss": put_max_loss,
-                            })
+                            valid_structures.append(candidate)
+                        elif rr_ratio >= rr_near_floor and credit_width_pct >= credit_width_near_floor:
+                            # Item 8: R:R/credit-width near-miss only -- the
+                            # band constraint above (sc <= band_hi / sp >=
+                            # band_lo) is NOT relaxed for Iron Condor (see
+                            # WATCHLIST_EM_BAND_PCT docstring for why).
+                            near_miss_structures.append(candidate)
 
     # 3. Evaluate Debit Verticals (Bull Call / Bear Put)
     # BUG FIX: previously select_best_strikes() only implemented the three
@@ -351,6 +501,7 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
         if not all_strikes:
             return {
                 "ok": False,
+                "watchlist": False,
                 "reason": (
                     f"No liquid {opt_type} strikes available for {strategy_type} scan "
                     f"(chain empty or every strike failed the liquidity gate) -- "
@@ -367,6 +518,18 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                 continue
             if not is_bull_call and long_strike < band_lo:
                 continue
+            # Items 16/17: symmetric guard on the OTHER side. Nothing above
+            # stopped the long leg from being bought arbitrarily deep ITM
+            # (e.g. 4x+ the expected move on the wrong side of spot) --
+            # a candidate like that prices almost entirely as intrinsic
+            # value, which the buggy sort below used to actively favor
+            # (see the sort-key fix a few lines down). A genuine directional
+            # debit-spread entry has no business buying a leg this far
+            # outside the expected-move band on either side.
+            if is_bull_call and long_strike < band_lo:
+                continue
+            if not is_bull_call and long_strike > band_hi:
+                continue
 
             for short_strike in all_strikes[i + 1:]:
                 width = abs(short_strike - long_strike)
@@ -381,45 +544,93 @@ def select_best_strikes(horizon_snap, spot, bias, strategy_type, lot_size=NIFTY_
                 if not stats:
                     continue
                 max_profit, max_loss, rr_ratio, debit_width_pct = stats
+                candidate = {
+                    "long_strike": long_strike,
+                    "short_strike": short_strike,
+                    "rr_ratio": rr_ratio,
+                    "credit_width_pct": debit_width_pct,
+                    "premium": premium,
+                    "width": width,
+                }
 
                 # Apply Strict Gates (see evaluate_debit_spread() docstring
                 # for why the credit-width gate is inverted here).
                 if rr_ratio >= MIN_REWARD_RISK_RATIO and debit_width_pct <= (100 - MIN_CREDIT_WIDTH_PCT):
-                    valid_structures.append({
-                        "long_strike": long_strike,
-                        "short_strike": short_strike,
-                        "rr_ratio": rr_ratio,
-                        "credit_width_pct": debit_width_pct,
-                        "premium": premium,
-                        "width": width,
-                    })
+                    valid_structures.append(candidate)
+                elif rr_ratio >= rr_near_floor and debit_width_pct <= (100 - credit_width_near_floor):
+                    # Item 8: near-miss on R:R and/or how much of the width
+                    # was paid away -- band constraint above is unchanged
+                    # (not part of item 10's relaxation for debit spreads).
+                    near_miss_structures.append(candidate)
+
+    # Items 16/17: "credit_width_pct" means opposite things for a credit
+    # vertical/Iron Condor (premium COLLECTED as % of width -- higher is
+    # better) vs. a debit vertical (premium PAID as % of width -- lower is
+    # better). Sorting both the same way (descending) silently picked the
+    # WORST debit spread that still cleared the gates -- the one that paid
+    # away the most of the width, which is what a deep-ITM long leg does
+    # since its price is almost pure intrinsic value. Sort debit spreads by
+    # rr_ratio first (directly measures reward per unit of risk, and is
+    # unaffected by this sign confusion), tiebreaking on the LEAST width
+    # paid away (ascending credit_width_pct/debit_width_pct).
+    is_debit_spread = strategy_type in ["Bull Call Spread", "Bear Put Spread"]
+
+    def _sort_key(candidates):
+        if is_debit_spread:
+            candidates.sort(key=lambda x: (x["rr_ratio"], -x["credit_width_pct"]), reverse=True)
+        else:
+            candidates.sort(key=lambda x: (x["credit_width_pct"], x["rr_ratio"]), reverse=True)
 
     if not valid_structures:
+        # Item 8: nothing cleared the strict gates -- before giving up
+        # entirely, check whether a near-miss candidate qualifies as a
+        # Watchlist pick instead of reporting nothing.
+        if near_miss_structures:
+            _sort_key(near_miss_structures)
+            best_near_miss = near_miss_structures[0]
+            return {
+                "ok": False,
+                "watchlist": True,
+                "near_miss_trade": best_near_miss,
+                "strategy_type": strategy_type,
+                "reason": (
+                    f"No {strategy_type} cleared the strict {MIN_CREDIT_WIDTH_PCT}% credit/width and "
+                    f"{MIN_REWARD_RISK_RATIO} R:R gates, but the closest candidate landed within "
+                    f"{NEAR_MISS_TOLERANCE_PCT:.0f}% of those thresholds -- surfaced as a Watchlist "
+                    f"candidate instead of being dropped."
+                ),
+            }
         liquidity_hint = (
             " (or every nearby strike failed the real bid-ask liquidity gate)"
             if has_quote_data else ""
         )
         return {
             "ok": False,
+            "watchlist": False,
             "reason": (
                 f"No {strategy_type} cleared the strict {MIN_CREDIT_WIDTH_PCT}% credit/width and "
-                f"{MIN_REWARD_RISK_RATIO} R:R gates in current market conditions{liquidity_hint}."
+                f"{MIN_REWARD_RISK_RATIO} R:R gates in current market conditions{liquidity_hint}, "
+                f"and no near-miss candidate landed within {NEAR_MISS_TOLERANCE_PCT:.0f}% of those "
+                f"thresholds either."
             ),
         }
 
     # Sort by credit_width_pct (premium collected as % of width) first, then
-    # rr_ratio as tiebreaker. The R:R floor is already enforced by the
-    # MIN_REWARD_RISK_RATIO gate above, so every candidate here already
-    # clears the minimum acceptable risk/reward -- the remaining objective
-    # is to maximize premium captured, not to keep optimizing R:R once it's
-    # already "good enough". (Previously sorted (rr_ratio, credit_width_pct),
-    # which could pick a lower-premium structure over a materially richer
-    # one just for a marginally better R:R.)
-    valid_structures.sort(key=lambda x: (x["credit_width_pct"], x["rr_ratio"]), reverse=True)
+    # rr_ratio as tiebreaker, for credit verticals/Iron Condor. The R:R
+    # floor is already enforced by the MIN_REWARD_RISK_RATIO gate above, so
+    # every candidate here already clears the minimum acceptable risk/reward
+    # -- the remaining objective is to maximize premium captured, not to
+    # keep optimizing R:R once it's already "good enough". (Previously
+    # sorted (rr_ratio, credit_width_pct), which could pick a lower-premium
+    # structure over a materially richer one just for a marginally better
+    # R:R.) Debit verticals (Bull Call / Bear Put) use the inverted
+    # objective via _sort_key() above -- see items 16/17.
+    _sort_key(valid_structures)
     best_trade = valid_structures[0]
     
     return {
         "ok": True,
+        "watchlist": False,
         "best_trade": best_trade,
         "strategy_type": strategy_type
     }
@@ -1002,27 +1213,54 @@ def fetch_live_market_data():
     }
 
     if yf is not None:
-        try:
-            vix_hist = yf.Ticker("^INDIAVIX").history(period="1y")
-            if not vix_hist.empty:
-                data["vix"] = round(float(vix_hist["Close"].iloc[-1]), 2)
-                data["vix_source"] = "Yahoo Finance (^INDIAVIX)"
-                if len(vix_hist) >= 2:
-                    prev = float(vix_hist["Close"].iloc[-2])
-                    data["vix_change_pct"] = round(((data["vix"] - prev) / prev * 100) if prev and prev > 0 else 0.0, 2)
-                rank, pct, days_used = compute_iv_rank_percentile(vix_hist["Close"], data["vix"])
-                data["iv_rank"] = rank
-                data["iv_percentile"] = pct
-                data["iv_rank_days"] = days_used
-        except Exception as e:
-            notes.append(f"Yahoo Finance VIX fetch failed: {e}")
-        try:
-            spot_hist = yf.Ticker("^NSEI").history(period="1d")
-            if not spot_hist.empty:
-                data["spot"] = round(float(spot_hist["Close"].iloc[-1]), 2)
-                data["spot_source"] = "Yahoo Finance (^NSEI)"
-        except Exception as e:
-            notes.append(f"Yahoo Finance Nifty spot fetch failed: {e}")
+        # Item 14: retry-with-delay instead of a single try -- transient
+        # Yahoo Finance blips no longer cost us the whole data point.
+        vix_hist = _retry_with_delay(
+            lambda: yf.Ticker("^INDIAVIX").history(period=IV_RANK_LOOKBACK_PERIOD),
+            "Yahoo Finance VIX",
+            max_attempts=3,
+            notes=notes,
+        )
+        if vix_hist is not None and not vix_hist.empty:
+            data["vix"] = round(float(vix_hist["Close"].iloc[-1]), 2)
+            data["vix_source"] = "Yahoo Finance (^INDIAVIX)"
+            if len(vix_hist) >= 2:
+                prev = float(vix_hist["Close"].iloc[-2])
+                data["vix_change_pct"] = round(((data["vix"] - prev) / prev * 100) if prev and prev > 0 else 0.0, 2)
+            rank, pct, days_used = compute_iv_rank_percentile(vix_hist["Close"], data["vix"])
+            data["iv_rank"] = rank
+            data["iv_percentile"] = pct
+            data["iv_rank_days"] = days_used
+        else:
+            # Item 14: secondary source. yfinance gave us nothing after
+            # retries -- try NSE's own live indices endpoint for at least a
+            # current VIX level (no history there, so IV rank/percentile
+            # stay unavailable and are noted as such rather than guessed).
+            nse_vix = _retry_with_delay(
+                _fetch_nse_vix_snapshot, "NSE India VIX (secondary source)", max_attempts=2, notes=notes,
+            )
+            if nse_vix:
+                data["vix"] = nse_vix["vix"]
+                data["vix_change_pct"] = nse_vix.get("vix_change_pct")
+                data["vix_source"] = "NSE live indices API (secondary source -- current level only, no IV rank/percentile)"
+                notes.append(
+                    "India VIX came from the NSE secondary source after Yahoo Finance failed -- "
+                    "no history available from this source, so IV rank/percentile are unavailable this run."
+                )
+
+        spot_hist = _retry_with_delay(
+            lambda: yf.Ticker("^NSEI").history(period="1d"),
+            "Yahoo Finance Nifty spot",
+            max_attempts=3,
+            notes=notes,
+        )
+        if spot_hist is not None and not spot_hist.empty:
+            data["spot"] = round(float(spot_hist["Close"].iloc[-1]), 2)
+            data["spot_source"] = "Yahoo Finance (^NSEI)"
+        # Note: if this also fails, data["spot"] is still backfilled below
+        # from the NSE option-chain's own underlyingValue (existing
+        # secondary source), or the EOD Bhavcopy futures-close proxy in
+        # _fill_horizons_from_bhavcopy() as a tertiary fallback.
     else:
         notes.append("yfinance not installed -- spot/VIX cross-check skipped (pip install yfinance).")
 
@@ -1766,6 +2004,33 @@ def _clamp01_100(x):
     return max(0, min(100, x))
 
 
+# Item 22: stale/EOD-derived figures were being displayed with the same
+# precision as live-tick data -- a breakeven computed off yesterday's
+# closing prices (no live IV, no live bid/ask) doesn't actually resolve to
+# the nearest paisa, and a Return-on-Margin/Capital-Efficiency percentage
+# built on top of that same stale premium is just as imprecise, however
+# large the number gets. These round display precision down to match what
+# the underlying data can actually support, rather than implying a false
+# level of certainty. Does not touch the underlying float used for any
+# gating/math -- display only.
+def _fmt_breakeven_pts(value, is_eod):
+    return f"{value:,.0f}" if is_eod else f"{value:,.2f}"
+
+
+def _fmt_pct_precision(value, is_eod, implausible_threshold=1000):
+    """Formats a percentage figure (ROI/ROM/Capital Efficiency) at a
+    precision matching data quality. EOD-derived figures round to the
+    nearest whole percent instead of one decimal place. A figure past
+    implausible_threshold is itself a sign the underlying premiums are
+    mismatched/stale rather than a genuine return, so it's flagged instead
+    of displayed as a bare huge number."""
+    if value is None:
+        return "n/a"
+    if abs(value) >= implausible_threshold:
+        return f">{implausible_threshold:,.0f}% (implausible at this precision -- verify premiums)"
+    return f"{value:.0f}%" if is_eod else f"{value:.1f}%"
+
+
 def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop_pct, reward_risk_ratio, conf_pct, is_eod, sources=None):
     components = {}
 
@@ -1857,8 +2122,23 @@ def compute_trade_quality_score(priced_legs, horizon_snap, ev_inr, max_loss, pop
     return score, components, penalty_notes
 
 
-def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None, sources=None):
+def compute_confidence(priced_legs, horizon_snap, breakevens, is_eod, vix, spot=None, sources=None, gamma_available=None):
     checks = []
+
+    # Item 21: gamma (and the rest of the Greeks) being unavailable used to
+    # be purely a footnote on net_greeks/the portfolio gamma summary --
+    # it never touched confidence or the Trade Quality Score, so a horizon
+    # with literally no verified gap-risk read could still score however
+    # the other checks happened to land. Treat it as its own confidence
+    # check, same as OI/VIX/liquidity availability below. gamma_available
+    # is None when the caller hasn't determined it yet (skips the check
+    # rather than guessing) -- see apply_verified_payoff's greeks_ok.
+    if gamma_available is not None:
+        checks.append((
+            gamma_available,
+            "Live IV available -- Greeks (incl. gamma) verified for this structure" if gamma_available
+            else "Gamma/Greeks unavailable this run -- gap risk on this structure is unverified",
+        ))
 
     # BUG FIX: an "Event Calendar" source hit (RBI/FOMC/budget/election --
     # see _categorize_source()/_CATEGORY_KEYWORDS) used to be display-only,
@@ -2141,7 +2421,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sourc
                 horizon_dict["max_profit"] = "n/a"
                 horizon_dict["max_loss_pct_capital"] = "n/a"
                 horizon_dict["max_profit_pct_capital"] = "n/a"
-                horizon_dict["breakeven"] = ", ".join(f"{b:,.2f}" for b in result["breakevens"]) if result["breakevens"] else "n/a"
+                horizon_dict["breakeven"] = ", ".join(_fmt_breakeven_pts(b, is_eod) for b in result["breakevens"]) if result["breakevens"] else "n/a"
                 horizon_dict["gap_risk"] = "n/a"
                 horizon_dict["adjustment_trigger"] = "n/a"
                 horizon_dict["expected_move"] = (
@@ -2173,7 +2453,7 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sourc
     max_loss = result["max_loss"]
     max_profit = result["max_profit"]
     net_premium = result["net_premium"]
-    be = ", ".join(f"{b:,.2f}" for b in result["breakevens"]) if result["breakevens"] else "n/a"
+    be = ", ".join(_fmt_breakeven_pts(b, is_eod) for b in result["breakevens"]) if result["breakevens"] else "n/a"
 
     max_loss_pts = result["max_loss"] / NIFTY_LOT_SIZE if NIFTY_LOT_SIZE else 0
     width = (max_loss_pts + net_premium) if net_premium > 0 else 0
@@ -2187,8 +2467,58 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sourc
 
     reward_risk_ratio = (max_profit / max_loss) if max_loss > 0 else float("inf")
     credit_width_pct = (net_premium / width * 100) if width > 0 and net_premium > 0 else None
+    # Item 20: max_loss <= 0 on a real defined-risk structure means the
+    # premium collected/paid is claiming to fully fund (or overfund) the
+    # widest wing -- an arbitrage-looking price that's a data artifact
+    # (mismatched stale EOD last-traded prices across strikes/timestamps),
+    # not a genuine riskless trade. This used to fall through as
+    # reward_risk_ratio=inf and read downstream as "no capital at risk,
+    # ~100% POP" -- Confidence (computed independently, see
+    # compute_confidence) never saw it, so a horizon could show 76%
+    # confidence in the same report where Suggested Sizing separately (and
+    # correctly) rejected it as "Unverified max loss". Reject it here too,
+    # the same way poor_reward_risk does, so both parts of the report agree.
+    invalid_max_loss = max_loss <= 0
     poor_reward_risk = max_loss > 0 and reward_risk_ratio < MIN_REWARD_RISK_RATIO
     poor_credit_width = credit_width_pct is not None and credit_width_pct < MIN_CREDIT_WIDTH_PCT
+
+    if invalid_max_loss:
+        reason_text = (
+            f"Computed max loss is ₹{max_loss:,.0f} (<= 0) on a defined-risk structure -- the "
+            f"priced legs imply the premium fully funds (or overfunds) the widest wing, which "
+            f"isn't a genuine riskless trade. This is almost always mismatched/stale leg prices "
+            f"({premium_label}), not a real arbitrage -- reverify every leg's premium against a "
+            f"live broker terminal before trusting this structure at all."
+        )
+        horizon_dict["max_loss"] = "UNVERIFIABLE MAX LOSS -- reject this trade"
+        horizon_dict["max_profit"] = f"₹{max_profit:,.0f} per lot ({NIFTY_LOT_SIZE} qty)"
+        horizon_dict["max_loss_pct_capital"] = "n/a"
+        horizon_dict["max_profit_pct_capital"] = "n/a"
+        horizon_dict["breakeven"] = be
+        horizon_dict["gap_risk"] = "n/a"
+        horizon_dict["adjustment_trigger"] = "n/a"
+        horizon_dict["expected_move"] = "n/a"
+        horizon_dict["net_greeks"] = "n/a"
+        horizon_dict["probability_of_profit"] = None
+        horizon_dict["probability_of_touch"] = None
+        horizon_dict["expected_win_rate"] = None
+        horizon_dict["expected_value"] = None
+        horizon_dict["kelly_pct"] = None
+        horizon_dict["expectancy_ratio"] = None
+        horizon_dict["reward_risk_ratio"] = "n/a -- max loss unverifiable (rejected)"
+        horizon_dict["margin_required"] = "n/a"
+        horizon_dict["return_on_margin"] = "n/a"
+        horizon_dict["capital_efficiency"] = "n/a"
+        horizon_dict["confidence"] = "Not generated"
+        horizon_dict["confidence_pct"] = None
+        horizon_dict["confidence_reasons"] = [(False, reason_text)]
+        horizon_dict["verification"] = f"🛑 Rejected: {reason_text}"
+        horizon_dict["_verified_max_loss_inr"] = 0.0
+        horizon_dict["_net_gamma"] = None
+        horizon_dict["_negative_ev"] = False
+        horizon_dict["_trade_quality_score"] = None
+        horizon_dict["trade_quality_score"] = "n/a"
+        return horizon_dict
 
     if poor_reward_risk:
         reason_text = (
@@ -2406,21 +2736,22 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sourc
         f"figure in your own broker's margin calculator before sizing)"
     )
     horizon_dict["return_on_margin"] = (
-        f"~{rom:.1f}% (assumes the structure is held to expiry and achieves max profit; actual "
+        f"~{_fmt_pct_precision(rom, is_eod)} (assumes the structure is held to expiry and achieves max profit; actual "
         f"realized returns may differ due to early exit, margin changes, or assignment risk)"
         if rom is not None else "n/a"
     )
     risk_margin_pct = round(max_loss / margin * 100, 1) if margin else None
     if rom is not None and risk_margin_pct is not None:
         horizon_dict["capital_efficiency"] = (
-            f"Profit/Margin ~{rom:.1f}% · Risk/Margin ~{risk_margin_pct:.1f}% "
+            f"Profit/Margin ~{_fmt_pct_precision(rom, is_eod)} · Risk/Margin ~{_fmt_pct_precision(risk_margin_pct, is_eod)} "
             f"(share of locked-up margin at stake if max loss is hit)"
         )
     else:
         horizon_dict["capital_efficiency"] = "n/a"
 
     conf_label, conf_pct, conf_checks = compute_confidence(
-        priced_legs, horizon_snap, result["breakevens"], is_eod, vix, spot, sources
+        priced_legs, horizon_snap, result["breakevens"], is_eod, vix, spot, sources,
+        gamma_available=greeks_ok,
     )
     horizon_dict["confidence"] = conf_label
     horizon_dict["confidence_pct"] = conf_pct
@@ -2430,6 +2761,15 @@ def apply_verified_payoff(horizon_dict, horizon_snap, spot=None, vix=None, sourc
         priced_legs, horizon_snap, ev_inr, max_loss, pop, reward_risk_ratio, conf_pct, is_eod, sources
     )
     horizon_dict["_trade_quality_score"] = tq_score
+    # Item 19: liquidity previously only ever fed the Trade Quality Score as
+    # a 10%-weighted component -- a horizon could score "✅ Consider" on the
+    # strength of EV/R:R/POP alone while liquidity sat at its worst
+    # acceptable value (30/100, the floor for a spread that just barely
+    # clears MAX_LEG_SPREAD_PCT -- or the flat EOD placeholder when there's
+    # no live quote data at all) with nothing ever blocking the
+    # recommendation on that basis. Stashed here so
+    # compute_horizon_recommendation() can gate on it directly.
+    horizon_dict["_liquidity_score"] = tq_breakdown.get("Liquidity", (None, None))[0]
     horizon_dict["trade_quality_breakdown"] = " · ".join(
         f"{name} {sub}/100 ({weight}%)" for name, (sub, weight) in tq_breakdown.items()
     )
@@ -3035,9 +3375,16 @@ def compute_portfolio_gamma_summary(horizons):
         usable.append((name, h.get("strategy_name") or "n/a", gamma))
 
     if not usable:
+        # Item 21: portfolio-wide gamma unavailability used to be buried as
+        # a single gray-text sentence inside the Portfolio View paragraph --
+        # easy to skim past even though it means gap risk across the ENTIRE
+        # portfolio is unverified this run. The caller now also gets a bool
+        # so it can render this as its own bold warning line, the same
+        # visual tier as the aggregate-cap verdict, instead of a footnote.
         return (
             "Combined portfolio gamma: not computable this run (live IV was unavailable "
-            "for one or more legs across all horizons)."
+            "for one or more legs across all horizons).",
+            True,
         )
 
     for name, strategy, gamma in usable:
@@ -3062,7 +3409,8 @@ def compute_portfolio_gamma_summary(horizons):
         f"Summed across the horizons with a computable figure, the combined structure is "
         f"{overall}{coverage_note} -- not uniformly short gamma across every horizon, since "
         f"long-gamma debit spreads and short-gamma premium-selling structures can coexist and "
-        f"partly offset."
+        f"partly offset.",
+        False,
     )
 
 
@@ -3113,7 +3461,7 @@ def compute_market_regime(live_data, horizons):
 
 
 def compute_horizon_recommendation(h):
-    green, amber, red, gray, blue = "#2F5233", "#A6812F", "#8B2E2E", "#8A8F9C", "#3D6690"
+    green, amber, red, gray, blue, teal = "#2F5233", "#A6812F", "#8B2E2E", "#8A8F9C", "#3D6690", "#2E6E73"
 
     if _model_declared_no_strategy(h):
         return "⚪ No Trade", gray, "Conflicting Signals"
@@ -3126,9 +3474,20 @@ def compute_horizon_recommendation(h):
             reason = "Poor Reward:Risk"
         elif "SHORT STRIKE INSIDE EXPECTED MOVE" in ml:
             reason = "Short Strike Inside Expected Move"
+        elif "UNVERIFIABLE MAX LOSS" in ml:
+            reason = "Unverifiable Max Loss -- Pricing Anomaly"
         else:
             reason = "Unverified"
         return "❌ Skip", red, reason
+
+    # Item 8: select_best_strikes() now returns a Watchlist near-miss
+    # candidate (see NEAR_MISS_TOLERANCE_PCT / WATCHLIST_EM_BAND_PCT) when
+    # nothing cleared the strict live gates. It's a real, priced, defined-
+    # risk structure (so it still passes the _horizon_rejected check above),
+    # just one that missed the strict thresholds -- give it its own tier
+    # rather than letting it silently read as a full "Consider".
+    if h.get("_watchlist_tier"):
+        return "🔍 Watchlist", teal, "Near-Miss on Strict Gates"
 
     loss_pct = h.get("max_loss_pct_capital")
     if isinstance(loss_pct, (int, float)) and loss_pct > PER_HORIZON_CAP_PCT:
@@ -3143,6 +3502,15 @@ def compute_horizon_recommendation(h):
 
     if h.get("_implausible_reward_risk"):
         return "⚠ Caution", amber, "Reward:Risk Implausible -- Verify Premiums"
+
+    # Item 19: liquidity hard floor -- see MIN_LIQUIDITY_SCORE_FOR_CONSIDER.
+    # Placed after the other hard-gate checks (so a genuinely broken trade
+    # still reports its own real rejection reason first) but before the
+    # quality-score branch, so thin/unknown liquidity can never read as a
+    # full "✅ Consider" no matter how the rest of the math looks.
+    liq_score = h.get("_liquidity_score")
+    if isinstance(liq_score, (int, float)) and liq_score <= MIN_LIQUIDITY_SCORE_FOR_CONSIDER:
+        return "⚠ Caution", amber, f"Liquidity Too Thin ({liq_score:.0f}/100) -- Verify Fill Quality"
 
     score = h.get("_trade_quality_score")
     if not isinstance(score, (int, float)):
@@ -3212,6 +3580,29 @@ def _suggested_action_for_score(score):
     if score >= 40:
         return "Watchlist", "#A6812F"
     return "Skip", "#8B2E2E"
+
+
+def _sizing_multiplier(h, action_label):
+    """
+    Item 13: previously this label was purely cosmetic -- compute_suggested_
+    sizing() looked up action_label just to append it to a footnote, while
+    `lots` itself was still sized off the per-horizon capital cap alone. A
+    "Half Size" or "Watchlist" trade got exactly the same lot count as a
+    "Full Size" one; only the text next to it differed. This derates the
+    actual lot count so confidence tier changes the real position, not just
+    the label.
+    """
+    if h.get("_watchlist_tier"):
+        # Item 8's near-miss candidates never cleared the strict live gates
+        # at all -- size well below "Half Size" rather than at half.
+        return 0.25
+    if action_label == "Half Size":
+        return 0.5
+    if action_label == "Watchlist":
+        return 0.25
+    if action_label == "Skip":
+        return 0.0
+    return 1.0
 
 
 def render_trade_quality_table(horizons):
@@ -3420,6 +3811,22 @@ def compute_suggested_sizing(horizons):
                 f"ceiling)"
             )
             note = f"{note}. {cap_note}" if note else cap_note
+
+        # Item 13: actually apply the confidence-tier derating instead of
+        # only noting it -- see _sizing_multiplier(). Applied after the
+        # MAX_LOTS_PER_HORIZON ceiling so a Watchlist/Half-Size trade is a
+        # fraction of the same ceiling everything else is capped at, not a
+        # fraction of an already-uncapped number.
+        mult = _sizing_multiplier(h, action_label)
+        if mult < 1.0:
+            full_size_lots = lots
+            lots = int(lots * mult)
+            size_note = f"{action_label} tier -- sized at {mult:g}x ({full_size_lots} -> {lots} lots)"
+            note = f"{note}. {size_note}" if note else size_note
+            if lots < 1:
+                plan.append([name, None, f"{note} -- rounds down to 0 lots, skip"])
+                continue
+
         plan.append([name, lots, note])
 
     def total_risk():
@@ -3525,13 +3932,22 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
         if over_cap else
         f"✅ Stays within the {AGGREGATE_CAP_PCT:.0f}% worst-case combined cap."
     )
-    gamma_summary = compute_portfolio_gamma_summary(horizons)
+    gamma_summary, gamma_unavailable_all = compute_portfolio_gamma_summary(horizons)
     portfolio_text = _strip_gamma_claims(_strip_cap_claims(portfolio_view))
     portfolio_text = _scrub_portfolio_view_contradictions(portfolio_text, horizons)
     portfolio_text = _scrub_portfolio_view_structure_type_contradiction(portfolio_text, horizons)
     portfolio_text = _scrub_portfolio_view_directional_contradiction(portfolio_text, horizons)
     sizing_plan = compute_suggested_sizing(horizons)
     sizing_html = render_suggested_sizing_html(sizing_plan, sans)
+    # Item 21: bold, same-tier warning line as the aggregate-cap verdict --
+    # not just the gray-text sentence inside gamma_summary below -- so
+    # portfolio-wide unverified gap risk can't be skimmed past.
+    gamma_gate_html = (
+        f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:#8B2E2E;margin-top:8px;">'
+        f'⚠ Portfolio gamma unavailable this run -- gap risk across every horizon is unverified; '
+        f'treat aggregate sizing above as an upper bound, not a confirmed figure.</div>'
+        if gamma_unavailable_all else ""
+    )
     portfolio_html = (
         f'<div style="margin-top:16px;padding:12px 14px;background:#FAF9F6;'
         f'border:1px solid #EDEAE2;border-left:3px solid #B08D57;border-radius:4px;">'
@@ -3543,6 +3959,7 @@ def render_horizons_html(horizons, aggregate_pct, portfolio_view, live_data=None
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;">{_esc(gamma_summary)}</div>'
         f'<div style="font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;margin-top:8px;">{_esc(portfolio_text)}</div>'
         f'<div style="font-family:{sans};font-size:12px;font-weight:700;color:{agg_color};margin-top:8px;">{verdict}</div>'
+        f'{gamma_gate_html}'
         f'{sizing_html}'
         f'</div>'
     )
@@ -3770,7 +4187,7 @@ def _horizon_rejected(h):
     ml = h.get("max_loss")
     return isinstance(ml, str) and (
         "UNDEFINED RISK" in ml or "Unverified" in ml or "POOR REWARD/RISK" in ml
-        or "SHORT STRIKE INSIDE EXPECTED MOVE" in ml
+        or "SHORT STRIKE INSIDE EXPECTED MOVE" in ml or "UNVERIFIABLE MAX LOSS" in ml
     )
 
 
@@ -4247,15 +4664,84 @@ def run():
                 target_strat = "Iron Condor"
 
             res = select_best_strikes(snap, spot, bias, target_strat)
-            if res.get("ok"):
-                best = res["best_trade"]
+
+            # Item 11 -- regime override: an Iron Condor that can't find ANY
+            # structure with its short legs genuinely outside the expected
+            # move band means the chain itself isn't range-bound enough this
+            # run (the same condition REJECT_IC_SHORT_INSIDE_EM guards
+            # against downstream) -- deliberately not given a Watchlist
+            # near-miss on band for this reason (see WATCHLIST_EM_BAND_PCT).
+            # If live PCR(OI) shows a clear directional skew instead of a
+            # neutral reading, retry deterministic selection with the
+            # PCR-implied directional credit spread rather than falling
+            # through to the model's raw (also likely ungated) IC guess.
+            is_regime_override = False
+            if (
+                not res.get("ok") and not res.get("watchlist")
+                and target_strat == "Iron Condor"
+                and REGIME_OVERRIDE_ENABLED
+            ):
+                pcr = snap.get("pcr_oi")
+                strong_bearish = isinstance(pcr, (int, float)) and pcr <= (0.7 - REGIME_OVERRIDE_PCR_MARGIN)
+                strong_bullish = isinstance(pcr, (int, float)) and pcr >= (1.2 + REGIME_OVERRIDE_PCR_MARGIN)
+                if strong_bearish or strong_bullish:
+                    override_strat = "Bear Call Spread" if strong_bearish else "Bull Put Spread"
+                    override_res = select_best_strikes(snap, spot, bias, override_strat)
+                    if override_res.get("ok") or override_res.get("watchlist"):
+                        log.info(
+                            f"Regime override for {horizon_name}: Iron Condor found no valid "
+                            f"structure outside the expected-move band and PCR(OI)={pcr:g} shows a "
+                            f"strong directional skew -- retrying with {override_strat} instead."
+                        )
+                        res = override_res
+                        target_strat = override_strat
+                        is_regime_override = True
+
+            if res.get("ok") or res.get("watchlist"):
+                is_watchlist = bool(res.get("watchlist"))
+                best = res["best_trade"] if res.get("ok") else res["near_miss_trade"]
                 st = res["strategy_type"]
+                # Item 8: near-miss candidates never get a live "Consider"
+                # recommendation and are sized down -- see
+                # compute_horizon_recommendation() / _sizing_multiplier().
+                if is_watchlist:
+                    h["_watchlist_tier"] = True
+                    h["_watchlist_reason"] = res.get("reason")
                 # Make any substitution visible in the report instead of silent:
                 # the model's original strategy_name/legs are being replaced by
                 # a deterministically-optimized structure, which can be a
                 # different structure family than what bias_reason/
                 # strike_rationale were written to justify.
-                if strat_lower and st.lower() not in strat_lower:
+                if is_regime_override:
+                    substitution_note = (
+                        f"Regime override: Iron Condor found no strike combination outside the "
+                        f"expected-move band this run; live PCR(OI) showed a strong directional "
+                        f"skew, so a {st} was selected deterministically instead."
+                        + (" (Watchlist -- see note below.)" if is_watchlist else "")
+                    )
+                elif is_watchlist:
+                    if st == "Bear Call Spread":
+                        chosen_desc = f"short {best['short_strike']:g} CE / long {best['long_strike']:g} CE"
+                    elif st == "Bull Put Spread":
+                        chosen_desc = f"short {best['short_strike']:g} PE / long {best['long_strike']:g} PE"
+                    elif st == "Bull Call Spread":
+                        chosen_desc = f"long {best['long_strike']:g} CE / short {best['short_strike']:g} CE"
+                    elif st == "Bear Put Spread":
+                        chosen_desc = f"long {best['long_strike']:g} PE / short {best['short_strike']:g} PE"
+                    elif st == "Iron Condor":
+                        chosen_desc = (
+                            f"short {best['short_put']:g} PE/{best['short_call']:g} CE, "
+                            f"long {best['long_put']:g} PE/{best['long_call']:g} CE"
+                        )
+                    else:
+                        chosen_desc = None
+                    substitution_note = (
+                        f"WATCHLIST: no {st} cleared the strict live R:R/credit-width gates this "
+                        f"run; the closest near-miss candidate ({chosen_desc or 'see legs above'}) is "
+                        f"shown for reference only, not a live gate-cleared entry -- sized down "
+                        f"accordingly in the suggested sizing table below."
+                    )
+                elif strat_lower and st.lower() not in strat_lower:
                     substitution_note = (
                         f"Deterministic strike selection replaced the model's proposed "
                         f"'{strategy_name}' with an optimized {st} that clears the live "

@@ -60,11 +60,16 @@ from models import swing_trade_universe as universe  # static ticker seed list f
 # The model's own JSON output is not trusted at face value: _verify_stock_claims
 # independently checks every mandatory filter from the prompt (uptrend, RSI/MACD,
 # growth thresholds, risk:reward minimum, debt/ROE) against real data. A stock
-# with any "hard" contradiction -- i.e. one where the independent check actively
-# disagrees with the model's claim, not just "couldn't be verified" -- fails its
-# own strategy's entry criteria and must not be recommended. REQUIRE_QUALIFYING_STOCK
-# (default true) enforces that; set to "false" to restore the old behavior of
-# reporting every candidate regardless of contradictions.
+# with a "hard" contradiction -- i.e. one where the independent check actively
+# disagrees with the model's claim, not just "couldn't be verified" -- on
+# debt-to-equity, ROE, or a data-integrity check (missing price, hallucinated
+# ticker) always fails its own strategy's entry criteria. A hard contradiction
+# on one of the five CORE setup filters (uptrend/RSI/MACD/growth/risk-reward)
+# is more forgiving: MIN_CORE_FILTERS_REQUIRED lets up to two fail by default,
+# and a high enough composite score can override even that (see
+# _split_qualifying). REQUIRE_QUALIFYING_STOCK (default true) enforces the
+# overall gate; set to "false" to restore the old behavior of reporting every
+# candidate regardless of contradictions.
 REQUIRE_QUALIFYING_STOCK = os.getenv("REQUIRE_QUALIFYING_STOCK", "true").lower() == "true"
 # How many times to re-prompt the model (with the specific rejection reasons fed
 # back in) before giving up and reporting "no qualifying trade found" instead of
@@ -138,9 +143,23 @@ MAX_POSITION_SIZE_PCT = _env_float("MAX_POSITION_SIZE_PCT", 5.0)
 USE_DETERMINISTIC_SCREEN = os.getenv("USE_DETERMINISTIC_SCREEN", "true").lower() == "true"
 
 # -----------------------------
+# Universe widening (optional supplement to swing_trade_universe.py)
+# -----------------------------
+# swing_trade_universe.py's static seed list is what actually determines
+# how many/which candidates get checked -- widening it for real (adding
+# mid-cap names or a broader index) means editing that file directly.
+# EXTRA_UNIVERSE_FILE is a lower-friction supplement that doesn't require
+# touching swing_trade_universe.py at all: point it at a CSV
+# (columns: name,ticker,sector,bucket) and those rows get merged into the
+# deterministic screen's candidate pool alongside the seed list, for
+# whichever sectors are in play on a given attempt. Unset by default (no
+# behavior change). See _load_extra_universe_tickers.
+EXTRA_UNIVERSE_FILE = os.getenv("EXTRA_UNIVERSE_FILE", "").strip()
+
+# -----------------------------
 # Regime-aware fundamentals softening -- bounded, transparent, this-run-only
 # -----------------------------
-# A fixed 20%/20% YoY growth bar is calibrated for an average market. In a
+# A fixed MIN_GROWTH_YOY_PCT bar is calibrated for an average market. In a
 # genuinely weak/choppy tape (see swing_trade_regime.py's classification)
 # the honest answer some weeks really is "nothing qualifies" -- but a bar
 # that NEVER flexes also means the strategy simply stops producing any
@@ -157,10 +176,33 @@ REGIME_SOFTEN_GROWTH_BAR = os.getenv("REGIME_SOFTEN_GROWTH_BAR", "true").lower()
 REGIME_SOFTEN_MAX_PCT = _env_float("REGIME_SOFTEN_MAX_PCT", 15.0)
 
 # -----------------------------
+# Regime-gate override -- relative-strength exception (explicit, opt-in)
+# -----------------------------
+# When regime.REQUIRE_MARKET_REGIME_FILTER is on (the default) and the
+# broad-market check fails, run() has always skipped the entire scan --
+# see the "Market-regime gate" block in run(). That's a deliberate,
+# explicit block, not the thing this section is about.
+#
+# What THIS controls is a separate, opt-in exception: when enabled, a
+# failed regime gate no longer skips the run outright -- instead, every
+# candidate this run must additionally clear a stricter, substitute
+# per-stock bar (_verify_relative_strength_override) in place of the
+# market-wide check that's being skipped for it. That override check is
+# an absolute blocker (like debt/equity or ROE), not one of the five
+# flexible core filters -- it can't be waived by MIN_CORE_FILTERS_REQUIRED
+# slack or a high composite score, since it exists specifically to
+# substitute for the disabled market gate rather than to be one more
+# negotiable setup filter. Off by default: a failed regime gate still
+# skips the run unless you explicitly opt into this.
+REGIME_OVERRIDE_ON_RS = os.getenv("REGIME_OVERRIDE_ON_RS", "false").lower() == "true"
+REGIME_OVERRIDE_MIN_RSI = _env_float("REGIME_OVERRIDE_MIN_RSI", 55.0)
+REGIME_OVERRIDE_SMA50D_MARGIN_PCT = _env_float("REGIME_OVERRIDE_SMA50D_MARGIN_PCT", 3.0)
+
+# -----------------------------
 # Cross-run near-miss watchlist
 # -----------------------------
 # A stock that fully clears fundamentals but fails ONLY on a technical
-# filter (e.g. RSI still falling, no MACD crossover yet) is exactly the
+# filter (e.g. RSI still falling, no bullish MACD signal yet) is exactly the
 # kind of candidate worth re-checking next week rather than re-discovering
 # from scratch -- growth doesn't change week to week, but a technical setup
 # can complete within days. WATCHLIST_LOG persists these across runs;
@@ -183,18 +225,161 @@ WATCHLIST_MAX_AGE_DAYS = _env_int("WATCHLIST_MAX_AGE_DAYS", 42)  # ~6 weeks, the
 # now always describes the actual enforced value instead of a hardcoded
 # number that could silently drift out of sync with the verifier (as the
 # risk:reward text and check previously had -- the prompt said "1:2.5" but
-# the code enforced 2.0; MIN_RISK_REWARD's default below preserves that
-# previously-enforced 2.0 rather than silently tightening it).
+# the code enforced 2.0). MIN_RISK_REWARD's default below was lowered from
+# that previously-enforced 2.0 to 1.5 -- a deliberate loosening, not drift --
+# and MIN_GROWTH_YOY_PCT's default was similarly lowered from 20.0 to 15.0
+# (see _verify_fundamentals for the accompanying "either revenue or profit
+# growth, not both" change).
 MIN_GROWTH_YOY_PCT = _env_float("MIN_GROWTH_YOY_PCT", 15.0)
+
+# -----------------------------
+# Growth lookback window
+# -----------------------------
+# A strict single-quarter YoY comparison penalizes one lumpy/weak quarter
+# even when the underlying trend is fine -- e.g. a one-off delayed order or
+# a tough prior-year comp can fail an otherwise-strong company on a single
+# data point. "trailing_2q" sums the latest 2 quarters and compares against
+# the 2 quarters bracketing the point 1 year ago, so one bad quarter is
+# averaged against its neighbor rather than deciding the outcome alone.
+# "ttm" compares trailing-twelve-months against the prior TTM (8 quarters
+# of history needed) -- the smoothest option, but yfinance's
+# quarterly_financials frequently only exposes ~4-5 quarters, so this mode
+# commonly falls back to "yoy" per-ticker (logged when it happens) rather
+# than silently skipping growth verification for that name. See
+# _growth_lookback_periods.
+GROWTH_LOOKBACK_MODE = os.getenv("GROWTH_LOOKBACK_MODE", "yoy").strip().lower()
+if GROWTH_LOOKBACK_MODE not in ("yoy", "trailing_2q", "ttm"):
+    log.warning(f"GROWTH_LOOKBACK_MODE='{GROWTH_LOOKBACK_MODE}' not recognized -- falling back to 'yoy'.")
+    GROWTH_LOOKBACK_MODE = "yoy"
+
 MIN_RISK_REWARD = _env_float("MIN_RISK_REWARD", 1.5)
 MAX_RSI_OVERBOUGHT = _env_float("MAX_RSI_OVERBOUGHT", 70.0)
+# RSI filter loosened from "trending up AND below MAX_RSI_OVERBOUGHT" to a
+# plain band check: anywhere in [MIN_RSI_OVERSOLD, MAX_RSI_OVERBOUGHT)
+# qualifies regardless of whether RSI ticked up or down since the prior
+# session -- day-to-day direction is noisy and was rejecting otherwise-fine
+# setups on a single down-week.
+MIN_RSI_OVERSOLD = _env_float("MIN_RSI_OVERSOLD", 40.0)
 MAX_DEBT_TO_EQUITY_PCT = _env_float("MAX_DEBT_TO_EQUITY_PCT", 100.0)
 MIN_ROE_PCT = _env_float("MIN_ROE_PCT", 10.0)
-# When false, the price-above-20/50-week-SMA uptrend requirement is dropped
-# from both the prompt and the verifier entirely (RSI/MACD/growth/risk-reward
-# filters still apply) -- use this if you want to consider pullback/basing
-# setups, not just confirmed uptrends.
+# When false, the uptrend requirement is dropped from both the prompt and
+# the verifier entirely (RSI/MACD/growth/risk-reward filters still apply)
+# -- use this if you want to consider pullback/basing setups, not just
+# confirmed uptrends. When true, the requirement itself is now just "price
+# above its 50-day MA" -- loosened from the previous stricter "price above
+# BOTH the 20-week and 50-week SMA" structure (see _verify_technicals).
 REQUIRE_UPTREND_FILTER = os.getenv("REQUIRE_UPTREND_FILTER", "true").lower() == "true"
+
+# -----------------------------
+# "N of 5 core filters must pass" -- and a high-composite-score override
+# -----------------------------
+# Previously a candidate qualified only if it had ZERO hard contradictions
+# across every mandatory filter. The five CORE swing-setup filters this
+# strategy's own prompt describes as "the setup" are: uptrend (50-day MA),
+# RSI band, MACD signal, growth threshold, and risk:reward minimum.
+# MIN_CORE_FILTERS_REQUIRED lets a candidate qualify even if up to
+# (CORE_FILTER_COUNT - MIN_CORE_FILTERS_REQUIRED) of those five hard-fail --
+# lowered from 4 (any 4 of 5) to 3 (any 3 of 5), i.e. up to two of the five
+# core filters can now hard-fail and a candidate still qualifies strict.
+# This flexibility does NOT extend to debt-to-equity, ROE, or data-
+# integrity checks (missing price, hallucinated ticker, etc.) -- those
+# remain absolute blockers no matter how many core filters pass, since
+# they're basic quality/fraud checks rather than part of the setup itself.
+#
+# Separately, COMPOSITE_SCORE_CORE_FILTER_OVERRIDE gives a second path to
+# qualify: a candidate whose 0-100 composite score clears this (lowered
+# from 75 to 70) bar can be reported even if it doesn't clear
+# MIN_CORE_FILTERS_REQUIRED -- the idea being a sufficiently strong overall
+# setup can outweigh a weak filter or two. This override still respects
+# the non-core absolute blockers above, and still goes through the
+# existing MIN_COMPOSITE_SCORE floor in _passes_professional_quality_gate.
+# See _split_qualifying.
+CORE_FILTER_COUNT = 5
+MIN_CORE_FILTERS_REQUIRED = _env_int("MIN_CORE_FILTERS_REQUIRED", 3)
+COMPOSITE_SCORE_CORE_FILTER_OVERRIDE = _env_float("COMPOSITE_SCORE_CORE_FILTER_OVERRIDE", 70.0)
+
+# -----------------------------
+# Watchlist tier (this run's email, not to be confused with the cross-run
+# near-miss CSV below)
+# -----------------------------
+# Previously, a candidate that didn't clear the strict bar above just fell
+# into "rejected" -- on a genuinely weak day that can mean the whole run
+# reports "no qualifying trade" even though one or two names came close. A
+# candidate that clears every ABSOLUTE blocker (debt/equity, ROE, data
+# integrity -- never negotiable) but is one core filter short of the
+# strict bar is exactly the "fails one filter but close" case worth
+# surfacing on its own, clearly-labeled tier rather than either promoting
+# it into strict (which would quietly lower the bar) or burying it in the
+# rejected list (which drops it from the email's headline output
+# entirely). WATCHLIST_EXTRA_CORE_FILTER_SLACK widens the core-filter bar
+# by this many additional failures beyond what strict allows -- default 1
+# means "one filter more than strict tolerates" lands in the watchlist
+# tier instead of being flatly rejected. Set WATCHLIST_TIER_ENABLED=false
+# to disable and restore the old "strict or rejected" behavior. See
+# _split_qualifying.
+WATCHLIST_TIER_ENABLED = os.getenv("WATCHLIST_TIER_ENABLED", "true").lower() == "true"
+WATCHLIST_EXTRA_CORE_FILTER_SLACK = _env_int("WATCHLIST_EXTRA_CORE_FILTER_SLACK", 1)
+
+# -----------------------------
+# Confidence-adjusted position sizing for the watchlist tier
+# -----------------------------
+# Alternative to relaxing entry filters for close-but-imperfect setups:
+# _split_qualifying's filters above are untouched -- a watchlist candidate
+# still has to clear every absolute blocker and land within
+# WATCHLIST_EXTRA_CORE_FILTER_SLACK of the strict bar, exactly as before.
+# What changes is that a watchlist pick is no longer sized the same as a
+# strict one -- _apply_confidence_sizing scales BOTH the model's flat
+# allocation_pct AND the independently-computed ATR-based share count/
+# position value (see _attach_risk_plan) by this multiplier, once, right
+# after _split_qualifying. This is exposure-management, not a lowered bar:
+# a watchlist stock can still never end up sized larger than a strict one,
+# since the multiplier applies on top of whatever already survived
+# MAX_POSITION_SIZE_PCT's cap. Set to 1.0 to disable (watchlist sized the
+# same as strict). See _apply_confidence_sizing.
+WATCHLIST_POSITION_SIZE_MULTIPLIER = _env_float("WATCHLIST_POSITION_SIZE_MULTIPLIER", 0.5)
+
+# -----------------------------
+# Target-distance-based time horizon (replaces one fixed 3-5 month window
+# for every candidate)
+# -----------------------------
+# Every candidate used to be pushed into the same "3-5 months" holding
+# period in the prompt, regardless of how far its own target actually was.
+# _compute_flexible_horizon derives a per-stock window instead, from real
+# data already on hand: the ATR-based weekly volatility computed in
+# _attach_risk_plan (this stock's own typical weekly % move) says roughly
+# how many weeks it should take THIS stock, at ITS OWN pace, to travel the
+# distance to target1_pct. A modest, close target on a fast mover can
+# genuinely resolve in under 3 months; a distant, aggressive target on a
+# slow mover legitimately needs more than 5 -- that's a timing fact, not a
+# reason to loosen the entry bar (the same principle
+# WATCHLIST_POSITION_SIZE_MULTIPLIER applies to size instead of horizon).
+# Set HORIZON_STRETCH_ENABLED=false to fall back to showing only the
+# model's own exit_date guess with no computed window.
+HORIZON_STRETCH_ENABLED = os.getenv("HORIZON_STRETCH_ENABLED", "true").lower() == "true"
+# Multiplier on top of the raw straight-line ATR-pace estimate to get the
+# window's upper bound -- price doesn't move in a straight line every
+# week, so the realistic worst case allows more calendar time than the
+# straight-line number alone.
+HORIZON_BUFFER_MULTIPLIER = _env_float("HORIZON_BUFFER_MULTIPLIER", 1.6)
+# Absolute floor/ceiling so a near-zero ATR or an extreme target can't
+# produce a nonsensical multi-day or multi-year "swing trade" horizon --
+# a sanity clamp, not a reintroduction of the old fixed window.
+HORIZON_FLOOR_MONTHS = _env_float("HORIZON_FLOOR_MONTHS", 1.5)
+HORIZON_CEILING_MONTHS = _env_float("HORIZON_CEILING_MONTHS", 9.0)
+
+# -----------------------------
+# Multi-session confirmation for weekly RSI/MACD (reduces noise-driven
+# rejections without changing the actual bar)
+# -----------------------------
+# _fetch_weekly_technicals_uncached used to read weekly RSI and the MACD-
+# vs-signal comparison off a single latest session -- a stock could get
+# hard-rejected purely because ITS ONE MOST RECENT weekly close happened to
+# be a noisy outlier, even though it was solidly inside the RSI band or
+# above signal on every nearby session. This averages both readings over
+# the last MULTI_SESSION_CONFIRMATION_WINDOW weekly sessions instead of
+# taking a single snapshot. MIN_RSI_OVERSOLD/MAX_RSI_OVERBOUGHT (the actual
+# bar) are untouched -- this only smooths what gets compared against them.
+MULTI_SESSION_CONFIRMATION_WINDOW = _env_int("MULTI_SESSION_CONFIRMATION_WINDOW", 3)
 
 # -----------------------------
 # Rejection-history logging (for deciding whether a threshold is genuinely
@@ -218,6 +403,7 @@ def _metric_patterns():
         ("roe_pct", re.compile(r"ROE is (-?[\d.]+)%"), MIN_ROE_PCT, "min"),
         ("risk_reward_ratio", re.compile(r"Risk:reward of 1 : (-?[\d.]+) is below"), MIN_RISK_REWARD, "min"),
         ("weekly_rsi_overbought", re.compile(r"Weekly RSI is (-?[\d.]+) \(>="), MAX_RSI_OVERBOUGHT, "max"),
+        ("weekly_rsi_oversold", re.compile(r"Weekly RSI is (-?[\d.]+) \(<"), MIN_RSI_OVERSOLD, "min"),
     ]
 
 
@@ -335,6 +521,7 @@ _ORIGINAL_THRESHOLDS = {
     "MIN_GROWTH_YOY_PCT": MIN_GROWTH_YOY_PCT,
     "MIN_RISK_REWARD": MIN_RISK_REWARD,
     "MAX_RSI_OVERBOUGHT": MAX_RSI_OVERBOUGHT,
+    "MIN_RSI_OVERSOLD": MIN_RSI_OVERSOLD,
     "MAX_DEBT_TO_EQUITY_PCT": MAX_DEBT_TO_EQUITY_PCT,
     "MIN_ROE_PCT": MIN_ROE_PCT,
 }
@@ -342,6 +529,7 @@ _GLOBAL_DIRECTION = {
     "MIN_GROWTH_YOY_PCT": "min",
     "MIN_RISK_REWARD": "min",
     "MAX_RSI_OVERBOUGHT": "max",
+    "MIN_RSI_OVERSOLD": "min",
     "MAX_DEBT_TO_EQUITY_PCT": "max",
     "MIN_ROE_PCT": "min",
 }
@@ -352,6 +540,7 @@ _METRIC_TO_GLOBAL = {
     "roe_pct": "MIN_ROE_PCT",
     "risk_reward_ratio": "MIN_RISK_REWARD",
     "weekly_rsi_overbought": "MAX_RSI_OVERBOUGHT",
+    "weekly_rsi_oversold": "MIN_RSI_OVERSOLD",
 }
 
 
@@ -558,6 +747,28 @@ def _regime_softening_html(softening):
         f'margin-bottom:14px;">'
         f'<strong>MIN_GROWTH_YOY_PCT softened this run</strong>: {old} &rarr; {new} '
         f'<span style="color:#8A8F9C;">({html.escape(reason)})</span></div>'
+    )
+
+
+def _regime_override_html(active, regime_detail):
+    """Disclosure box for a run where the regime gate failed but
+    REGIME_OVERRIDE_ON_RS let the scan proceed anyway -- same visual
+    language as _regime_softening_html, so this is never a silent
+    exception."""
+    if not active:
+        return ""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    classification = html.escape(str((regime_detail or {}).get("classification") or "unknown"))
+    return (
+        f'<div style="font-family:{sans};font-size:12px;color:#5C4A1E;line-height:1.6;'
+        f'padding:12px 16px;background:#FBF3DC;border-radius:4px;border:1px solid #E9DCB0;'
+        f'margin-bottom:14px;">'
+        f'<strong>Regime gate overridden this run</strong>: broad market regime classified '
+        f'&#39;{classification}&#39; (would normally skip the run entirely), but '
+        f'REGIME_OVERRIDE_ON_RS is enabled, so every candidate below additionally had to clear '
+        f'a stricter relative-strength bar (momentum &ge; {_fmt_num(REGIME_OVERRIDE_MIN_RSI)}, '
+        f'price &ge;{_fmt_num(REGIME_OVERRIDE_SMA50D_MARGIN_PCT)}% above its 50-day moving '
+        f'average) in place of the market-wide check.</div>'
     )
 
 
@@ -791,7 +1002,7 @@ def _run_context():
 # snippets alone.
 STRATEGY_TYPES_BLOCK = """Stock Selection Strategy (choose one per stock in Stage 2):
 - Momentum Breakout: a large-cap or quality mid-cap breaking out of a multi-month consolidation (Cup and Handle, Multi-Year Base, Symmetrical Triangle on a weekly chart) on significantly above-average volume, signaling a new sustained intermediate-term uptrend.
-- Event-Driven: positioned to gain from a major near-term catalyst (regulatory approval, large contract win, demerger/spinoff, M&A arbitrage) with a clearly quantifiable price impact inside the 3-5 month window.
+- Event-Driven: positioned to gain from a major near-term catalyst (regulatory approval, large contract win, demerger/spinoff, M&A arbitrage) with a clearly quantifiable price impact within a realistic multi-month window (the report derives each pick's actual horizon separately from its target distance and volatility -- see below -- rather than assuming a fixed period).
 - Technical Swing Trade: a stock in a confirmed strong secular uptrend (above 50-WMA and 200-WMA) that has pulled back to a key support level (20-WMA, 38.2%/50% Fibonacci retracement, or horizontal support) with a clear reversal candlestick pattern.
 - Fundamental Short-Term Bet: compelling valuation plus an exceptionally strong recent quarter (YoY and QoQ growth, clear beat on analyst consensus) and strongly positive guidance -- a re-rating play."""
 
@@ -812,10 +1023,10 @@ def _mega_large_cap_caution():
         "IMPORTANT market-cap steering: well-known large-caps and megacaps (e.g. "
         "TCS, Infosys, HCL Tech, Wipro, Reliance, HDFC Bank, ICICI Bank, Sun "
         f"Pharma, Bandhan Bank, and similar Nifty 50/Nifty 100 constituents) almost "
-        f"never post BOTH >={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue growth AND "
+        f"never post EVEN ONE of >={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue growth OR "
         f">={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY profit growth in "
-        "the same quarter simultaneously -- their revenue base is too large for "
-        "that pace of growth except in rare one-off years. Repeatedly proposing "
+        "a given quarter -- their revenue base is too large for that pace of growth "
+        "except in rare one-off years, on either line. Repeatedly proposing "
         "these names and having them fail this filter wastes this search. "
         "Deprioritize them unless you have concrete, verifiable evidence of an "
         "unusual one-off beat this specific quarter. Spend most of your search "
@@ -889,7 +1100,7 @@ Search Strategy:
 {exclude_block}
 
 Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
-- Latest quarter: net profit AND revenue growth both above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY, with margin expansion.
+- Latest quarter: net profit OR revenue growth above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY (only one of the two needs to clear the bar, not both), with margin expansion.
 - Low debt-to-equity (or strong asset quality for financials).
 - High/improving ROCE/ROE, and check for promoter/institutional buying last quarter if known.
 
@@ -934,7 +1145,7 @@ def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note
     )
     return f"""STAGE 2 OF 2 -- TECHNICALS, SENTIMENT, AND TRADE PLAN. Using the most current market data as of {today_str}, {lookback_note}
 
-The stocks below have ALREADY passed independent fundamentals verification (>={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue and profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no MACD crossover) -- do not force a pick that doesn't qualify.
+The stocks below have ALREADY passed independent fundamentals verification (>={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue or profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no bullish MACD signal) -- do not force a pick that doesn't qualify.
 
 Fundamentally-qualified shortlist to evaluate (do not propose any stock outside this list):
 {listing}
@@ -943,7 +1154,7 @@ Fundamentally-qualified shortlist to evaluate (do not propose any stock outside 
 {STRATEGY_TYPES_BLOCK}
 
 Mandatory technical / sentiment / risk filters:
-- Technicals (3-5M view): {"price above 20-week AND 50-week SMA; " if REQUIRE_UPTREND_FILTER else ""}weekly RSI trending up but below {_fmt_num(MAX_RSI_OVERBOUGHT)}; bullish MACD crossover.
+- Technicals (multi-month swing view): {"price above its 50-day MA; " if REQUIRE_UPTREND_FILTER else ""}weekly RSI between {_fmt_num(MIN_RSI_OVERSOLD)} and {_fmt_num(MAX_RSI_OVERBOUGHT)} (day-to-day direction doesn't matter); bullish MACD signal (MACD line above its signal line, OR the MACD histogram has been rising for 2+ consecutive weekly sessions -- a fresh crossover is not required).
 - Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
 - Risk/reward: minimum 1:{_fmt_num(MIN_RISK_REWARD)} based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
 - Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
@@ -958,13 +1169,13 @@ OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothi
       "ticker": "Exact ticker from the shortlist above",
       "allocation_pct": "e.g. 5-10%",
       "entry_date": "Targeted entry date",
-      "exit_date": "Expected exit date, 3-5 months from entry",
+      "exit_date": "Your own rough estimated exit date for the setup -- the report separately derives an independent target-distance-based horizon from real ATR data, so don't force this to any fixed window",
       "strategy_type": "Strategy name used",
       "confidence_score": "Conviction out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
       "risk_level": "One word: 'Medium' or 'High'",
       "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, Order Win, Sector Upgrade'",
       "risk_reward_ratio": "e.g. '1 : 2.5' -- must arithmetically match stop_loss_pct and target1_pct below",
-      "upside_target_pct": "Favourable % for 3-5 months",
+      "upside_target_pct": "Favourable % you expect this setup to reach -- the time it should take is derived separately from this figure and real volatility data, not assumed to be a fixed period",
       "stop_loss_pct": "Risk % (Stop-Loss)",
       "target1_pct": "Expected Profit % (T1)",
       "target2_pct": "Expected Profit % (T2), optional",
@@ -1250,6 +1461,122 @@ def _risk_plan_display(stock):
     return "".join(lines)
 
 
+def _compute_flexible_horizon(stocks):
+    """
+    Attaches a per-stock "_horizon_window" dict (or None if it can't be
+    computed) using target1_pct/upside_target_pct against the ATR-based
+    weekly move already sitting in _atr_risk_plan (see _attach_risk_plan) --
+    see the HORIZON_* constants' docstring above for the full rationale.
+    Deliberately additive, same pattern as _attach_risk_plan: doesn't touch
+    the model's own "exit_date" field, so the report can show both the
+    model's rough guess and the independently-derived window side by side.
+
+    Must run AFTER _attach_risk_plan (needs _atr_risk_plan) and BEFORE
+    _verify_stock_claims (whose sanity-bounds check references the window
+    when flagging an aggressive upside target -- see _verify_sanity_bounds).
+    """
+    if not HORIZON_STRETCH_ENABLED:
+        for s in stocks:
+            s["_horizon_window"] = None
+        return stocks
+
+    for s in stocks:
+        plan = s.get("_atr_risk_plan") or {}
+        atr_weekly = plan.get("atr_weekly")
+        latest_close = plan.get("latest_close")
+        target_pct = _parse_first_number(s.get("target1_pct")) or _parse_first_number(s.get("upside_target_pct"))
+
+        if not atr_weekly or not latest_close or not target_pct or target_pct <= 0:
+            s["_horizon_window"] = None
+            continue
+
+        weekly_pct_move = (atr_weekly / latest_close) * 100
+        if weekly_pct_move <= 0:
+            s["_horizon_window"] = None
+            continue
+
+        # Straight-line estimate of how many weeks it takes THIS stock, at
+        # its own typical weekly ATR-based move, to cover the distance to
+        # target -- then buffered upward for the upper bound since price
+        # doesn't move in a straight line every week, and clamped to a sane
+        # floor/ceiling so extreme inputs can't produce a nonsensical window.
+        weeks_needed = target_pct / weekly_pct_move
+        min_months = weeks_needed / 4.345  # average weeks per month
+        max_months = min_months * HORIZON_BUFFER_MULTIPLIER
+
+        min_months = max(HORIZON_FLOOR_MONTHS, min(min_months, HORIZON_CEILING_MONTHS))
+        max_months = max(min_months + 0.5, min(max_months, HORIZON_CEILING_MONTHS))
+
+        s["_horizon_window"] = {
+            "min_months": round(min_months, 1),
+            "max_months": round(max_months, 1),
+            "weekly_pct_move": round(weekly_pct_move, 2),
+            "weeks_needed_at_atr_pace": round(weeks_needed, 1),
+        }
+    return stocks
+
+
+def _horizon_window_display(stock):
+    window = stock.get("_horizon_window")
+    if not window:
+        return (
+            '<span style="color:#8A8F9C;">Could not compute (needs both a target % and ATR '
+            "data) -- see the model's own Exit Date estimate above instead.</span>"
+        )
+    return (
+        f'{window["min_months"]:g}&ndash;{window["max_months"]:g} months '
+        f'<span style="color:#8A8F9C;">(target implies &asymp;{window["weeks_needed_at_atr_pace"]:g} weeks '
+        f'at this stock&rsquo;s own {window["weekly_pct_move"]:g}%/week ATR pace)</span>'
+    )
+
+
+def _apply_confidence_sizing(watchlist):
+    """
+    Scales position size down for every watchlist-tier stock by
+    WATCHLIST_POSITION_SIZE_MULTIPLIER (default: half) instead of loosening
+    any entry filter to admit more close-but-imperfect candidates at full
+    size -- see that constant's docstring above. Must run AFTER
+    _split_qualifying (only applies to the watchlist tier) and after
+    MAX_POSITION_SIZE_PCT's cap has already been applied in
+    _passes_professional_quality_gate, so a watchlist stock's size is always
+    scaled down from whatever already survived that cap -- never larger
+    than a strict-tier stock's.
+
+    Scales two independent things that both represent position size and
+    would otherwise drift out of sync in the report:
+    1. allocation_pct -- the model's own flat %.
+    2. _atr_risk_plan's shares_for_1pct_risk / position_value_for_1pct_risk
+       -- the independently-computed ATR-based share count (see
+       _attach_risk_plan). Both need to move together, or the report would
+       show a halved % next to a full-size share count.
+    """
+    if WATCHLIST_POSITION_SIZE_MULTIPLIER >= 1.0:
+        return watchlist
+
+    for s in watchlist:
+        alloc = _parse_first_number(s.get("allocation_pct"))
+        if alloc is not None:
+            s["allocation_pct"] = f"{alloc * WATCHLIST_POSITION_SIZE_MULTIPLIER:g}%"
+
+        plan = s.get("_atr_risk_plan")
+        if plan and plan.get("shares_for_1pct_risk") is not None:
+            try:
+                plan["shares_for_1pct_risk"] = int(plan["shares_for_1pct_risk"] * WATCHLIST_POSITION_SIZE_MULTIPLIER)
+                if plan.get("position_value_for_1pct_risk") is not None:
+                    plan["position_value_for_1pct_risk"] = (
+                        plan["position_value_for_1pct_risk"] * WATCHLIST_POSITION_SIZE_MULTIPLIER
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        s["_confidence_sizing_note"] = (
+            f"Watchlist tier -- position size cut to {WATCHLIST_POSITION_SIZE_MULTIPLIER:g}x strict sizing. "
+            "Entry filters were NOT relaxed to admit this candidate; only size was, to limit exposure "
+            "to a still-forming setup while still getting some exposure to it."
+        )
+    return watchlist
+
+
 def _parse_first_number(value):
     if value is None:
         return None
@@ -1350,11 +1677,56 @@ def _fetch_weekly_technicals(ticker):
         return result
 
 
+def _fetch_price_history_secondary(ticker):
+    """
+    Backfill data source for OHLC price history, tried only when the
+    primary fetch_stock_data() source (services.stock_fetcher) fails
+    outright -- i.e. call_with_retries already exhausted its 5 attempts
+    against transient errors and still came back empty -- rather than for
+    every call. Goes directly through yfinance's own daily history() call,
+    on the same shared session + process-wide throttle _fetch_fundamentals
+    already uses (utils/yf_throttle.py), so it's independent of whatever
+    fetch_stock_data wraps internally: an outage or bug specific to that
+    ONE source no longer permanently disqualifies a stock on "technicals
+    could not be verified" when a second source would have real data (seen
+    in practice for names like Persistent Systems / Coforge, which have
+    perfectly ordinary price history everywhere else). Returns a DataFrame
+    with a lowercase "close" column indexed by date, or None if this
+    source also fails.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    def _raw():
+        yt = yf.Ticker(ticker, session=get_shared_session())
+        hist = yt.history(period="2y", interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            return None
+        hist = hist.rename(columns={c: c.lower() for c in hist.columns})
+        return hist[["close"]] if "close" in hist.columns else None
+
+    try:
+        return call_with_retries(_raw, max_attempts=3)
+    except Exception as e:
+        log.warning(f"Secondary (yfinance) price-history source also failed for '{ticker}': {e}")
+        return None
+
+
 def _fetch_weekly_technicals_uncached(ticker):
     try:
+        used_secondary_source = False
         df = call_with_retries(lambda: fetch_stock_data(ticker), max_attempts=5)
-        if df is None or len(df) < 30 or "close" not in df.columns:
-            return None
+        if df is None or len(df) < 30 or "close" not in getattr(df, "columns", []):
+            log.info(
+                f"Primary price-history source failed/insufficient for '{ticker}' -- "
+                "trying secondary (yfinance) source before giving up."
+            )
+            df = _fetch_price_history_secondary(ticker)
+            used_secondary_source = df is not None
+            if df is None or len(df) < 30 or "close" not in df.columns:
+                return None
 
         if not isinstance(df.index, pd.DatetimeIndex):
             date_col = next((c for c in df.columns if c.lower() == "date"), None)
@@ -1366,19 +1738,27 @@ def _fetch_weekly_technicals_uncached(ticker):
         if len(close) < 30:
             return None
 
+        # Daily 50-day SMA -- used for the uptrend filter, loosened from a
+        # stricter "price above BOTH the 20-week and 50-week SMA" structure
+        # down to simply "price above its 50-day MA" (see _verify_technicals).
+        # Computed on the raw daily series so it's checkable with far less
+        # history (50 daily sessions is ~10 weeks) than the weekly RSI/MACD
+        # below need, and independent of the weekly-history gate further down.
+        latest_close_daily = round(float(close.iloc[-1]), 2)
+        sma50d = round(float(close.rolling(50).mean().iloc[-1]), 2) if len(close) >= 50 else None
+
         weekly_close = close.resample("W").last().dropna()
         # Drop current incomplete week to avoid distorted signals
         if len(weekly_close) > 1 and weekly_close.index[-1] > pd.Timestamp.now(tz=weekly_close.index.tz) - pd.Timedelta(days=2):
             weekly_close = weekly_close.iloc[:-1]
         if len(weekly_close) < 55:
-            result = {"insufficient_history": True, "weeks_available": len(weekly_close)}
-            if len(weekly_close) >= 20:
-                result["sma20w"] = round(float(weekly_close.rolling(20).mean().iloc[-1]), 2)
-                result["latest_close"] = round(float(weekly_close.iloc[-1]), 2)
-            return result
-
-        sma20w = weekly_close.rolling(20).mean()
-        sma50w = weekly_close.rolling(50).mean()
+            return {
+                "insufficient_history": True,
+                "weeks_available": len(weekly_close),
+                "latest_close": latest_close_daily,
+                "sma50d": sma50d,
+                "used_secondary_source": used_secondary_source,
+            }
 
         delta = weekly_close.diff()
         gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
@@ -1390,8 +1770,17 @@ def _fetch_weekly_technicals_uncached(ticker):
         ema26 = weekly_close.ewm(span=26, adjust=False).mean()
         macd = ema12 - ema26
         macd_signal = macd.ewm(span=9, adjust=False).mean()
+        macd_hist = macd - macd_signal
 
-        # Check for recent bullish MACD crossover (within last 3 bars)
+        # MACD bullish signal, broadened beyond "just crossed over": a fresh
+        # bullish crossover (within last 3 bars) is still one qualifying
+        # path, but so is simply being above signal right now, or the
+        # histogram having risen for 2+ consecutive weekly sessions (i.e.
+        # momentum building even before/without a crossover). Requiring a
+        # FRESH crossover specifically was too narrow -- a stock that
+        # crossed over 4 weeks ago and has stayed above signal since is
+        # still bullish, it just doesn't get penalized for the crossover
+        # itself being "stale".
         recent_bullish_crossover = False
         for i in range(-1, -4, -1):
             try:
@@ -1401,19 +1790,56 @@ def _fetch_weekly_technicals_uncached(ticker):
             except IndexError:
                 break
 
+        # "Above signal" is now read off the average MACD-vs-signal spread
+        # over the last MULTI_SESSION_CONFIRMATION_WINDOW weekly sessions
+        # (default 3), not a single session's snapshot -- see that
+        # constant's docstring. A stock that's genuinely above signal stays
+        # above signal on average; a stock that's only above signal because
+        # of one noisy session's close correctly stops qualifying here,
+        # without touching the 0-line threshold itself.
+        window = min(MULTI_SESSION_CONFIRMATION_WINDOW, len(macd))
+        spread_recent = (macd - macd_signal).iloc[-window:]
+        macd_above_signal = bool(spread_recent.mean() > 0) if len(spread_recent) > 0 else bool(macd.iloc[-1] > macd_signal.iloc[-1])
+
+        histogram_rising_2session = False
+        if len(macd_hist) >= 3:
+            try:
+                histogram_rising_2session = bool(
+                    macd_hist.iloc[-1] > macd_hist.iloc[-2] > macd_hist.iloc[-3]
+                )
+            except IndexError:
+                histogram_rising_2session = False
+
+        macd_bullish_signal = recent_bullish_crossover or macd_above_signal or histogram_rising_2session
+
+        # RSI is likewise read as an average over the same
+        # MULTI_SESSION_CONFIRMATION_WINDOW sessions rather than the single
+        # latest session -- this is purely a noise-reduction change to WHAT
+        # gets compared against MIN_RSI_OVERSOLD/MAX_RSI_OVERBOUGHT in
+        # _verify_technicals; those threshold values themselves are
+        # untouched, so the bar isn't loosened, just the reading of where a
+        # stock sits relative to it is steadier. rsi14w_latest keeps the
+        # single-session snapshot available for display/debugging.
+        rsi_valid = rsi.dropna()
+        rsi_window = rsi_valid.iloc[-window:] if len(rsi_valid) > 0 else rsi_valid
+        rsi_avg = rsi_window.mean() if len(rsi_window) > 0 else None
         rsi_now = rsi.iloc[-1]
         rsi_prev = rsi.iloc[-3] if len(rsi) > 3 else None
 
         return {
             "insufficient_history": False,
-            "latest_close": round(float(weekly_close.iloc[-1]), 2),
-            "sma20w": round(float(sma20w.iloc[-1]), 2),
-            "sma50w": round(float(sma50w.iloc[-1]), 2),
-            "rsi14w": round(float(rsi_now), 1) if pd.notna(rsi_now) else None,
+            "latest_close": latest_close_daily,
+            "sma50d": sma50d,
+            "rsi14w": round(float(rsi_avg), 1) if rsi_avg is not None and pd.notna(rsi_avg) else None,
+            "rsi14w_latest": round(float(rsi_now), 1) if pd.notna(rsi_now) else None,
             "rsi14w_prev": round(float(rsi_prev), 1) if rsi_prev is not None and pd.notna(rsi_prev) else None,
             "macd": round(float(macd.iloc[-1]), 3),
             "macd_signal": round(float(macd_signal.iloc[-1]), 3),
             "recent_bullish_crossover": recent_bullish_crossover,
+            "macd_above_signal": macd_above_signal,
+            "histogram_rising_2session": histogram_rising_2session,
+            "macd_bullish_signal": macd_bullish_signal,
+            "used_secondary_source": used_secondary_source,
         }
     except Exception as e:
         log.warning(f"Could not compute weekly technicals for '{ticker}': {e}")
@@ -1429,44 +1855,105 @@ def _verify_technicals(stock):
     tech = _fetch_weekly_technicals(ticker)
     if tech is None:
         return [("Technicals could not be independently verified (price history fetch failed).", "nodata")]
-    if tech.get("insufficient_history"):
-        notes = [(
-            f"Only {tech.get('weeks_available')} weeks of price history available -- "
-            "not enough to verify the 50-week SMA, RSI, or MACD; those claims are "
-            "unverified.", "soft"
-        )]
-        # Even with <55 weeks we may still have enough for the 20-week SMA
-        # (_fetch_weekly_technicals populates it once >=20 weeks are available)
-        # -- that much is checkable, so don't leave it as a blanket "unverified".
-        # Only enforced when REQUIRE_UPTREND_FILTER is true (default).
-        if REQUIRE_UPTREND_FILTER and tech.get("sma20w") is not None and tech.get("latest_close") is not None:
-            if tech["latest_close"] < tech["sma20w"]:
-                notes.append((
-                    f"Price ({tech['latest_close']}) is BELOW the 20-week SMA "
-                    f"({tech['sma20w']}) -- contradicts the required uptrend filter "
-                    "(this much is checkable even with limited history).", "hard"
-                ))
-        return notes
 
     notes = []
-    price = tech["latest_close"]
+
+    if tech.get("used_secondary_source"):
+        notes.append((
+            "Price history came from the secondary (yfinance) backfill source -- the primary "
+            "source failed for this ticker after retries -- see _fetch_price_history_secondary.",
+            "soft",
+        ))
+
+    # Uptrend filter: a single "price above its 50-day MA" check, checkable
+    # off the daily series regardless of whether there's enough weekly
+    # history for RSI/MACD below.
     if REQUIRE_UPTREND_FILTER:
-        if price < tech["sma50w"]:
-            notes.append((f"Price ({price}) is BELOW the 50-week SMA ({tech['sma50w']}) -- major uptrend filter failed.", "hard"))
-        elif price < tech["sma20w"]:
-            notes.append((f"Price ({price}) is below the 20-week SMA ({tech['sma20w']}) -- pullback setup near 50-week SMA support.", "soft"))
+        price = tech.get("latest_close")
+        sma50d = tech.get("sma50d")
+        if price is None or sma50d is None:
+            notes.append(("Not enough daily price history (<50 sessions) to verify the 50-day MA uptrend filter -- unverified.", "soft"))
+        elif price < sma50d:
+            notes.append((f"Price ({price}) is BELOW its 50-day MA ({sma50d}) -- uptrend filter failed.", "hard"))
+
+    if tech.get("insufficient_history"):
+        notes.append((
+            f"Only {tech.get('weeks_available')} weeks of price history available -- "
+            "not enough to verify weekly RSI or MACD; those claims are unverified.", "soft"
+        ))
+        return notes
 
     if tech["rsi14w"] is not None:
         if tech["rsi14w"] >= MAX_RSI_OVERBOUGHT:
-            notes.append((f"Weekly RSI is {tech['rsi14w']} (>={_fmt_num(MAX_RSI_OVERBOUGHT)}, overbought) -- contradicts the 'RSI below {_fmt_num(MAX_RSI_OVERBOUGHT)}' requirement.", "hard"))
-        if tech.get("rsi14w_prev") is not None and tech["rsi14w"] < tech["rsi14w_prev"]:
-            notes.append((f"Weekly RSI is falling ({tech['rsi14w_prev']} to {tech['rsi14w']}), not rising as the strategy requires.", "soft"))
+            notes.append((f"Weekly RSI (avg of last {MULTI_SESSION_CONFIRMATION_WINDOW} sessions) is {tech['rsi14w']} (>={_fmt_num(MAX_RSI_OVERBOUGHT)}, overbought) -- outside the {_fmt_num(MIN_RSI_OVERSOLD)}-{_fmt_num(MAX_RSI_OVERBOUGHT)} band the strategy requires.", "hard"))
+        elif tech["rsi14w"] < MIN_RSI_OVERSOLD:
+            notes.append((f"Weekly RSI (avg of last {MULTI_SESSION_CONFIRMATION_WINDOW} sessions) is {tech['rsi14w']} (<{_fmt_num(MIN_RSI_OVERSOLD)}) -- outside the {_fmt_num(MIN_RSI_OVERSOLD)}-{_fmt_num(MAX_RSI_OVERBOUGHT)} band the strategy requires.", "hard"))
+        # Day-to-day direction (rising/falling) no longer matters -- any RSI
+        # inside the band qualifies regardless of which way it moved since
+        # the prior weekly bar.
 
-    if not tech.get("recent_bullish_crossover"):
-        if tech["macd"] < tech["macd_signal"]:
-            notes.append(("MACD line is currently below its signal line -- consolidation phase prior to bullish momentum crossover.", "soft"))
-        else:
-            notes.append(("MACD line is above signal, but no recent bullish crossover (within last 3 bars) detected.", "soft"))
+    if not tech.get("macd_bullish_signal"):
+        notes.append((
+            "MACD line is below its signal line and the histogram hasn't been "
+            "rising for 2+ consecutive weekly sessions -- bullish MACD signal "
+            "(above signal, rising histogram, or a fresh crossover) not yet met.",
+            "soft",
+        ))
+
+    return notes
+
+
+def _verify_relative_strength_override(stock):
+    """
+    Substitute, per-stock gate used ONLY for a run where the broad
+    market-regime gate failed AND REGIME_OVERRIDE_ON_RS is enabled (see
+    run() and REGIME_OVERRIDE_ON_RS's docstring above). This is what "the
+    stock's own trend is strong enough to override a failed regime gate"
+    actually checks: a materially stronger uptrend (price well above its
+    50-day MA, by REGIME_OVERRIDE_SMA50D_MARGIN_PCT) AND a stronger weekly
+    RSI floor (REGIME_OVERRIDE_MIN_RSI) than the normal filters require.
+
+    Always returns "hard" notes (or none) -- deliberately an absolute
+    blocker, not a core filter eligible for MIN_CORE_FILTERS_REQUIRED
+    slack or the composite-score override, since it exists specifically to
+    replace the market-wide check being skipped for this stock.
+    """
+    ticker = (stock.get("ticker") or "").strip()
+    if not ticker:
+        return [("No ticker provided -- relative-strength override could not be verified.", "hard")]
+
+    tech = _fetch_weekly_technicals(ticker)
+    if tech is None or tech.get("insufficient_history"):
+        return [(
+            "Market-regime gate failed this run, and the relative-strength override "
+            f"requires verified weekly technicals to grant an exception for '{ticker}' -- "
+            "none available, so no override is granted.", "hard"
+        )]
+
+    # NOTE: phrasing below deliberately avoids the literal substrings
+    # "50-day MA" and "RSI" that _classify_core_filter() scans for -- this
+    # override is meant to be an absolute blocker, not something that gets
+    # (mis)classified as one of the five negotiable core filters just
+    # because it also looks at price-vs-moving-average and momentum.
+    notes = []
+    price = tech.get("latest_close")
+    sma50d = tech.get("sma50d")
+    required_price = sma50d * (1 + REGIME_OVERRIDE_SMA50D_MARGIN_PCT / 100.0) if sma50d else None
+    if price is None or required_price is None or price < required_price:
+        notes.append((
+            f"Relative-strength override requires price at least "
+            f"{_fmt_num(REGIME_OVERRIDE_SMA50D_MARGIN_PCT)}% above its 50-day moving average (a "
+            "materially stronger uptrend than the normal filter) since the broad market-regime "
+            "gate failed this run -- not met.", "hard"
+        ))
+
+    momentum = tech.get("rsi14w")
+    if momentum is None or momentum < REGIME_OVERRIDE_MIN_RSI:
+        notes.append((
+            f"Relative-strength override requires a weekly momentum reading >= "
+            f"{_fmt_num(REGIME_OVERRIDE_MIN_RSI)} (stronger than the normal band) since the "
+            f"broad market-regime gate failed this run -- not met (reading: {momentum}).", "hard"
+        ))
 
     return notes
 
@@ -1529,32 +2016,51 @@ def _fetch_fundamentals_uncached(ticker):
             "roe": info.get("returnOnEquity"),
             "revenue_growth_yoy": None,
             "profit_growth_yoy": None,
+            "growth_basis": None,
         }
         try:
             qf = yt.quarterly_financials  # rows = line items, cols = quarter-end dates, most-recent first
             if qf is not None and not qf.empty and qf.shape[1] >= 2:
-                year_ago_idx = _find_year_ago_index(list(qf.columns))
-                if year_ago_idx is None:
+                columns = list(qf.columns)
+                periods = _growth_lookback_periods(columns, GROWTH_LOOKBACK_MODE)
+                if periods is None and GROWTH_LOOKBACK_MODE != "yoy":
+                    log.info(
+                        f"'{ticker}': not enough quarterly history for "
+                        f"GROWTH_LOOKBACK_MODE='{GROWTH_LOOKBACK_MODE}' -- falling back "
+                        "to a plain YoY comparison for this ticker only."
+                    )
+                    periods = _growth_lookback_periods(columns, "yoy")
+                if periods is None:
                     log.warning(
                         f"'{ticker}': no quarterly_financials column falls within "
                         "45 days of 1 year before the latest quarter -- skipping "
-                        "YoY growth calc (irregular/missing quarterly history) "
+                        "growth calc (irregular/missing quarterly history) "
                         "rather than comparing against the wrong period."
                     )
                 else:
+                    current_idxs, prior_idxs, basis = periods
                     revenue_row = next((r for r in qf.index if "total revenue" in r.lower()), None)
                     income_row = next((r for r in qf.index if r.lower() == "net income"), None)
+
+                    def _period_sum(row):
+                        current_vals = qf.loc[row].iloc[current_idxs]
+                        prior_vals = qf.loc[row].iloc[prior_idxs]
+                        if current_vals.isna().any() or prior_vals.isna().any():
+                            return None, None
+                        return float(current_vals.sum()), float(prior_vals.sum())
+
                     if revenue_row is not None:
-                        latest, year_ago = qf.loc[revenue_row].iloc[0], qf.loc[revenue_row].iloc[year_ago_idx]
-                        if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                        latest, year_ago = _period_sum(revenue_row)
+                        if latest is not None and year_ago not in (None, 0):
                             result["revenue_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
                     if income_row is not None:
-                        latest, year_ago = qf.loc[income_row].iloc[0], qf.loc[income_row].iloc[year_ago_idx]
-                        if year_ago and year_ago != 0 and pd.notna(latest) and pd.notna(year_ago):
+                        latest, year_ago = _period_sum(income_row)
+                        if latest is not None and year_ago not in (None, 0):
                             if year_ago <= 0 or latest <= 0:
                                 result["profit_growth_yoy"] = None  # Turnaround case, not standard growth
                             else:
                                 result["profit_growth_yoy"] = round(((latest - year_ago) / abs(year_ago)) * 100, 1)
+                    result["growth_basis"] = basis
             elif qf is None or qf.empty:
                 pass
         except Exception as e:
@@ -1590,6 +2096,48 @@ def _find_year_ago_index(columns, tolerance_days=45):
         if diff <= tolerance_days and (best_diff is None or diff < best_diff):
             best_idx, best_diff = i, diff
     return best_idx
+
+
+def _growth_lookback_periods(columns, mode):
+    """
+    Returns (current_idxs, prior_idxs, basis_label) -- positional indices
+    into `columns` (quarterly_financials' most-recent-first column order)
+    to sum for the "current" and "prior" side of a growth comparison, plus
+    a short human-readable label for the basis used. Returns None if there
+    isn't enough quarterly history for the requested mode, so callers can
+    fall back (or skip) rather than compute against a mismatched/incomplete
+    period. See GROWTH_LOOKBACK_MODE's docstring above for the rationale.
+
+    "yoy": single latest quarter vs. whichever column falls closest to 1
+    year before it (_find_year_ago_index) -- the original behavior.
+
+    "trailing_2q": sum of the latest 2 quarters vs. the 2 quarters
+    bracketing the point 1 year ago -- smooths a single weak quarter by
+    averaging it against its neighbor on both sides of the comparison.
+
+    "ttm": trailing-twelve-months (latest 4 quarters) vs. the prior TTM
+    (the 4 quarters before that) -- needs 8+ quarters of history, which
+    yfinance's quarterly_financials often doesn't expose; a None return
+    here is expected and callers should fall back to "yoy" per-ticker.
+    """
+    if mode == "trailing_2q":
+        if len(columns) < 2:
+            return None
+        year_ago_idx = _find_year_ago_index(columns)
+        if year_ago_idx is None or year_ago_idx < 1:
+            return None
+        return [0, 1], [year_ago_idx - 1, year_ago_idx], "trailing 2-quarter"
+    if mode == "ttm":
+        if len(columns) < 8:
+            return None
+        return [0, 1, 2, 3], [4, 5, 6, 7], "trailing-twelve-month"
+    # "yoy" (default / fallback)
+    if len(columns) < 2:
+        return None
+    year_ago_idx = _find_year_ago_index(columns)
+    if year_ago_idx is None:
+        return None
+    return [0], [year_ago_idx], "YoY"
 
 
 # Growth this far above the mandatory threshold is disproportionately
@@ -1664,8 +2212,9 @@ def _check_anomalous_growth(ticker, data):
 def _verify_fundamentals(stock):
     """
     Independently checks the prompt's mandatory fundamentals filters
-    (low debt-to-equity, high/improving ROE, >=20% YoY revenue and
-    profit growth) against real data instead of trusting the model's
+    (low debt-to-equity, high/improving ROE, >=MIN_GROWTH_YOY_PCT% YoY
+    revenue OR profit growth -- only one of the two needs to clear the
+    bar, not both) against real data instead of trusting the model's
     fundamental narrative. Returns a list of (note_text, severity) tuples.
     """
     ticker = (stock.get("ticker") or "").strip()
@@ -1716,17 +2265,23 @@ def _verify_fundamentals(stock):
 
     rev_g = data.get("revenue_growth_yoy")
     profit_g = data.get("profit_growth_yoy")
+    basis = data.get("growth_basis")
+    # Note text below always keeps the literal "growth YoY is X%" phrasing
+    # regardless of GROWTH_LOOKBACK_MODE -- _metric_patterns() regex-parses
+    # that exact substring for rejection-history logging, so the basis is
+    # disclosed as a suffix after the number instead of changing the label.
+    basis_suffix = f" (computed on a {basis} basis)" if basis and basis != "YoY" else ""
     growths = [g for g in (rev_g, profit_g) if g is not None]
     if growths:
         best_growth = max(growths)
         if best_growth < MIN_GROWTH_YOY_PCT:
-            notes.append((f"Neither revenue growth ({rev_g}%) nor net profit growth ({profit_g}%) meets the {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY threshold.", "hard"))
+            notes.append((f"Neither revenue growth ({rev_g}%) nor net profit growth ({profit_g}%) meets the {_fmt_num(MIN_GROWTH_YOY_PCT)}% threshold{basis_suffix}.", "hard"))
         elif rev_g is not None and rev_g < MIN_GROWTH_YOY_PCT:
-            notes.append((f"Revenue growth YoY is {rev_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%), but net profit growth YoY is {profit_g}% (qualifies on profit growth).", "soft"))
+            notes.append((f"Revenue growth YoY is {rev_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%){basis_suffix}, but net profit growth YoY is {profit_g}% (qualifies on profit growth).", "soft"))
         elif profit_g is not None and profit_g < MIN_GROWTH_YOY_PCT:
-            notes.append((f"Net profit growth YoY is {profit_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%), but revenue growth YoY is {rev_g}% (qualifies on revenue growth).", "soft"))
+            notes.append((f"Net profit growth YoY is {profit_g}% (below {_fmt_num(MIN_GROWTH_YOY_PCT)}%){basis_suffix}, but revenue growth YoY is {rev_g}% (qualifies on revenue growth).", "soft"))
     else:
-        notes.append(("YoY growth could not be computed (insufficient quarterly history from data provider).", "soft"))
+        notes.append(("Growth could not be computed (insufficient quarterly history from data provider).", "soft"))
 
     notes.extend(_check_anomalous_growth(ticker, data))
 
@@ -1750,7 +2305,7 @@ def _prefilter_by_fundamentals(candidates):
 
     A candidate is also rejected here if fundamentals data couldn't be
     fetched at all (severity "nodata", e.g. yfinance has no such ticker) --
-    this stage exists specifically to confirm >=20% YoY growth, and "no data
+    this stage exists specifically to confirm >=MIN_GROWTH_YOY_PCT% YoY growth, and "no data
     to confirm it with" is functionally the same failure as "confirmed and
     it's below threshold". It's also usually a sign the ticker itself is
     wrong/hallucinated rather than a transient data-provider hiccup, so
@@ -1775,6 +2330,41 @@ def _prefilter_by_fundamentals(candidates):
     return qualified, rejected
 
 
+def _load_extra_universe_tickers():
+    """
+    Optional supplement to swing_trade_universe.py's static seed list -- see
+    EXTRA_UNIVERSE_FILE's docstring above. Reads a CSV of
+    name,ticker,sector,bucket rows and returns them in the same 4-tuple
+    shape universe.tickers_for_sectors() yields, so the two sources can be
+    merged with identical dedupe/exclude handling. Best-effort: a missing,
+    unset, or malformed file is logged and treated as "no extra tickers"
+    rather than failing the run.
+    """
+    if not EXTRA_UNIVERSE_FILE:
+        return []
+    path = Path(EXTRA_UNIVERSE_FILE)
+    if not path.exists():
+        log.warning(f"EXTRA_UNIVERSE_FILE='{EXTRA_UNIVERSE_FILE}' does not exist -- ignoring.")
+        return []
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+    except OSError as e:
+        log.warning(f"Could not read EXTRA_UNIVERSE_FILE '{EXTRA_UNIVERSE_FILE}': {e}")
+        return []
+
+    out = []
+    for row in rows:
+        ticker = (row.get("ticker") or "").strip()
+        sector = (row.get("sector") or "").strip()
+        if not ticker or not sector:
+            continue
+        name = (row.get("name") or "").strip() or ticker
+        bucket = (row.get("bucket") or row.get("market_cap_bucket") or "?").strip()
+        out.append((name, ticker, sector, bucket))
+    return out
+
+
 def _deterministic_fundamentals_screen(sectors, exclude_tickers):
     """
     Stage-1 replacement for USE_DETERMINISTIC_SCREEN=true: iterates
@@ -1796,9 +2386,21 @@ def _deterministic_fundamentals_screen(sectors, exclude_tickers):
     qualified, rejected = [], []
     seen_this_call = set()
     
-    # Gather candidates
+    # Gather candidates: the static seed list first, then any widened
+    # supplement (see EXTRA_UNIVERSE_FILE) filtered to this attempt's
+    # sectors -- same dedupe/exclude rules for both sources so a ticker
+    # present in both is only checked once.
     candidates = []
     for name, ticker, sector, bucket in universe.tickers_for_sectors(sectors):
+        ticker_u = ticker.strip().upper()
+        if ticker_u in exclude_tickers or ticker_u in seen_this_call:
+            continue
+        seen_this_call.add(ticker_u)
+        candidates.append((name, ticker, sector, bucket))
+
+    for name, ticker, sector, bucket in _load_extra_universe_tickers():
+        if sector not in sectors:
+            continue
         ticker_u = ticker.strip().upper()
         if ticker_u in exclude_tickers or ticker_u in seen_this_call:
             continue
@@ -1864,7 +2466,12 @@ def _verify_sanity_bounds(stock):
 
     upside = _parse_first_number(stock.get("upside_target_pct"))
     if upside is not None and upside > 60:
-        notes.append((f"Upside target of {upside}% in a 3-5 month window is unusually aggressive -- treat as a stretch case, not a base case.", "soft"))
+        window = stock.get("_horizon_window")
+        horizon_clause = (
+            f"implied horizon ~{window['min_months']:g}-{window['max_months']:g} months at this stock's own ATR pace"
+            if window else "no computed horizon available to sanity-check the pace"
+        )
+        notes.append((f"Upside target of {upside}% ({horizon_clause}) is unusually aggressive -- treat as a stretch case, not a base case.", "soft"))
 
     risk_level = (stock.get("risk_level") or "").strip().lower()
     if risk_level not in ("medium", "high"):
@@ -1873,18 +2480,19 @@ def _verify_sanity_bounds(stock):
     return notes
 
 
-def _verify_stock_claims(stocks):
+def _verify_stock_claims(stocks, regime_override_active=False):
     for stock in stocks:
         rr_notes = _verify_risk_reward(stock)
         tech_notes = _verify_technicals(stock)
         fund_notes = _verify_fundamentals(stock)
         sanity_notes = _verify_sanity_bounds(stock)
+        rs_override_notes = _verify_relative_strength_override(stock) if regime_override_active else []
 
         price_missing = not stock.get("current_price_display")
         tech_no_data = any(sev == "nodata" for _, sev in tech_notes)
         fund_no_data = any(sev == "nodata" for _, sev in fund_notes)
 
-        notes = rr_notes + tech_notes + fund_notes + sanity_notes
+        notes = rr_notes + tech_notes + fund_notes + sanity_notes + rs_override_notes
         if price_missing:
             notes.append(("Live quote lookup failed for this ticker -- confirm it's a real, currently-listed symbol before trading it.", "nodata"))
 
@@ -1956,8 +2564,40 @@ def _hard_contradictions(stock):
     return [n for n, sev in (stock.get("_verification_notes") or []) if sev == "hard"]
 
 
-def _passes_professional_quality_gate(stock):
-    notes = stock.get("_verification_notes") or []
+# The five CORE swing-setup filters -- see MIN_CORE_FILTERS_REQUIRED's
+# docstring above. Matched by keyword against the hard-note text each
+# verifier already produces, in the same spirit as _metric_patterns().
+# A hard note matching none of these (debt-to-equity, ROE, missing price,
+# hallucinated ticker, position sizing, etc.) is NOT a core filter and
+# always blocks regardless of MIN_CORE_FILTERS_REQUIRED or a high
+# composite score -- see _split_qualifying.
+_CORE_FILTER_KEYWORDS = (
+    ("uptrend", ("50-day MA",)),
+    ("rsi", ("RSI",)),
+    ("macd", ("MACD",)),
+    ("growth", ("revenue growth", "profit growth")),
+    ("risk_reward", ("Risk:reward", "risk:reward")),
+)
+
+
+def _classify_core_filter(note_text):
+    """Returns the core-filter name a hard note belongs to, or None if it's
+    outside the five-filter flexibility (see _CORE_FILTER_KEYWORDS)."""
+    for name, keywords in _CORE_FILTER_KEYWORDS:
+        if any(kw in note_text for kw in keywords):
+            return name
+    return None
+
+
+def _passes_professional_quality_gate(stock, enforce_composite_floor=True):
+    """
+    enforce_composite_floor=False is used for the watchlist tier (see
+    _split_qualifying): a watchlist candidate is EXPECTED to score lower
+    than MIN_COMPOSITE_SCORE (that's part of why it's watchlist and not
+    strict), so that floor doesn't apply there -- but the live-price data-
+    integrity check and the position-size cap always still apply to any
+    stock reaching this function, strict or watchlist.
+    """
     if not stock.get("current_price_display"):
         return False, "Missing a verified live price for the trade setup"
 
@@ -1967,35 +2607,107 @@ def _passes_professional_quality_gate(stock):
         stock["allocation_pct"] = f"{MAX_POSITION_SIZE_PCT:g}%"
         stock["_position_cap_applied"] = True
 
-    composite = stock.get("_composite_score")
-    if composite is not None and composite < MIN_COMPOSITE_SCORE:
-        return False, f"Composite score {composite:.1f}/100 is below the threshold of {MIN_COMPOSITE_SCORE:.1f}/100"
+    if enforce_composite_floor:
+        composite = stock.get("_composite_score")
+        if composite is not None and composite < MIN_COMPOSITE_SCORE:
+            return False, f"Composite score {composite:.1f}/100 is below the threshold of {MIN_COMPOSITE_SCORE:.1f}/100"
 
     return True, None
 
 
 def _split_qualifying(stocks):
     """
-    Splits verified stocks into (qualifying, rejected). A stock qualifies only if
-    it has zero 'hard' contradictions -- i.e. nothing in its own strategy's
-    mandatory filters (uptrend, RSI/MACD, growth thresholds, risk:reward minimum,
-    debt/ROE) was independently found to be false. 'Soft' notes (couldn't be
-    verified) are still disclosed in the report but don't block a recommendation.
+    Splits verified stocks into (qualifying, watchlist, rejected).
+
+    Previously a stock qualified only if it had ZERO 'hard' contradictions
+    anywhere. Now:
+
+    1. A hard contradiction OUTSIDE the five core setup filters (debt-to-
+       equity, ROE, missing price, hallucinated ticker, a failed
+       relative-strength override, etc. -- see _classify_core_filter)
+       always disqualifies into `rejected`, same as before. These are
+       basic quality/data-integrity/absolute checks, not part of the setup
+       itself, so they're never up for negotiation by either tier below.
+    2. Among the five core filters (uptrend, RSI, MACD, growth, risk:reward),
+       a stock qualifies STRICT if at least MIN_CORE_FILTERS_REQUIRED of
+       the 5 hard-pass -- i.e. up to (CORE_FILTER_COUNT -
+       MIN_CORE_FILTERS_REQUIRED) of them can hard-fail and it still
+       qualifies strict (default: any 3 of 5).
+    3. A stock that doesn't clear that core-filter bar can still qualify
+       STRICT via COMPOSITE_SCORE_CORE_FILTER_OVERRIDE: a sufficiently high
+       overall composite score (default >=70/100) is treated as strong
+       enough evidence on its own, even with more than one core filter
+       failing -- still subject to rule 1 above.
+    4. A stock that clears rule 1 (no absolute blocker) but misses both
+       rule 2 and rule 3 lands in WATCHLIST instead of rejected, provided
+       it's within WATCHLIST_EXTRA_CORE_FILTER_SLACK core filters of the
+       strict bar (default: one filter more than strict tolerates) and
+       WATCHLIST_TIER_ENABLED is on. This is "fails one filter but close"
+       -- shown as its own tier in the email rather than silently promoted
+       into strict or silently dropped. The composite-score floor
+       (MIN_COMPOSITE_SCORE) does NOT apply to this tier -- scoring below
+       that floor is expected for a watchlist candidate -- but the live-
+       price/data-integrity check and position-size cap still do.
+
+    'Soft' notes (couldn't be verified either way) never block, in any
+    tier.
     """
-    qualifying, rejected = [], []
+    qualifying, watchlist, rejected = [], [], []
     for s in stocks:
-        if _hard_contradictions(s):
+        hard_notes = _hard_contradictions(s)
+        non_core_failed = [n for n in hard_notes if _classify_core_filter(n) is None]
+        core_failed = {cat for cat in (_classify_core_filter(n) for n in hard_notes) if cat}
+
+        if non_core_failed:
             rejected.append(s)
             continue
-        if REQUIRE_PROFESSIONAL_QUALITY_GATE:
-            passes, reason = _passes_professional_quality_gate(s)
-            if not passes:
-                s.setdefault("_verification_notes", [])
-                s["_verification_notes"] = list(s.get("_verification_notes") or []) + [(reason, "hard")]
-                rejected.append(s)
+
+        core_passed = CORE_FILTER_COUNT - len(core_failed)
+        composite = s.get("_composite_score")
+        passes_core_filter_bar = core_passed >= MIN_CORE_FILTERS_REQUIRED
+        passes_composite_override = composite is not None and composite >= COMPOSITE_SCORE_CORE_FILTER_OVERRIDE
+
+        if passes_core_filter_bar or passes_composite_override:
+            if REQUIRE_PROFESSIONAL_QUALITY_GATE:
+                passes, reason = _passes_professional_quality_gate(s, enforce_composite_floor=True)
+                if not passes:
+                    s["_verification_notes"] = list(s.get("_verification_notes") or []) + [(reason, "hard")]
+                    rejected.append(s)
+                    continue
+            qualifying.append(s)
+            continue
+
+        watchlist_min_core_passed = MIN_CORE_FILTERS_REQUIRED - WATCHLIST_EXTRA_CORE_FILTER_SLACK
+        if WATCHLIST_TIER_ENABLED and core_passed >= watchlist_min_core_passed:
+            passes, reason = (True, None)
+            if REQUIRE_PROFESSIONAL_QUALITY_GATE:
+                passes, reason = _passes_professional_quality_gate(s, enforce_composite_floor=False)
+            if passes:
+                s["_watchlist_reason"] = (
+                    f"{core_passed}/{CORE_FILTER_COUNT} core setup filters passed this run "
+                    f"(strict needs {MIN_CORE_FILTERS_REQUIRED}/{CORE_FILTER_COUNT}) -- close, "
+                    "not a full qualifier."
+                )
+                watchlist.append(s)
                 continue
-        qualifying.append(s)
-    return qualifying, rejected
+            s["_verification_notes"] = list(s.get("_verification_notes") or []) + [(reason, "hard")]
+            rejected.append(s)
+            continue
+
+        composite_clause = (
+            f"composite score ({composite:.1f}/100) is below the "
+            f"{_fmt_num(COMPOSITE_SCORE_CORE_FILTER_OVERRIDE)}/100 override threshold"
+            if composite is not None else
+            "no composite score is available to fall back on"
+        )
+        note = (
+            f"Only {core_passed}/{CORE_FILTER_COUNT} core setup filters passed "
+            f"(needs {MIN_CORE_FILTERS_REQUIRED}/{CORE_FILTER_COUNT} for strict, "
+            f"{watchlist_min_core_passed}/{CORE_FILTER_COUNT} for watchlist), and {composite_clause}."
+        )
+        s["_verification_notes"] = list(s.get("_verification_notes") or []) + [(note, "hard")]
+        rejected.append(s)
+    return qualifying, watchlist, rejected
 
 
 def _verification_display(stock):
@@ -2071,7 +2783,7 @@ def _risk_reward_display(stock):
     return f'<strong>{html.escape(verified)}</strong>'
 
 
-def _render_one_stock_card(stock, idx, sans):
+def _render_one_stock_card(stock, idx, sans, tier_badge=None):
     def esc(v):
         v = "" if v is None else str(v).strip()
         return html.escape(v) if v else "—"
@@ -2102,7 +2814,8 @@ def _render_one_stock_card(stock, idx, sans):
         raw_row("Risk : Reward", _risk_reward_display),
         row("Allocation (% of capital)", "allocation_pct"),
         row("Entry Date (Targeted)", "entry_date"),
-        row("Exit Date (Expected)", "exit_date"),
+        row("Exit Date (Model's Estimate)", "exit_date"),
+        raw_row("Time Horizon (Target-Based)", _horizon_window_display),
         row("Strategy Type", "strategy_type"),
         row("Upside Target %", "upside_target_pct", value_color="#2F5233", bold=True),
         row("Stop-Loss %", "stop_loss_pct", value_color="#8B2E2E", bold=True),
@@ -2117,29 +2830,107 @@ def _render_one_stock_card(stock, idx, sans):
     name = esc(stock.get("name"))
     ticker = esc(stock.get("ticker"))
     rationale = esc(stock.get("rationale"))
+    badge_html = (
+        f' <span style="background:#B08D57;color:#14213D;border-radius:3px;padding:2px 7px;'
+        f'font-size:10px;font-weight:700;letter-spacing:0.03em;vertical-align:middle;">{html.escape(tier_badge)}</span>'
+        if tier_badge else ""
+    )
+    watchlist_reason_html = (
+        f'<div style="margin-top:6px;font-family:{sans};font-size:11px;color:#8A6D1E;">'
+        f'<strong>Why watchlist, not strict:</strong> {esc(stock.get("_watchlist_reason"))}</div>'
+        if stock.get("_watchlist_reason") else ""
+    )
+    sizing_note_html = (
+        f'<div style="margin-top:6px;font-family:{sans};font-size:11px;color:#8A6D1E;">'
+        f'<strong>Position sizing:</strong> {esc(stock.get("_confidence_sizing_note"))}</div>'
+        if stock.get("_confidence_sizing_note") else ""
+    )
 
     return f"""<div style="margin-top:{0 if idx == 0 else 22}px;">
 <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;border-collapse:collapse;">
-<tr style="background:#14213D;"><td colspan="2" style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">{idx + 1}. {name} <span style="color:#B08D57;">({ticker})</span></td></tr>
+<tr style="background:#14213D;"><td colspan="2" style="padding:9px 10px;font-family:{sans};font-size:11px;font-weight:700;color:#ffffff;text-transform:uppercase;letter-spacing:0.05em;">{idx + 1}. {name} <span style="color:#B08D57;">({ticker})</span>{badge_html}</td></tr>
 {rows}
 </table>
+{watchlist_reason_html}
+{sizing_note_html}
 <div style="margin-top:10px;font-family:{sans};font-size:12px;color:#4A5063;line-height:1.65;"><strong style="color:#14213D;">Investment Rationale:</strong> {rationale}</div>
 {_trade_execution_plan_html(stock, sans)}
 </div>"""
 
 
-def render_stock_table_html(stocks):
+def render_stock_table_html(stocks, tier_badge=None):
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     if not stocks:
         return _no_qualifying_stock_html([])
     return "".join(
-        _render_one_stock_card(stock, idx, sans) for idx, stock in enumerate(stocks)
+        _render_one_stock_card(stock, idx, sans, tier_badge=tier_badge) for idx, stock in enumerate(stocks)
     )
 
 
-def _choose_analysis_html(qualifying, candidates, rejected, require_qualifying_stock=True):
+def _watchlist_tier_html(watchlist):
+    """
+    Renders the watchlist tier as its own clearly-labeled section --
+    distinct from the strict-tier table above it (if any) and from the
+    cross-run near-miss CSV (_log_watchlist/_load_and_recheck_watchlist),
+    which is a separate mechanism for re-checking technical-only near-misses
+    on a FUTURE run. This is THIS run's "close, but not a full qualifier"
+    output.
+    """
+    if not watchlist:
+        return ""
+    sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+    header = (
+        f'<div style="margin-top:26px;padding:10px 16px;background:#FBF3DC;border:1px solid #E9DCB0;'
+        f'border-radius:4px;font-family:{sans};">'
+        f'<div style="font-size:11px;font-weight:700;color:#5C4A1E;text-transform:uppercase;'
+        f'letter-spacing:0.05em;">Watchlist Picks</div>'
+        f'<div style="margin-top:4px;font-size:12px;color:#5C4A1E;line-height:1.55;">'
+        "Close, but not full strict-tier qualifiers -- each one below failed at least one more "
+        "core setup filter than the strict bar allows (or scored below the composite floor), "
+        "with no absolute blocker (debt/equity, ROE, data integrity) against it. Treat these as "
+        "worth a second look, not a vetted recommendation."
+        "</div></div>"
+    )
+    return header + render_stock_table_html(watchlist, tier_badge="WATCHLIST")
+
+
+def _dedupe_and_rank_watchlist(watchlist, max_shown=5):
+    """De-dupes accumulated watchlist candidates (a ticker can surface more
+    than once across this run's attempts) by ticker, keeping the
+    best-scoring instance, then ranks by composite score (best first) and
+    caps the count shown in the email."""
+    best_by_ticker = {}
+    for s in watchlist:
+        ticker = (s.get("ticker") or "").strip().upper()
+        if not ticker:
+            continue
+        existing = best_by_ticker.get(ticker)
+        if existing is None or (s.get("_composite_score") or 0) > (existing.get("_composite_score") or 0):
+            best_by_ticker[ticker] = s
+    ranked = scoring.rank_by_composite(list(best_by_ticker.values())) if scoring.USE_COMPOSITE_SCORE else list(best_by_ticker.values())
+    return ranked[:max_shown]
+
+
+def _choose_analysis_html(qualifying, candidates, rejected, watchlist=None, require_qualifying_stock=True):
+    watchlist = watchlist or []
     if qualifying:
-        return render_stock_table_html(qualifying)
+        return render_stock_table_html(qualifying) + _watchlist_tier_html(watchlist)
+    if watchlist:
+        # No strict qualifier this run, but one or more close candidates
+        # exist -- surface them as the headline output instead of falling
+        # all the way back to "no qualifying trade found" (see
+        # WATCHLIST_TIER_ENABLED's docstring).
+        sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
+        note = (
+            f'<div style="font-family:{sans};font-size:13px;color:#14213D;line-height:1.65;'
+            f'padding:14px 16px;background:#F4F2ED;border-radius:4px;border:1px solid #E7E4DC;">'
+            "<strong>No strict qualifying trade found this run.</strong> "
+            f"{len(watchlist)} candidate(s) came close enough to land on the watchlist tier "
+            "below instead -- see each one's \"why watchlist, not strict\" note for exactly "
+            "what fell short."
+            "</div>"
+        )
+        return note + _watchlist_tier_html(watchlist)
     if require_qualifying_stock:
         return _no_qualifying_stock_html(rejected or candidates)
     return render_stock_table_html(candidates)
@@ -2154,16 +2945,24 @@ def _no_qualifying_stock_html(rejected):
     the bug this replaces.
     """
     sans = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
-    uptrend_phrase = "uptrend, " if REQUIRE_UPTREND_FILTER else ""
+    uptrend_phrase = "50-day MA uptrend, " if REQUIRE_UPTREND_FILTER else ""
     out = (
         f'<div style="font-family:{sans};font-size:13px;color:#14213D;line-height:1.65;'
         f'padding:14px 16px;background:#F4F2ED;border-radius:4px;border:1px solid #E7E4DC;">'
         "<strong>No qualifying trade found for this run.</strong> Every candidate considered "
-        f"failed at least one of the strategy's mandatory filters ({uptrend_phrase}rising RSI below {_fmt_num(MAX_RSI_OVERBOUGHT)}, "
-        f"bullish MACD crossover, &ge;{_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue/profit growth, or &ge;1:{_fmt_num(MIN_RISK_REWARD)} risk:reward) once "
-        "checked against independently-verified data, even after retrying with feedback. No pick is "
-        "being reported rather than recommending one that fails its own entry criteria."
-        "</div>"
+        f"failed too many of the five core setup filters ({uptrend_phrase}RSI {_fmt_num(MIN_RSI_OVERSOLD)}-{_fmt_num(MAX_RSI_OVERBOUGHT)}, "
+        f"bullish MACD signal, &ge;{_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue/profit growth, &ge;1:{_fmt_num(MIN_RISK_REWARD)} risk:reward -- "
+        f"fewer than {MIN_CORE_FILTERS_REQUIRED} of {CORE_FILTER_COUNT} passing, with no composite score reaching the "
+        f"{_fmt_num(COMPOSITE_SCORE_CORE_FILTER_OVERRIDE)}/100 override) or a non-negotiable check (debt/equity, ROE, or a "
+        "verifiable ticker) once checked against independently-verified data, even after retrying with feedback. No pick is "
+        "being reported rather than recommending one that fails its own entry criteria. "
+        + (
+            "No candidate was even close enough to land on the watchlist tier either "
+            f"(needs within {WATCHLIST_EXTRA_CORE_FILTER_SLACK} core filter(s) of the strict bar, no absolute blocker)."
+            if WATCHLIST_TIER_ENABLED else
+            "(WATCHLIST_TIER_ENABLED is off, so no near-miss tier was considered.)"
+        )
+        + "</div>"
     )
     if rejected:
         # Ranked by composite score (best near-misses first) rather than
@@ -2388,7 +3187,10 @@ def run():
     sources = []
     used_live_search = False
     all_rejected = []
+    all_watchlist = []  # accumulated across attempts -- see WATCHLIST_TIER_ENABLED
     qualifying = []  # default if every attempt "continue"s before ever assigning it
+    stocks = []  # default if every attempt "continue"s before ever assigning it
+    regime_override_active = False
     regime_ok, regime_detail = regime.check_market_regime()
     log.info(f"Market-regime check: {regime_detail}")
 
@@ -2409,23 +3211,38 @@ def run():
     # swing_trade_regime.py's env) to disable and fall back to the old
     # per-stock-only behavior.
     if regime.REQUIRE_MARKET_REGIME_FILTER and not regime_ok:
-        log.warning(
-            f"Market regime gate failed ({regime_detail.get('classification')}) -- "
-            "skipping this run's scan entirely rather than screening individual "
-            "stocks against an unfavorable broad-market backdrop."
-        )
-        analysis_html = (
-            _no_qualifying_stock_html([])
-            + regime.regime_note_html(regime_detail)
-        )
-        email_html = build_email_html(analysis_html, today_str, [], False, _adjustments_html(applied_adjustments))
-        if os.getenv("DRY_RUN", "false").lower() == "true":
-            with open("swing_trade_report.html", "w", encoding="utf-8") as f:
-                f.write(email_html)
-            log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
+        if REGIME_OVERRIDE_ON_RS:
+            # Explicit, opt-in exception (see REGIME_OVERRIDE_ON_RS's
+            # docstring above): don't skip the run -- proceed, but every
+            # candidate must additionally clear _verify_relative_strength_
+            # override in place of the market-wide check being skipped.
+            # This is what makes the existing fail-open behavior a
+            # deliberate rule instead of an accident.
+            regime_override_active = True
+            log.warning(
+                f"Market regime gate failed ({regime_detail.get('classification')}) -- "
+                "REGIME_OVERRIDE_ON_RS is enabled, so proceeding with the scan instead of "
+                "skipping the run. Every candidate this run must additionally clear a "
+                "stricter relative-strength bar in place of the market-wide check."
+            )
+        else:
+            log.warning(
+                f"Market regime gate failed ({regime_detail.get('classification')}) -- "
+                "skipping this run's scan entirely rather than screening individual "
+                "stocks against an unfavorable broad-market backdrop."
+            )
+            analysis_html = (
+                _no_qualifying_stock_html([])
+                + regime.regime_note_html(regime_detail)
+            )
+            email_html = build_email_html(analysis_html, today_str, [], False, _adjustments_html(applied_adjustments))
+            if os.getenv("DRY_RUN", "false").lower() == "true":
+                with open("swing_trade_report.html", "w", encoding="utf-8") as f:
+                    f.write(email_html)
+                log.info("DRY_RUN enabled -- wrote swing_trade_report.html instead of emailing.")
+                return
+            send_swing_trade_email(email_html)
             return
-        send_swing_trade_email(email_html)
-        return
 
     regime_softening = _regime_soften_growth_bar(regime_detail)
     if regime_softening:
@@ -2582,41 +3399,61 @@ def run():
 
         stocks = _attach_live_prices(stocks)
         stocks = _attach_risk_plan(stocks)
-        stocks = _verify_stock_claims(stocks)
-        qualifying, rejected = _split_qualifying(stocks)
+        stocks = _compute_flexible_horizon(stocks)
+        stocks = _verify_stock_claims(stocks, regime_override_active=regime_override_active)
+        qualifying, watchlist, rejected = _split_qualifying(stocks)
+        watchlist = _apply_confidence_sizing(watchlist)
 
-        # When enabled, rank qualifying candidates by composite score before
-        # the concentration cap below picks which one(s) to keep per sector --
-        # otherwise "which pick survives the cap" is just "whichever the
-        # model happened to list first" (review item 6).
+        # When enabled, rank qualifying (and watchlist) candidates by
+        # composite score before the concentration cap below picks which
+        # one(s) to keep per sector -- otherwise "which pick survives the
+        # cap" is just "whichever the model happened to list first"
+        # (review item 6).
         if scoring.USE_COMPOSITE_SCORE:
             qualifying = scoring.rank_by_composite(qualifying)
+            watchlist = scoring.rank_by_composite(watchlist)
 
         # Sector-concentration cap (review item 9): if this attempt's Stage 2
         # call returned multiple qualifying names, don't let several
         # same-sector picks (often the same underlying factor bet) all
-        # through in one run.
+        # through in one run. Applied to each tier independently so a
+        # crowded sector doesn't crowd out the OTHER tier's cap budget.
         qualifying, dropped_for_concentration = risk.apply_sector_concentration_cap(qualifying)
         for d in dropped_for_concentration:
             d["_verification_notes"] = (d.get("_verification_notes") or []) + [(d["_concentration_note"], "hard")]
         all_rejected.extend(dropped_for_concentration)
+
+        watchlist, watchlist_dropped_for_concentration = risk.apply_sector_concentration_cap(watchlist)
+        for d in watchlist_dropped_for_concentration:
+            d["_verification_notes"] = (d.get("_verification_notes") or []) + [(d["_concentration_note"], "hard")]
+        all_rejected.extend(watchlist_dropped_for_concentration)
+
         all_rejected.extend(rejected)
+        all_watchlist.extend(watchlist)
         seen_tickers.update(
             (s.get("ticker") or "").strip().upper() for s in rejected if s.get("ticker")
         )
 
         if qualifying or not REQUIRE_QUALIFYING_STOCK:
-            analysis_html = _choose_analysis_html(
-                qualifying=qualifying,
-                candidates=stocks,
-                rejected=rejected,
-                require_qualifying_stock=REQUIRE_QUALIFYING_STOCK,
-            )
             break
 
         log.info(
             f"Attempt {attempt}/{MAX_GENERATION_ATTEMPTS}: {len(rejected)} "
-            "candidate(s) failed independent verification at Stage 2."
+            "candidate(s) failed independent verification at Stage 2, "
+            f"{len(watchlist)} landed on the watchlist tier."
+        )
+
+    # De-dupe/rank the watchlist tier accumulated across every attempt this
+    # run made (a ticker can resurface across attempts) before it's shown.
+    all_watchlist = _dedupe_and_rank_watchlist(all_watchlist)
+
+    if analysis_html is None and (qualifying or all_watchlist or not REQUIRE_QUALIFYING_STOCK):
+        analysis_html = _choose_analysis_html(
+            qualifying=qualifying,
+            candidates=stocks,
+            rejected=all_rejected,
+            watchlist=all_watchlist,
+            require_qualifying_stock=REQUIRE_QUALIFYING_STOCK,
         )
 
     # Log regardless of whether this run ultimately found a qualifying stock --
@@ -2651,7 +3488,11 @@ def run():
         analysis_html = _no_qualifying_stock_html(all_rejected)
 
     analysis_html = (analysis_html or "") + regime.regime_note_html(regime_detail)
-    disclosures_html = _adjustments_html(applied_adjustments) + _regime_softening_html(regime_softening)
+    disclosures_html = (
+        _adjustments_html(applied_adjustments)
+        + _regime_softening_html(regime_softening)
+        + _regime_override_html(regime_override_active, regime_detail)
+    )
     email_html = build_email_html(analysis_html, today_str, sources, used_live_search, disclosures_html)
 
     # Outcome-tracking feedback loop (review item 7): log every stock this
