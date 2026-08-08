@@ -165,3 +165,54 @@ def derive_commodity_buy_levels(current_price, history):
     buy_levels["recommended_entry_label"] = recommended.replace("_", " ").title()
     buy_levels["recommended_buy_level"] = buy_levels[recommended]
     return buy_levels
+
+
+def resolve_recommended_commodity_entry(buy_levels, risk_reward_by_entry, min_acceptable_rr=1.5):
+    """Second pass over derive_commodity_buy_levels()'s recommendation, run
+    once the stop-loss/target are known (build_trade_plan derives those from
+    the buy_levels this function receives, so it can't happen any earlier).
+
+    derive_commodity_buy_levels() above picks a tier from recent price
+    momentum alone, with no visibility into risk/reward -- and because the
+    stop and target it's blind to are shared across all three tiers,
+    a higher (aggressive) entry structurally has less room to the target and
+    more room to the stop than a lower (patient) one. That combination can
+    -- and in production did -- produce a recommended tier with a materially
+    worse risk/reward than a more conservative tier sitting right next to it
+    on the same report. This overrides the recommendation in that case,
+    mirroring how choose_stock_entry factors risk_reward_ratio into its own
+    scoring for stocks instead of choosing on momentum alone.
+    """
+    recommended = buy_levels.get("recommended_entry")
+    recommended_rr = risk_reward_by_entry.get(recommended)
+
+    if recommended_rr is not None and recommended_rr >= min_acceptable_rr:
+        return buy_levels
+
+    # Prefer the most conservative tier (patient over optimal over
+    # aggressive) among any tier that actually clears the bar, rather than
+    # just the single best RR -- consistent with derive_commodity_buy_levels'
+    # own tie-breaking toward caution.
+    tier_order = ["patient_entry", "optimal_entry", "aggressive_entry"]
+    better_tiers = [
+        tier for tier in tier_order
+        if tier != recommended
+        and risk_reward_by_entry.get(tier) is not None
+        and risk_reward_by_entry[tier] >= min_acceptable_rr
+    ]
+
+    if not better_tiers:
+        # Nothing clears the bar -- fall back to whichever tier has the
+        # best available RR rather than silently keeping the worst one.
+        candidates = {
+            tier: rr for tier, rr in risk_reward_by_entry.items() if rr is not None
+        }
+        if not candidates or max(candidates.values()) <= (recommended_rr or float("-inf")):
+            return buy_levels
+        better_tiers = [max(candidates, key=candidates.get)]
+
+    new_recommended = better_tiers[0]
+    buy_levels["recommended_entry"] = new_recommended
+    buy_levels["recommended_entry_label"] = new_recommended.replace("_", " ").title()
+    buy_levels["recommended_buy_level"] = buy_levels[new_recommended]
+    return buy_levels

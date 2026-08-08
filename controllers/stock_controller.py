@@ -85,6 +85,14 @@ SILVER_MONTHLY_BUDGET = float(os.getenv("SILVER_MONTHLY_BUDGET", "5000"))
 # Buy list, a concentration alert card is shown.
 SECTOR_CONCENTRATION_THRESHOLD_PCT = float(os.getenv("SECTOR_CONCENTRATION_THRESHOLD_PCT", "40"))
 
+# A stock flagged SELL whose dividend record date falls within this many
+# days is a real timing trade-off (exit now vs. hold through to capture the
+# dividend) worth calling out explicitly near the top of the report, rather
+# than leaving the reader to notice the sell signal in one section and the
+# dividend date in another and connect the two themselves.
+DIVIDEND_SELL_CONFLICT_WINDOW_DAYS = int(os.getenv("DIVIDEND_SELL_CONFLICT_WINDOW_DAYS", "10"))
+EVENT_RISK_PRIORITY_WINDOW_DAYS = int(os.getenv("EVENT_RISK_PRIORITY_WINDOW_DAYS", "2"))
+
 # Cash figures used by apply_risk_management() to size every equity position
 # (risk_per_trade % of this, per stock). Previously a single literal 100000
 # was hardcoded at both call sites and applied to EVERY stock regardless of
@@ -849,6 +857,86 @@ def get_signal(score):
         return "RED -> SELL / REDUCE"
 
 
+@functools.lru_cache(maxsize=1)
+def fetch_macro_snapshot():
+    """
+    One-per-run snapshot of the macro drivers this report currently has no
+    visibility into: crude oil (WTI) for energy/refining names, and the
+    dollar index + 10-year yield for gold/silver (which move opposite the
+    dollar and are sensitive to rate expectations). Cached with lru_cache
+    since every stock/commodity card asks for the same snapshot -- this
+    fetches each series once per report run, not once per ticker. A cache
+    miss due to concurrent first calls (ThreadPoolExecutor workers racing on
+    the first request) just means an extra fetch or two, not a correctness
+    issue.
+
+    Returns None for any leg that fails to fetch rather than raising, so a
+    single flaky yfinance call degrades to "macro note omitted" for that
+    driver instead of failing the whole report.
+    """
+    def _last_two_closes(ticker_symbol):
+        try:
+            hist = yf.Ticker(ticker_symbol).history(period="5d")
+            closes = hist["Close"].dropna()
+            if len(closes) < 2:
+                return None
+            latest, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+            change_pct = round((latest - prev) / prev * 100, 2) if prev else None
+            return {"level": round(latest, 2), "change_pct": change_pct}
+        except Exception as exc:
+            print(f"Macro fetch failed for {ticker_symbol}: {exc}")
+            return None
+
+    return {
+        "crude_oil": _last_two_closes("CL=F"),   # WTI crude, USD/barrel
+        "dollar_index": _last_two_closes("DX-Y.NYB"),
+        "treasury_10y": _last_two_closes("^TNX"),  # in yield points (e.g. 4.32 = 4.32%)
+    }
+
+
+# Sector/industry keyword -> which macro leg is relevant and how to phrase
+# it. Checked against market_context's sector/industry strings (lowercased).
+# Deliberately narrow: only fires for names where the macro driver is a
+# well-established, first-order sensitivity -- not attached to every stock,
+# since a forced macro line on a name with no real macro linkage is noise,
+# not signal.
+_SECTOR_MACRO_RULES = [
+    (("oil", "gas", "petro", "refin", "energy"), "crude_oil"),
+    (("bank", "financial", "nbfc", "insurance", "housing finance"), "treasury_10y"),
+]
+
+
+def _macro_note_for_stock(market_context, macro):
+    if not macro:
+        return None
+    sector = str((market_context or {}).get("sector", "")).lower()
+    industry = str((market_context or {}).get("industry", "")).lower()
+    haystack = f"{sector} {industry}"
+
+    for keywords, macro_key in _SECTOR_MACRO_RULES:
+        if not any(kw in haystack for kw in keywords):
+            continue
+        leg = macro.get(macro_key)
+        if not leg or leg.get("change_pct") is None:
+            continue
+
+        if macro_key == "crude_oil":
+            direction = "up" if leg["change_pct"] > 0 else "down"
+            read = "pressuring refining margins" if direction == "up" else "easing input costs"
+            return (
+                f"🛢 WTI crude {direction} {abs(leg['change_pct']):.1f}% "
+                f"(${leg['level']}/bbl) — {read} for this sector."
+            )
+        if macro_key == "treasury_10y":
+            direction = "up" if leg["change_pct"] > 0 else "down"
+            read = "typically a headwind for lending/margin-sensitive names" if direction == "up" else "typically supportive for rate-sensitive names"
+            return (
+                f"📈 10Y yield {direction} {abs(leg['change_pct']):.1f}% "
+                f"({leg['level']}%) — {read}."
+            )
+    return None
+
+
 def get_conviction_rating(score):
     try:
         numeric_score = float(score)
@@ -906,6 +994,36 @@ def get_conviction_rating(score):
         "icons_html": "".join(icons),
         "icons_text": "".join(icons_text),
     }
+
+
+def build_conviction_breakdown_html(breakdown):
+    """
+    Compact attribution line under the conviction stars: what the total
+    score is actually made of, so two stocks that both land on "High ★★★★☆
+    82" aren't indistinguishable -- one could be technical-momentum-driven,
+    another fundamentals/sentiment-driven with a mediocre technical picture,
+    and right now the report shows the same badge for both.
+    """
+    if not breakdown:
+        return ""
+
+    tech_contrib = round(breakdown["tech_score"] * breakdown["tech_weight"], 1)
+    fund_contrib = round(breakdown["combined_fund_score"] * breakdown["fund_weight"], 1)
+    sent_contrib = round(breakdown["sentiment_score"] * breakdown["sentiment_weight"], 1)
+    trend_bonus = breakdown["trend_bonus"]
+    trend_str = f" {'+' if trend_bonus >= 0 else ''}{trend_bonus} trend" if trend_bonus else ""
+
+    adv_note = ""
+    if breakdown["adv_fund_score"]:
+        adv_note = f" (incl. adv. fund {breakdown['adv_fund_score']}×0.4)"
+
+    return f"""
+    <div style="margin-top:4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;color:#8A8F9C;line-height:1.5;max-width:150px;">
+        Tech {breakdown['tech_score']}×.40={tech_contrib} +
+        Fund {breakdown['combined_fund_score']}×.35={fund_contrib}{adv_note} +
+        Sent {breakdown['sentiment_score']}×.25={sent_contrib}{trend_str}
+    </div>
+    """
 
 
 def _signal_direction(score, high, low):
@@ -1439,11 +1557,35 @@ def calculate_combined_score(technical, fundamentals, sentiment, adv_fundamental
 
     trend_text = str(market_context.get("trend", "")).lower()
     if "bullish" in trend_text or "up" in trend_text or "positive" in trend_text:
-        total += 2
+        trend_bonus = 2
     elif "bearish" in trend_text or "down" in trend_text or "negative" in trend_text:
-        total -= 2
+        trend_bonus = -2
+    else:
+        trend_bonus = 0
+    total += trend_bonus
 
-    return round(max(0, min(100, total)), 2)
+    total = round(max(0, min(100, total)), 2)
+
+    # Breakdown of what actually produced `total`, so the conviction display
+    # doesn't have to be taken on faith -- final_score's own 0.4/0.35/0.25
+    # weighting (mirrored here for display only; final_score is still the
+    # source of truth for the number itself), plus the two inputs that are
+    # otherwise invisible: adv_fundamentals folded into combined_fund, and
+    # the trend bonus/penalty applied after the weighted blend.
+    breakdown = {
+        "tech_score": technical,
+        "tech_weight": 0.40,
+        "fund_score": fundamentals,
+        "adv_fund_score": adv_fundamentals,
+        "combined_fund_score": round(combined_fund, 2),
+        "fund_weight": 0.35,
+        "sentiment_score": sentiment,
+        "sentiment_weight": 0.25,
+        "trend_bonus": trend_bonus,
+        "total_score": total,
+    }
+
+    return total, breakdown
 
 
 def get_recommended_entry(signal, total_score, latest, market_context, entry_context):
@@ -1528,7 +1670,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                 "sector": "unknown",
                 "industry": "unknown",
             }
-        total_score = calculate_combined_score(
+        total_score, conviction_breakdown = calculate_combined_score(
             tech_score,
             fund_score,
             sentiment_score,
@@ -1611,6 +1753,10 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
             conviction_rating = get_conviction_rating(total_score)
         conviction_rating["capped"] = signal_confirmation["cap_conviction"]
         conviction_rating["confirmation"] = signal_confirmation
+        conviction_breakdown_html = build_conviction_breakdown_html(conviction_breakdown)
+
+        macro_snapshot = fetch_macro_snapshot()
+        macro_note = _macro_note_for_stock(market_context, macro_snapshot)
 
         # "Swing setup" tag: near a 20-day breakout with a confirmed strong
         # trend (ADX >= 25) mirrors the recurring high-conviction setups
@@ -1666,28 +1812,46 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                     + "".join(details)
                 )
 
+            days_to_next_event = _days_until_event(events.get("next_upcoming_event_date"))
+            in_event_risk_window = days_to_next_event is not None and 0 <= days_to_next_event <= EVENT_RISK_PRIORITY_WINDOW_DAYS
+
+            # Same amber box, but visually escalated (red-toned + a badge)
+            # when the event falls inside the event-risk window -- an
+            # earnings date next week reads very differently from one
+            # today/tomorrow, and the flat amber box didn't distinguish them.
+            box_bg = "#FEE2E2" if in_event_risk_window else "#FEF3C7"
+            box_border = "#DC2626" if in_event_risk_window else "#F59E0B"
+            label_color = "#991B1B" if in_event_risk_window else "#92400E"
+            value_color = "#991B1B" if in_event_risk_window else "#92400E"
+            date_color = "#B91C1C" if in_event_risk_window else "#B45309"
+            window_badge = (
+                ' <span style="display:inline-block;margin-left:6px;padding:2px 6px;border-radius:10px;'
+                'background:#DC2626;color:#FFFFFF;font-size:10px;font-weight:700;letter-spacing:0.03em;">'
+                '⚠ EVENT WINDOW</span>'
+            ) if in_event_risk_window else ""
+
             events_html = f"""
             <div style="margin-top:6px;padding:10px 12px;
                         border-radius:8px;
-                        background:#FEF3C7;
-                        border-left:4px solid #F59E0B;">
+                        background:{box_bg};
+                        border-left:4px solid {box_border};">
 
                 <div style="font-size:12px;
-                            color:#92400E;
+                            color:{label_color};
                             font-weight:bold;
                             text-transform:uppercase;">
-                    Next Upcoming Event
+                    Next Upcoming Event{window_badge}
                 </div>
 
                 <div style="font-size:16px;
-                            color:#92400E;
+                            color:{value_color};
                             font-weight:bold;
                             margin-top:3px;">
                     {html.escape(str(events['next_upcoming_event_label']))}
                 </div>
 
                 <div style="font-size:14px;
-                            color:#B45309;
+                            color:{date_color};
                             margin-top:3px;">
                     {html.escape(str(events['next_upcoming_event_date']))}
                 </div>
@@ -1729,6 +1893,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                     <div style="margin-top:12px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#8A8F9C;">Conviction</div>
                                     <div style="margin-top:6px;white-space:nowrap;">{conviction_rating['icons_html']}</div>
                                     <div style="margin-top:6px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;font-weight:700;color:{conviction_rating['fill_color']};">{conviction_rating['label']}</div>
+                                    {conviction_breakdown_html}
                                 </td>
                             </tr>
                         </table>
@@ -1762,6 +1927,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                 <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
                                 <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
                             </tr>
+                            {f'''<tr><td colspan="2" style="padding:6px 0;"><strong>Macro</strong><div style="color:#4A5063;margin-top:4px;">{html.escape(macro_note)}</div></td></tr>''' if macro_note else ""}
                             {build_fundamentals_html(fund_raw, fund_score)}
                             {build_support_resistance_html(pivot_levels, swing_zones, round(latest['close'], 2))}
                             {build_52_week_range_html(range_52w)}
@@ -1887,6 +2053,27 @@ def _format_short_date(value):
     return text
 
 
+def _days_until_event(value):
+    """Returns the integer number of days from today until `value` (an
+    event date in one of the formats also handled by _relative_day_label /
+    _format_short_date), or None if missing/unparseable. Negative means the
+    date already passed. Kept separate from _relative_day_label because
+    that function only returns a display string ("in 6 days"), not a
+    number usable for threshold comparisons (e.g. "is this within N days").
+    """
+    if not value or str(value).upper() == "NA":
+        return None
+    text = str(value).strip()
+    for fmt in ("%d %b %Y", "%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            event_date = datetime.strptime(text, fmt).date()
+            today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            return (event_date - today).days
+        except ValueError:
+            continue
+    return None
+
+
 def _relative_day_label(value):
     if not value or str(value).upper() == "NA":
         return None
@@ -1962,10 +2149,19 @@ def build_quick_summary_groups(rows):
         if results_date and str(results_date).upper() != "NA":
             short_date = _format_short_date(results_date)
             relative_label = _relative_day_label(results_date)
+            days_out = _days_until_event(results_date)
+            is_event_soon = days_out is not None and 0 <= days_out <= EVENT_RISK_PRIORITY_WINDOW_DAYS
             if relative_label == "today":
-                market_bucket[group_key].append(f"✅ Watch: {stock_name} results today")
+                bullet = f"✅ Watch: {stock_name} results today"
             else:
-                market_bucket[group_key].append(f"✅ Watch: {stock_name} results on {short_date or results_date}")
+                bullet = f"✅ Watch: {stock_name} results on {short_date or results_date}"
+            if is_event_soon:
+                # insert at front, not append -- a same-tier bullet with
+                # earnings today or within the event-risk window outranks
+                # routine bullets in that bucket
+                market_bucket[group_key].insert(0, bullet)
+            else:
+                market_bucket[group_key].append(bullet)
             continue
 
         dividend_date = upcoming_events.get("dividend_record_date")
@@ -2038,14 +2234,39 @@ def build_market_takeaway_banner(buy_count, hold_count, sell_count, err_count, s
     if not summary_rows and not commodity_bullets_by_metal.get("gold") and not commodity_bullets_by_metal.get("silver"):
         return ""
 
-    buy_items = [item for item in summary_rows if str(item.get("signal") or "").upper().startswith("BUY")]
-    watch_items = [item for item in summary_rows if str(item.get("signal") or "").upper() in {"HOLD", "SELL"}]
+    # BUG FIX: this used to filter on
+    # str(item.get("signal") or "").upper().startswith("BUY"), which has two
+    # problems visible side-by-side in the same report: a "Strong Buy"
+    # signal doesn't start with "BUY" (it starts with "STRONG"), so it was
+    # silently excluded from buy_items entirely and could never become the
+    # featured takeaway -- while a "Buy / Hold" signal DOES start with
+    # "BUY" as a literal string, so it was incorrectly included even though
+    # it's a Hold-tier call (priority == 2, the heatmap's 🟡 Wait), not an
+    # actual Buy. The featured stock was then whichever one happened to
+    # come first in summary_rows order, with no regard for conviction --
+    # so a middling Buy/Hold appearing early in the list could out-rank a
+    # genuine Strong Buy that never made it into the candidate list at all.
+    # priority == 1 is the same authoritative "real Buy" tier already used
+    # for the heatmap's 🟢 and the sector-crowding pre-pass above, so this
+    # now reads consistently everywhere in the report instead of re-parsing
+    # the signal string with different logic in different places.
+    buy_items = sorted(
+        (item for item in summary_rows if item.get("priority") == 1),
+        key=lambda item: item.get("total_score") or 0,
+        reverse=True,
+    )
+    watch_items = [item for item in summary_rows if item.get("priority") in (2, 3)]
 
     buy_excerpt = ""
     if buy_items:
         first_buy = buy_items[0]
         stock_name = first_buy.get("stock_name") or "a stock"
-        buy_excerpt = f"{stock_name} is the clearest near-term opportunity right now."
+        # Name the actual signal (e.g. "Strong Buy") when it's more specific
+        # than a plain Buy, so the takeaway doesn't flatten a Strong Buy and
+        # an ordinary Buy into identical wording.
+        signal_label = str(first_buy.get("signal") or "").strip()
+        qualifier = f" ({signal_label})" if signal_label and signal_label.upper() != "BUY" else ""
+        buy_excerpt = f"{stock_name}{qualifier} is the clearest near-term opportunity right now."
     else:
         buy_excerpt = "The setup is still selective; no strong buy idea is standing out yet."
 
@@ -2190,11 +2411,23 @@ ACTION_PLAN_MIN_RR_FOR_POINT = float(os.getenv("ACTION_PLAN_MIN_RR_FOR_POINT", "
 ACTION_PLAN_SCORE_FOR_3_TRANCHES = float(os.getenv("ACTION_PLAN_SCORE_FOR_3_TRANCHES", "4.5"))
 ACTION_PLAN_SCORE_FOR_2_TRANCHES = float(os.getenv("ACTION_PLAN_SCORE_FOR_2_TRANCHES", "2"))
 
+# A stock up this much or more intraday, on the same day it's being sized
+# for an Add, is arguably being chased rather than bought on a genuine dip
+# -- the price may only read as "in the buy zone" today because it gapped
+# or ran up into it, not because it pulled back to it. Flagged as a penalty
+# + explicit reason on the Add sizing rather than silently sizing the same
+# as a stock that arrived at the same level via a quiet pullback.
+ACTION_PLAN_CHASE_DAY_MOVE_PCT = float(os.getenv("ACTION_PLAN_CHASE_DAY_MOVE_PCT", "2.0"))
+
 _ACTION_PLAN_STATUS_DISPLAY = {
     "in_zone":        ("In buy zone",            "#2F5233", "#E7EEE4"),
     "slightly_above": ("Slightly above buy zone", "#A6812F", "#FDF3D9"),
     "overextended":   ("Overextended",            "#8B2E2E", "#FBEAEA"),
     "sell_signal":    ("Sell signal active",      "#8B2E2E", "#FBEAEA"),
+    # Amber matches _heatmap_signal_style's priority=2/"Wait" color (#A6812F)
+    # so a Hold-signal stock reads the same way in both sections instead of
+    # looking like two different calls on the same stock.
+    "hold_signal":    ("Hold signal active",      "#A6812F", "#FDF3D9"),
     "unknown":        ("—",                       "#8A8F9C", "#F4F2ED"),
 }
 
@@ -2205,12 +2438,16 @@ _ACTION_PLAN_STATUS_DISPLAY = {
 _ACTION_PLAN_NEXT_ACTION = {
     "slightly_above": "Wait for dip",
     "overextended":   "Don't add",
+    # No sizing here on purpose -- a Hold signal means don't add regardless
+    # of how close price sits to the buy level, so this never routes through
+    # _action_plan_add_sizing() the way "in_zone" does.
+    "hold_signal":    "Hold -- no new buys",
     "unknown":        "—",
 }
 
 
 def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confirmation_status,
-                             adx=None, risk_reward_ratio=None, sector_crowded=False):
+                             adx=None, risk_reward_ratio=None, sector_crowded=False, day_change_pct=None):
     """
     Sizes an "Add" recommendation into a concrete number of tranches
     (1..ACTION_PLAN_MAX_TRANCHES) using a weighted blend of factors instead
@@ -2237,8 +2474,15 @@ def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confir
       build_action_plan_table_html) -- discourages piling further into a
       sector that's already a concentration risk, even if this one stock's
       own numbers look great in isolation.
+    - chasing today's move (-1 pt): passed in as day_change_pct. When a
+      stock is up ACTION_PLAN_CHASE_DAY_MOVE_PCT% or more on the day it's
+      being sized, the price may only be reading as "in zone" because it
+      ran up into the level today, not because it pulled back to it --
+      without this, a stock that gapped up 3% and a stock that quietly
+      drifted down to the same buy level size identically, even though
+      buying into the former risks entering right at a local top.
 
-    The weighted total (roughly -1..6) is bucketed into tranches by
+    The weighted total (roughly -2..6) is bucketed into tranches by
     ACTION_PLAN_SCORE_FOR_2_TRANCHES / ACTION_PLAN_SCORE_FOR_3_TRANCHES.
 
     Conflicting technicals/fundamentals (signal_confirmation_status ==
@@ -2283,6 +2527,10 @@ def _action_plan_add_sizing(current_price, buy_level, total_score, signal_confir
         score -= 1.0
         reasons.append("sector already concentrated in Buy list -- sizing trimmed")
 
+    if day_change_pct is not None and day_change_pct >= ACTION_PLAN_CHASE_DAY_MOVE_PCT:
+        score -= 1.0
+        reasons.append(f"up {day_change_pct:.2f}% today -- may be chasing, not a genuine dip")
+
     if score >= ACTION_PLAN_SCORE_FOR_3_TRANCHES:
         tranches = 3
     elif score >= ACTION_PLAN_SCORE_FOR_2_TRANCHES:
@@ -2322,7 +2570,7 @@ def _action_plan_reduce_sizing(current_price, stop_loss, signal_confirmation_sta
 
 
 def _action_plan_next_action_html(status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status,
-                                   adx=None, risk_reward_ratio=None, sector_crowded=False):
+                                   adx=None, risk_reward_ratio=None, sector_crowded=False, day_change_pct=None):
     """
     Builds the "Next Action" cell content: a concrete sized action for
     in_zone/sell_signal (see the two sizing functions above), plus a small
@@ -2333,6 +2581,7 @@ def _action_plan_next_action_html(status_key, current_price, buy_level, stop_los
         tranches, reasons = _action_plan_add_sizing(
             current_price, buy_level, total_score, signal_confirmation_status,
             adx=adx, risk_reward_ratio=risk_reward_ratio, sector_crowded=sector_crowded,
+            day_change_pct=day_change_pct,
         )
         pct = tranches * ACTION_PLAN_ALLOCATION_PCT_PER_TRANCHE
         label = f"Add {tranches} <span style=\"color:#8A8F9C;font-weight:400;\">(~{pct}%)</span>"
@@ -2384,9 +2633,20 @@ def _classify_buy_zone(current_price, buy_level, signal=""):
     """
     Classifies where the current price sits relative to the recommended
     buy level, for the Action Plan table. Returns one of:
-    "in_zone" / "slightly_above" / "overextended" / "sell_signal" / "unknown".
+    "in_zone" / "slightly_above" / "overextended" / "sell_signal" /
+    "hold_signal" / "unknown".
 
     - A SELL signal always takes priority over the price/buy-level math.
+    - A HOLD signal (matched the same way the Portfolio Heatmap decides
+      priority=2/"Wait" -- see process_stock()'s "hold" in signal.lower()
+      check) also takes priority over the price/buy-level math. Without
+      this, a Hold-signal stock sitting at/below its buy level fell
+      straight through to "in_zone" below, which _action_plan_next_action_html
+      turns into a sized "Add N (~%)" -- contradicting the "Wait" the same
+      stock shows in the heatmap a few sections earlier, since the two
+      sections were deriving their recommendation from different logic
+      (heatmap: the raw signal string; Action Plan: price-vs-buy-level
+      only) despite describing the same underlying decision.
     - "in_zone": at or within IN_BUY_ZONE_TOLERANCE_PCT of the buy level
       (covers prices at or slightly below it too).
     - "slightly_above": up to SLIGHTLY_ABOVE_BUY_ZONE_PCT above the buy
@@ -2396,6 +2656,8 @@ def _classify_buy_zone(current_price, buy_level, signal=""):
     """
     if "sell" in str(signal or "").lower():
         return "sell_signal"
+    if "hold" in str(signal or "").lower():
+        return "hold_signal"
     if current_price is None or buy_level is None or buy_level == 0:
         return "unknown"
     pct_above = (current_price - buy_level) / buy_level * 100
@@ -2427,15 +2689,25 @@ def _action_plan_profit_booking(status_key, buy_level, target):
 
 def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, ticker_label=None, sans=None,
                            current_price=None, stop_loss=None, total_score=None, signal_confirmation_status=None,
-                           tranche_amount_inr=None, signal=None,
-                           adx=None, risk_reward_ratio=None, sector_crowded=False):
+                           tranche_amount_inr=None, signal=None, priority=None,
+                           adx=None, risk_reward_ratio=None, sector_crowded=False, day_change_pct=None):
     sans = sans or "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
     label, color, bg = _ACTION_PLAN_STATUS_DISPLAY[status_key]
     # Buy-call rows get a faint green row background (distinct from the
     # "Current Status" pill's own color, which reflects buy-zone proximity
     # rather than the underlying signal) so a Buy call is easy to spot at
     # a glance while scanning the table.
-    row_bg = " background:#F4FAF3;" if str(signal or "").upper().startswith("BUY") else ""
+    #
+    # BUG FIX: this used to check str(signal or "").upper().startswith("BUY"),
+    # which -- same bug as build_market_takeaway_banner above -- misses
+    # "Strong Buy" (doesn't start with "BUY") and wrongly matches
+    # "Buy / Hold" (a Hold-tier signal that happens to start with the
+    # literal string "BUY"). priority == 1 is the authoritative Buy tier
+    # used everywhere else in this table (see the sector-crowding pre-pass
+    # and _classify_buy_zone's now-separate "hold_signal" status), so a
+    # Buy/Hold row no longer gets a misleading green "active buy" highlight
+    # and a genuine Strong Buy row no longer gets skipped.
+    row_bg = " background:#F4FAF3;" if priority == 1 else ""
     if tranche_amount_inr is not None:
         # Commodities (gold/silver): render "Buy ₹X" / "Sell ₹X" / "Sell all"
         # instead of the equity-style "Add N (~%)" / "Reduce N" tranches.
@@ -2444,6 +2716,7 @@ def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, 
         next_action = _action_plan_next_action_html(
             status_key, current_price, buy_level, stop_loss, total_score, signal_confirmation_status,
             adx=adx, risk_reward_ratio=risk_reward_ratio, sector_crowded=sector_crowded,
+            day_change_pct=day_change_pct,
         )
     profit_booking = _action_plan_profit_booking(status_key, buy_level, target)
     add_below = f"{currency_symbol}{buy_level:,.2f}" if buy_level is not None else "—"
@@ -2533,9 +2806,10 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             ticker_label=entry.get("ticker"), sans=sans,
             current_price=current_price, stop_loss=entry.get("stop_loss"),
             total_score=entry.get("total_score"), signal_confirmation_status=entry.get("signal_confirmation_status"),
-            signal=signal,
+            signal=signal, priority=entry.get("priority"),
             adx=entry.get("adx"), risk_reward_ratio=entry.get("risk_reward_ratio"),
             sector_crowded=_is_sector_crowded(market_key, entry.get("sector")),
+            day_change_pct=entry.get("day_change_pct"),
         )
         stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
 
@@ -2858,6 +3132,27 @@ def _heatmap_divergence_badge(day_change_pct, raw_trend):
     )
 
 
+def _heatmap_conflict_badge(signal_confirmation_status):
+    """Returns a small inline warning badge (or '') when technicals and
+    fundamentals are actively conflicting for this stock. Today this caveat
+    only ever showed up in the Action Plan's sizing rationale (see
+    _action_plan_add_sizing / _action_plan_reduce_sizing), several sections
+    below the heatmap -- someone skimming just the Portfolio Heatmap at the
+    top of the report would have no way to know a "Buy"/"Add" row actually
+    carries a conflicted-signal caveat until they scrolled down and happened
+    to read that stock's Next Action reasoning. Surfacing it here means the
+    same caveat that caps sizing to 1 tranche below is visible at the point
+    where a skimming reader decides whether to act at all."""
+    if str(signal_confirmation_status or "").lower() != "conflicted":
+        return ""
+    return (
+        '<span title="Technicals and fundamentals are actively conflicting for this stock -- see Action Plan for detail" '
+        'style="display:inline-block;margin-left:6px;padding:1px 6px;border-radius:999px;'
+        'font-size:10px;font-weight:700;color:#8A5A00;background:#FFF3D6;border:1px solid #8A5A0033;'
+        'white-space:nowrap;">⚠️ conflicted</span>'
+    )
+
+
 def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals=None):
     """
     Portfolio Heatmap: a single scannable table (Symbol / Signal / Today's
@@ -2898,6 +3193,19 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
         '</tr>'
     )
 
+    def _has_event_soon(summary_entry):
+        """True if results or dividend fall within EVENT_RISK_PRIORITY_WINDOW_DAYS
+        (today included) -- used to rank event-day/near-event rows above
+        same-tier rows on technical score alone, since event risk (esp.
+        earnings) dominates the technical signal in that window, not just
+        on the day itself."""
+        events = summary_entry.get("upcoming_events") or {}
+        for key in ("results_announcement_date", "dividend_record_date"):
+            days = _days_until_event(events.get(key))
+            if days is not None and 0 <= days <= EVENT_RISK_PRIORITY_WINDOW_DAYS:
+                return True
+        return False
+
     def _heatmap_row_html(pr, name, summary_entry):
         signal = summary_entry.get("signal", "n/a")
         dot, color, action = _heatmap_signal_style(pr)
@@ -2905,10 +3213,11 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
         move_html = _heatmap_move_html(day_change_pct)
         trend_html = _heatmap_trend_label(summary_entry.get("trend"))
         divergence_html = _heatmap_divergence_badge(day_change_pct, summary_entry.get("trend"))
+        conflict_html = _heatmap_conflict_badge(summary_entry.get("signal_confirmation_status"))
         return (
             f'<tr>'
             f'<td style="padding:7px 8px 7px 14px;font-family:{sans};font-size:12px;font-weight:600;color:#14213D;border-bottom:1px solid #EFEDE7;">{name}</td>'
-            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}</td>'
+            f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;white-space:nowrap;">{dot} {signal}{conflict_html}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;border-bottom:1px solid #EFEDE7;text-align:right;">{move_html}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;color:#4A5063;border-bottom:1px solid #EFEDE7;white-space:nowrap;">{trend_html}{divergence_html}</td>'
             f'<td style="padding:7px 8px;font-family:{sans};font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #EFEDE7;text-align:right;">{action}</td>'
@@ -2920,7 +3229,10 @@ def build_quick_jump_table_html(rows, commodity_data=None, commodity_buy_signals
         entries = by_market.get(market_key) or []
         if not entries:
             continue
-        entries.sort(key=lambda e: (e[0], -e[1]))  # priority, score desc
+        # priority, then event-day risk (results/dividend today outranks a
+        # pure technical score within the same tier -- an event-day Buy is
+        # a materially different risk than a routine one), then score desc
+        entries.sort(key=lambda e: (e[0], 0 if _has_event_soon(e[3]) else 1, -e[1]))
         body += (
             f'<tr><td colspan="5" style="padding:7px 10px;background:#F4F2ED;'
             f'font-family:{sans};font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
@@ -3051,6 +3363,52 @@ def build_concentration_alert_html(rows):
           <td style="padding:0 28px 14px;" class="email-padding">
             <div style="border:1px solid #EAD9B8;border-left:3px solid #A6812F;border-radius:4px;background:#FBF6EB;padding:12px 14px;">
               <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#8A6D3B;text-transform:uppercase;letter-spacing:0.06em;">Concentration Watch</div>
+              {''.join(alerts)}
+            </div>
+          </td>
+        </tr>
+    """
+
+
+def build_dividend_conflict_alert_html(rows):
+    """
+    Flags any stock currently flagged SELL (priority == 3, the same tier
+    the Portfolio Heatmap shows as 🔴 Exit) whose dividend record date
+    falls within DIVIDEND_SELL_CONFLICT_WINDOW_DAYS -- a real trade-off
+    (exit now on the sell signal vs. hold a few more days to capture the
+    dividend) that was previously only discoverable by separately noticing
+    the 🔴 signal in one section and the dividend date in the per-stock
+    card or Quick Summary bullet several sections away, then connecting
+    the two manually. Surfaced here as one explicit callout instead.
+    """
+    alerts = []
+    for pr, _score, name, _html, summary_entry, market in rows:
+        if pr != 3:  # only current Sell signals
+            continue
+        upcoming = summary_entry.get("upcoming_events") or {}
+        dividend_date = upcoming.get("dividend_record_date")
+        if not dividend_date or str(dividend_date).upper() == "NA":
+            continue
+        days = _days_until_event(dividend_date)
+        if days is None or not (0 <= days <= DIVIDEND_SELL_CONFLICT_WINDOW_DAYS):
+            continue
+        flag = "🇮🇳" if market == "India" else "🇺🇸"
+        short_date = _format_short_date(dividend_date) or dividend_date
+        when = "today" if days == 0 else f"in {days} day{'s' if days != 1 else ''}"
+        alerts.append(
+            f'<div style="margin:4px 0 0;font-size:13px;color:#92400e;">'
+            f'{flag} <strong>{name}</strong> is flagged 🔴 Sell, but its dividend record date is {when} ({short_date}) '
+            f'-- exiting now forgoes the dividend; holding to capture it means holding through the sell signal</div>'
+        )
+
+    if not alerts:
+        return ""
+
+    return f"""
+        <tr>
+          <td style="padding:0 28px 14px;" class="email-padding">
+            <div style="border:1px solid #EAD9B8;border-left:3px solid #A6812F;border-radius:4px;background:#FBF6EB;padding:12px 14px;">
+              <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;font-weight:700;color:#8A6D3B;text-transform:uppercase;letter-spacing:0.06em;">Dividend Timing Conflict</div>
               {''.join(alerts)}
             </div>
           </td>
@@ -3602,8 +3960,10 @@ def main(mode, use_llm, detailed_llm=False):
         try:
             gold_levels   = tracker.derive_buy_levels(commodity_data["gold"]["current"],   commodity_data["gold"]["history"])
             silver_levels = tracker.derive_buy_levels(commodity_data["silver"]["current"], commodity_data["silver"]["history"])
-            gold_plan   = tracker.build_trade_plan(commodity_data["gold"]["current"],   commodity_data["gold"]["history"],   gold_levels)
-            silver_plan = tracker.build_trade_plan(commodity_data["silver"]["current"], commodity_data["silver"]["history"], silver_levels)
+            gold_plan   = tracker.build_trade_plan(commodity_data["gold"]["current"],   commodity_data["gold"]["history"],   gold_levels,
+                                                    sparkline_history=commodity_data["gold"].get("sparkline_history"))
+            silver_plan = tracker.build_trade_plan(commodity_data["silver"]["current"], commodity_data["silver"]["history"], silver_levels,
+                                                    sparkline_history=commodity_data["silver"].get("sparkline_history"))
 
             gold_card = tracker._commodity_card_html(
                 name="Gold (22K)", ticker_label="XAU/INR",
@@ -3697,6 +4057,7 @@ def main(mode, use_llm, detailed_llm=False):
         rows, commodity_data=commodity_data, commodity_buy_signals=new_commodity_history
     )
     concentration_alert_html = build_concentration_alert_html(rows)
+    dividend_conflict_alert_html = build_dividend_conflict_alert_html(rows)
 
     footer_html = (
         build_compliance_block_html(
@@ -3724,6 +4085,7 @@ def main(mode, use_llm, detailed_llm=False):
     report_html += (
         error_summary_html
         + quick_jump_html
+        + dividend_conflict_alert_html
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html
@@ -3748,6 +4110,7 @@ def main(mode, use_llm, detailed_llm=False):
     email_html = (
         report_html_header
         + quick_jump_html
+        + dividend_conflict_alert_html
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html

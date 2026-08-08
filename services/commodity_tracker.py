@@ -1,8 +1,9 @@
 import requests
+import statistics
 from datetime import datetime
 import yfinance as yf
 
-from models.recommendation_logic import derive_commodity_buy_levels
+from models.recommendation_logic import derive_commodity_buy_levels, resolve_recommended_commodity_entry
 
 try:
     from models.market_context import get_resilient_session
@@ -191,11 +192,35 @@ class CommodityTracker:
 
         return current
 
-    def build_trade_plan(self, current_price, history, levels):
+    # Floor on the volatility-derived band width, as a fraction of price.
+    # Prevents the range from collapsing to (near-)zero width during an
+    # unusually quiet stretch, which would misleadingly read as a
+    # high-conviction point estimate rather than a momentum-based guess.
+    MIN_TARGET_BAND_PCT = 0.5
+
+    def build_trade_plan(self, current_price, history, levels, sparkline_history=None):
         entry_low = round(min(levels["patient_entry"], levels["optimal_entry"], levels["aggressive_entry"]), 2)
         entry_high = round(max(levels["patient_entry"], levels["optimal_entry"], levels["aggressive_entry"]), 2)
-        stop_loss = round(min(entry_low, current_price) * 0.985, 2)
-        target = round(max(entry_high, current_price) * 1.02, 2)
+
+        # Band width comes from realized volatility (stdev of daily % change)
+        # over the lookback window, not a fixed 2%/1.5% constant -- a quiet
+        # week and a volatile week now produce different-width ranges instead
+        # of an identical single point. Prefer the longer sparkline window
+        # (up to 30 days) when available so the estimate isn't based on just
+        # the 7 rows kept for the on-screen history table; fall back to
+        # `history` so this still works wherever only 7 days are passed in.
+        vol_source = sparkline_history if sparkline_history else history
+        daily_changes = [row["change"] for row in vol_source if "change" in row] if vol_source else []
+        daily_vol_pct = statistics.pstdev(daily_changes) if len(daily_changes) >= 2 else 0.0
+        band_pct = max(daily_vol_pct, self.MIN_TARGET_BAND_PCT)
+
+        stop_base = min(entry_low, current_price)
+        target_base = max(entry_high, current_price)
+        stop_loss = round(stop_base * (1 - band_pct / 100), 2)
+        target_mid = round(target_base * 1.02, 2)
+        target_band = round(target_base * (band_pct / 100), 2)
+        target_low = round(target_mid - target_band, 2)
+        target_high = round(target_mid + target_band, 2)
 
         if not history:
             bias = "Neutral"
@@ -209,15 +234,44 @@ class CommodityTracker:
             else:
                 bias = "Neutral"
 
-        risk_reward = round((target - current_price) / max(current_price - stop_loss, 0.01), 2)
+        # Risk:reward measured against the near (conservative) edge of the
+        # target band, not the midpoint -- keeps this ratio from overstating
+        # the reward side now that target is a range rather than a point.
+        risk_reward = round((target_low - current_price) / max(current_price - stop_loss, 0.01), 2)
+
+        # Per-tier risk/reward -- stop_loss/target_low above are shared
+        # across all three entry prices, which structurally favors whichever
+        # tier sits lowest (patient) and penalizes whichever sits highest
+        # (aggressive): patient is close to stop_loss (small risk) and far
+        # from target_low (big reward); aggressive is the reverse. Computed
+        # here so the recommendation can be checked against it below instead
+        # of recommending purely on momentum and leaving that mismatch to
+        # surface only in the rendered report.
+        risk_reward_by_entry = {}
+        for tier in ("patient_entry", "optimal_entry", "aggressive_entry"):
+            entry_price = levels.get(tier)
+            if entry_price is None:
+                continue
+            risk = entry_price - stop_loss
+            reward = target_low - entry_price
+            risk_reward_by_entry[tier] = round(reward / risk, 2) if risk > 0 else None
+
+        # Mutates `levels` in place (recommended_entry/label/buy_level) so
+        # every caller already holding a reference to this dict -- the
+        # commodity card, the Action Plan table -- picks up the corrected
+        # recommendation without needing to re-fetch it.
+        resolve_recommended_commodity_entry(levels, risk_reward_by_entry)
 
         return {
             "bias": bias,
             "entry_low": entry_low,
             "entry_high": entry_high,
             "stop_loss": stop_loss,
-            "target": target,
+            "target": target_mid,
+            "target_low": target_low,
+            "target_high": target_high,
             "risk_reward": risk_reward,
+            "risk_reward_by_entry": risk_reward_by_entry,
         }
 
     def derive_buy_levels(self, current_price, history):
@@ -268,6 +322,58 @@ class CommodityTracker:
             )
         return rows
 
+    def fetch_commodity_macro_snapshot(self):
+        """
+        One-per-run DXY + 10Y yield snapshot, cached on the instance since
+        both gold and silver cards want the same numbers. Gold/silver
+        typically move opposite the dollar and are sensitive to rate
+        expectations, but the report currently shows neither -- this is the
+        commodity-side counterpart to fetch_macro_snapshot() in
+        stock_controller.py. Returns None for a leg that fails to fetch
+        rather than raising, so the card just omits that note instead of
+        breaking the report.
+        """
+        if getattr(self, "_macro_cache", None) is not None:
+            return self._macro_cache
+
+        def _last_two_closes(ticker_symbol):
+            try:
+                hist = yf.Ticker(ticker_symbol).history(period="5d")
+                closes = hist["Close"].dropna()
+                if len(closes) < 2:
+                    return None
+                latest, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+                change_pct = round((latest - prev) / prev * 100, 2) if prev else None
+                return {"level": round(latest, 2), "change_pct": change_pct}
+            except Exception:
+                return None
+
+        self._macro_cache = {
+            "dollar_index": _last_two_closes("DX-Y.NYB"),
+            "treasury_10y": _last_two_closes("^TNX"),
+        }
+        return self._macro_cache
+
+    def _macro_note_for_commodity(self):
+        macro = self.fetch_commodity_macro_snapshot()
+        dxy = macro.get("dollar_index")
+        if dxy and dxy.get("change_pct") is not None:
+            direction = "up" if dxy["change_pct"] > 0 else "down"
+            read = "a headwind" if direction == "up" else "supportive"
+            return (
+                f"&#128181; DXY {direction} {abs(dxy['change_pct']):.1f}% "
+                f"({dxy['level']}) — {read} for gold/silver."
+            )
+        y10 = macro.get("treasury_10y")
+        if y10 and y10.get("change_pct") is not None:
+            direction = "up" if y10["change_pct"] > 0 else "down"
+            read = "raises the opportunity cost of holding metals" if direction == "up" else "lowers the opportunity cost of holding metals"
+            return (
+                f"&#128200; 10Y yield {direction} {abs(y10['change_pct']):.1f}% "
+                f"({y10['level']}%) — {read}."
+            )
+        return None
+
     def _commodity_card_html(self, name, ticker_label, current_price, change, history, levels, plan, sparkline_history=None):
         """Renders one commodity card using the exact same table/card structure as stock cards."""
         buy_signal_html = self.buy_signal(history, name)
@@ -277,6 +383,11 @@ class CommodityTracker:
         history_rows = self._history_rows_html(history)
 
         bias_color = "#047857" if plan["bias"] == "Bullish" else "#dc2626" if plan["bias"] == "Bearish" else "#64748b"
+        macro_note = self._macro_note_for_commodity()
+        macro_html = (
+            f'<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:#f8fafc;'
+            f'border:1px solid #e2e8f0;font-size:12px;color:#475569;">{macro_note}</div>'
+        ) if macro_note else ""
 
         # 30-day sparkline. Falls back to the 7-day history if a longer
         # window wasn't provided, so this stays backward compatible.
@@ -331,8 +442,8 @@ class CommodityTracker:
                                     <div style="margin-top:4px;font-size:13px;font-weight:800;color:#dc2626;">&#8377;{plan['stop_loss']:.2f}</div>
                                 </td>
                                 <td style="padding:6px 0 6px 10px;width:50%;vertical-align:top;">
-                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Target</div>
-                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#047857;">&#8377;{plan['target']:.2f}</div>
+                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Target (momentum est.)</div>
+                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#047857;">&#8377;{plan['target_low']:.2f} &ndash; &#8377;{plan['target_high']:.2f}</div>
                                 </td>
                             </tr>
                             <!-- Buy Levels -->
@@ -348,6 +459,10 @@ class CommodityTracker:
                                         </div>
                                     </div>
                                 </td>
+                            </tr>
+                            <!-- Macro -->
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;">{macro_html}</td>
                             </tr>
                             <!-- Price History -->
                             <tr>
@@ -376,8 +491,10 @@ class CommodityTracker:
 
         gold_levels   = self.derive_buy_levels(gold["current"],   gold["history"])
         silver_levels = self.derive_buy_levels(silver["current"], silver["history"])
-        gold_plan   = self.build_trade_plan(gold["current"],   gold["history"],   gold_levels)
-        silver_plan = self.build_trade_plan(silver["current"], silver["history"], silver_levels)
+        gold_plan   = self.build_trade_plan(gold["current"],   gold["history"],   gold_levels,
+                                             sparkline_history=gold.get("sparkline_history"))
+        silver_plan = self.build_trade_plan(silver["current"], silver["history"], silver_levels,
+                                             sparkline_history=silver.get("sparkline_history"))
 
         gold_card = self._commodity_card_html(
             name="Gold (22K)", ticker_label="XAU/INR",
