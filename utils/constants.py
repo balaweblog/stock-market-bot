@@ -57,6 +57,5 @@ MF_PORTFOLIO = [
     "SBI Small Cap Fund - Direct Growth",
     "DSP Multi Asset Fund - Direct Growth",
     "ICICI Prudential Manufacturing Fund",
-    "DSP Natural Resources & New Energy Fund",
     "Nippon India Gold Savings Fund"
 ]
