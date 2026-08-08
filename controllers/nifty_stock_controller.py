@@ -500,9 +500,14 @@ def _parse_json_object(text):
 # -----------------------------
 # Stage runners
 # -----------------------------
+def _valid_market_json(text):
+    data = _parse_json_object(text)
+    return isinstance(data, dict) and isinstance(data.get("developments"), list)
+
+
 def run_market_stage(today_str, lookback_note):
     prompt = build_market_prompt(today_str, lookback_note)
-    text, sources, live = generate_analysis(prompt, max_tokens=3000)
+    text, sources, live = generate_analysis(prompt, max_tokens=3000, validate_fn=_valid_market_json)
     if not text:
         err_msg = "No LLM backend produced Stage 1 (market/macro) output. Aborting without sending an email."
         log.error(err_msg)
@@ -567,13 +572,20 @@ def _filter_to_requested_stocks(stocks, batch):
     return kept
 
 
+def _valid_stocks_json(text):
+    data = _parse_json_object(text)
+    return isinstance(data, dict) and isinstance(data.get("stocks"), list)
+
+
 def run_stock_stage(today_str, lookback_note):
     all_stocks, sources, used_live = [], [], False
     for batch in _chunks(WATCHLIST, STOCK_PER_BATCH):
         log.info(f"Stage 2 -- stock batch: {', '.join(batch)}")
         prompt = build_stock_prompt(batch, today_str, lookback_note)
         stock_queries = [f"{name} share price target news {today_str}" for name in batch]
-        text, s, live = generate_analysis(prompt, max_tokens=3200, extra_context_queries=stock_queries)
+        text, s, live = generate_analysis(
+            prompt, max_tokens=3200, extra_context_queries=stock_queries, validate_fn=_valid_stocks_json,
+        )
         if not text:
             log.error(f"No LLM output for stock batch ({', '.join(batch)}) -- skipping this batch.")
             continue
@@ -604,12 +616,17 @@ def run_stock_stage(today_str, lookback_note):
     return all_stocks, sources, used_live
 
 
+def _valid_sectors_json(text):
+    data = _parse_json_object(text)
+    return isinstance(data, dict) and isinstance(data.get("sectors"), list)
+
+
 def run_sector_stage(today_str, lookback_note):
     all_sectors, sources, used_live = [], [], False
     for batch in _chunks(SECTORS_STOCK, SECTORS_PER_BATCH):
         log.info(f"Stage 3 -- sector batch: {', '.join(batch)}")
         prompt = build_sector_prompt(batch, today_str, lookback_note)
-        text, s, live = generate_analysis(prompt, max_tokens=2000)
+        text, s, live = generate_analysis(prompt, max_tokens=2000, validate_fn=_valid_sectors_json)
         if not text:
             log.error(f"No LLM output for sector batch ({', '.join(batch)}) -- skipping this batch.")
             continue
