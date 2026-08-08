@@ -1,0 +1,48 @@
+Act as a SEBI-aware mutual fund research analyst. Using the most current data as of {today_str}, {lookback_note}
+
+For EACH of the following Indian mutual funds, research recent news, portfolio/AUM changes, and performance:
+{listing}
+
+{SOURCE_QUALITY_NOTE}
+
+{NO_FABRICATION_NOTE}
+
+For each fund, look for: AMC announcements, fund manager changes, portfolio additions/exits or sector-weight shifts disclosed in the latest factsheet, AUM changes, category-average/benchmark comparison, and any news specifically naming this fund or its major holdings. Where pre-fetched facts are provided above, use those values directly for nav_latest, fund_category, one_year_return_pct, three_year_return_pct -- do not override them with guesses.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "funds": [
+    {{
+      "fund_name": "Exact fund name as given above",
+      "news_timeline": [
+        {{
+          "date": "DD Month YYYY",
+          "headline": "Short headline",
+          "summary": "2-3 sentence summary",
+          "why_it_matters": "One sentence",
+          "impact_on_fund": "Positive | Neutral | Negative",
+          "confidence": "High | Medium | Low"
+        }}
+      ],
+      "portfolio_changes": "New additions, exits, increased/reduced holdings, sector-allocation shifts, cash allocation, AUM change, or fund-manager updates this month -- or 'No material disclosed changes found this window' if none verifiable",
+      "monthly_return_pct": "Approximate % return this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'monthly_return_pct' only.",
+      "benchmark_comparison": "How the fund did vs its benchmark/category this window -- cite specific benchmark name and index level or category average if known",
+      "fund_category": "Short fund category label, e.g. 'Large & Mid Cap' or 'Flexi Cap'",
+      "benchmark": "Benchmark index name (e.g. 'NIFTY Large Midcap 250 TRI') or 'Not disclosed'",
+      "nav_latest": "Latest NAV as a plain number string, or 'Not disclosed'",
+      "aum_cr": "Latest AUM in crore as a plain number string from AMFI/Value Research (e.g. '44048'), or 'Not disclosed'",
+      "expense_ratio_pct": "Latest expense ratio as a plain number string (e.g. '0.84'), or 'Not disclosed'",
+      "one_year_return_pct": "Latest 1-year CAGR return as a plain number string, or 'Not disclosed'",
+      "three_year_return_pct": "Latest 3-year CAGR return as a plain number string, or 'Not disclosed'",
+      "risk_level": "Low | Medium | High | Very High (from SEBI riskometer or AMC factsheet) or 'Not disclosed'",
+      "decision_note": "One short sentence on why this fund is attractive, neutral, or unattractive for a long-term SIP investor",
+      "assessment": "Positive | Neutral | Negative",
+      "short_term_outlook": "3-6 month outlook, 1-2 sentences referencing specific macro or sector factors",
+      "long_term_outlook": "5-20 year outlook, 1-2 sentences",
+      "recommendation": "Strong Buy | Buy | Continue SIP | Hold | Review | Reduce | Exit"
+    }}
+  ]
+}}
+Include one object per fund listed above, even if you found little news for it (in that case say so plainly rather than inventing content).

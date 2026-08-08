@@ -1,0 +1,43 @@
+STAGE 2 OF 2 -- TECHNICALS, SENTIMENT, AND TRADE PLAN. Using the most current market data as of {today_str}, {lookback_note}
+
+The stocks below have ALREADY passed independent fundamentals verification (>={min_growth_yoy_pct}% YoY revenue or profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no bullish MACD signal) -- do not force a pick that doesn't qualify.
+
+Fundamentally-qualified shortlist to evaluate (do not propose any stock outside this list):
+{listing}
+{exclude_block}
+
+{STRATEGY_TYPES_BLOCK}
+
+Mandatory technical / sentiment / risk filters:
+- Technicals (multi-month swing view): {uptrend_clause}weekly RSI between {min_rsi_oversold} and {max_rsi_overbought} (day-to-day direction doesn't matter); bullish MACD signal (MACD line above its signal line, OR the MACD histogram has been rising for 2+ consecutive weekly sessions -- a fresh crossover is not required).
+- Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
+- Risk/reward: minimum 1:{min_risk_reward} based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
+- Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
+- Only include a stock if it can be supported by verified current data and internally consistent numbers; if any required value is unverifiable, inconsistent, or weak, return an empty list rather than forcing a pick.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
+
+{{
+  "stocks": [
+    {{
+      "name": "Stock name",
+      "ticker": "Exact ticker from the shortlist above",
+      "allocation_pct": "e.g. 5-10%",
+      "entry_date": "Targeted entry date",
+      "exit_date": "Your own rough estimated exit date for the setup -- the report separately derives an independent target-distance-based horizon from real ATR data, so don't force this to any fixed window",
+      "strategy_type": "Strategy name used",
+      "confidence_score": "Conviction out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
+      "risk_level": "One word: 'Medium' or 'High'",
+      "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, Order Win, Sector Upgrade'",
+      "risk_reward_ratio": "e.g. '1 : 2.5' -- must arithmetically match stop_loss_pct and target1_pct below",
+      "upside_target_pct": "Favourable % you expect this setup to reach -- the time it should take is derived separately from this figure and real volatility data, not assumed to be a fixed period",
+      "stop_loss_pct": "Risk % (Stop-Loss)",
+      "target1_pct": "Expected Profit % (T1)",
+      "target2_pct": "Expected Profit % (T2), optional",
+      "top_buyers": "Recent FII/DII activity, if known",
+      "broker_recommendations": "e.g. 'Buy' with target X from a named brokerage, if known",
+      "rationale": "Two to three sentences covering technical + sentiment rationale (fundamentals already confirmed) and the key risk to watch"
+    }}
+  ]
+}}
+Only include a stock if it truly satisfies every mandatory technical/sentiment/risk filter with real, verifiable current data. Return "stocks": [] if none from the shortlist genuinely pass right now -- do not force a pick.

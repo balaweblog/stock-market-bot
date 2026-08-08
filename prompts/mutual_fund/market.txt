@@ -1,0 +1,28 @@
+Act as a CFA charterholder and mutual fund research analyst covering the Indian market. Using the most current data as of {today_str}, {lookback_note}
+
+Find and summarize the most important developments across these topics: {topic_list}.
+
+{SOURCE_QUALITY_NOTE}
+
+{NO_FABRICATION_NOTE}
+
+For each topic, search for what actually happened in the window above (index levels/moves, RBI policy actions, inflation prints, GDP releases, FII/DII net flows, Fed decisions, crude/gold/DXY moves, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "market_sentiment": "Bullish | Neutral | Bearish",
+  "sentiment_reason": "One or two sentences on why",
+  "developments": [
+    {{
+      "date": "DD Month YYYY",
+      "topic": "one of: {topic_list}",
+      "headline": "Short headline",
+      "summary": "2-3 sentence summary",
+      "sip_investor_impact": "How this specifically affects a long-term (5-20yr) SIP investor holding diversified Indian equity, US equity, manufacturing, and multi-asset/commodity mutual funds -- not just a restatement of the headline",
+      "confidence": "High | Medium | Low"
+    }}
+  ]
+}}
+List 15-25 genuine, dated developments across the topics above, in roughly chronological order. It is fine for some topics to have fewer items than others if less happened.

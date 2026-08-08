@@ -65,6 +65,7 @@ from email.mime.text import MIMEText
 
 from utils import config
 from utils.logger import log
+from utils.prompt_loader import load_prompt
 from controllers import swing_controller as swing
 from utils.compliance import build_compliance_block_html
 
@@ -2793,90 +2794,7 @@ def build_prompt(live_data=None):
     session_label, in_session = _market_session_label()
     live_data_block = format_live_data_block(live_data)
 
-    return f"""Core Objective: You are an expert quantitative derivatives analyst for Indian index options (Nifty 50). A LIVE DATA FEED has been provided below and must be treated as your absolute source of truth for this run. Do not invent, guess, or infer data not provided in the feed (web search is fine only for context this feed doesn't cover).
-
-{live_data_block}
-
-Analyze current market conditions and determine the optimal strategy stance for three distinct horizons:
-1. Weekly -- (current/nearest weekly expiry)
-2. Next Week -- (next week's expiry)
-3. Next to Next Week -- (the weekly expiry after Next Week, i.e. two weeks out)
-
---------------------------------------------------------------------------------
-STRATEGY & LEGS CONSTRAINT:
-For each horizon, "strategy_name" MUST be exactly one of these six DEFINED-RISK,
-capped-loss structures -- nothing else. Do not invent ratio spreads, backspreads,
-naked legs, broken-wing variants, or any structure with an extra/unequal leg
-beyond what's listed below -- those carry undefined risk, cannot be verified by
-this pipeline, and will be rejected outright:
-  - Bull Call Spread (2 legs: Buy lower-strike Call, Sell higher-strike Call)
-  - Bear Call Spread (2 legs: Sell lower-strike Call, Buy higher-strike Call)
-  - Bull Put Spread  (2 legs: Sell higher-strike Put, Buy lower-strike Put)
-  - Bear Put Spread  (2 legs: Buy higher-strike Put, Sell lower-strike Put)
-  - Iron Condor      (4 legs: Buy far OTM Put, Sell near OTM Put, Sell near OTM Call, Buy far OTM Call)
-  - Iron Butterfly   (4 legs: Buy far OTM Put, Sell ATM Put, Sell ATM Call, Buy far OTM Call)
-
-"legs" MUST be a single comma-separated STRING (not a JSON array) containing
-EXACTLY the legs that structure implies, with concrete strikes from the live
-data, in this exact format: "Sell 24000 PE, Buy 23800 PE" -- always
-"<Buy|Sell> <strike> <CE|PE>".
-
---------------------------------------------------------------------------------
-RISK & SELECTION RULES:
-- Heavy CALL open interest signals overhead resistance (bearish tilt).
-- Heavy PUT open interest signals underlying support (bullish tilt) -- the
-  opposite of reading heavy call activity as bullish.
-- Within the six allowed structures, prefer strike widths and short-strike
-  placement that maximize the credit-to-width (or reward-to-risk) ratio given
-  current IV, while keeping short strikes outside the expected move. Better
-  risk/reward comes from strike selection within these defined-risk
-  structures, not from adding undefined-risk ones.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "horizons": [
-    {{
-      "horizon": "Weekly",
-      "expiry_date": "The actual expiry date for Weekly copied EXACTLY as shown in the LIVE DATA FEED above.",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data for Weekly.",
-      "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
-      "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
-      "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
-      "confidence": "High",
-      "data_status": "live"
-    }},
-    {{
-      "horizon": "Next Week",
-      "expiry_date": "The actual expiry date for Next Week copied EXACTLY as shown in the LIVE DATA FEED above.",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data for Next Week.",
-      "strategy_name": "One of allowed defined-risk structures",
-      "legs": "Comma-separated string, e.g. 'Buy 24000 CE, Sell 24200 CE'",
-      "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
-      "confidence": "High",
-      "data_status": "live"
-    }},
-    {{
-      "horizon": "Next to Next Week",
-      "expiry_date": "The actual expiry date for Next to Next Week copied EXACTLY as shown in the LIVE DATA FEED above.",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "One or two sentences grounded in the live data for Next to Next Week.",
-      "strategy_name": "One of allowed defined-risk structures",
-      "legs": "Comma-separated string, e.g. 'Sell 23800 PE, Buy 23600 PE'",
-      "strike_rationale": "One qualitative sentence describing the logic behind the strategy placement.",
-      "confidence": "High",
-      "data_status": "live"
-    }}
-  ],
-  "portfolio_view": "One paragraph on overall market gap risk and multi-horizon portfolio diversification across Weekly, Next Week, and Next to Next Week setups."
-}}
-"""
+    return load_prompt("option/main", live_data_block=live_data_block)
 
 
 # -----------------------------
@@ -4240,31 +4158,28 @@ def build_repair_prompt(rejected_horizons, live_data):
         )
     bad_block = "\n".join(bad_lines)
 
-    return f"""You previously generated a Nifty options strategy report. The horizons below were REJECTED because their legs did not form a valid risk-defined structure. Fix ONLY the legs for these horizons, using the same live data feed as before -- do not change any other horizon.
-
-{live_data_block}
-
-REJECTED HORIZONS TO FIX:
-{bad_block}
-
-Respond with ONLY raw JSON:
-{{
-  "horizons": [
-    {{"horizon": "<name>", "strategy_name": "<corrected strategy name>", "legs": "<corrected legs string>"}}
-  ]
-}}
-"""
+    return load_prompt("option/repair", live_data_block=live_data_block, bad_block=bad_block)
 
 
 def repair_rejected_legs(horizons, live_data, sources=None):
+    """
+    Reasons over horizons + live_data that were ALREADY fetched earlier in
+    the run -- no new facts to find -- so this uses the non-live
+    generate_synthesis() tier (plain Groq -> plain Gemini) rather than the
+    full live-search cascade. Keeps groq/compound, Tavily, Gemini-
+    grounding, and Mistral quota free for the calls in this run that
+    actually depend on live search.
+    """
     rejected = [h for h in horizons if _horizon_rejected(h)]
     if not rejected:
         return horizons
 
     repair_prompt = build_repair_prompt(rejected, live_data)
     try:
-        repair_text, _repair_sources, _repair_used_search = swing.generate_analysis(
-            repair_prompt, validate_fn=lambda t: _parse_analysis_json(t)[0] is not None
+        repair_text = swing.generate_synthesis(
+            repair_prompt,
+            validate_fn=lambda t: _parse_analysis_json(t)[0] is not None,
+            log_label="option repair pass",
         )
     except Exception as e:
         log.warning(f"Repair pass call failed; keeping original rejection(s). Exception: {e}", exc_info=True)
@@ -4336,60 +4251,11 @@ def build_reformat_prompt(raw_analysis, live_data):
     possibly-inconsistent, set of numbers.
     """
     live_data_block = format_live_data_block(live_data)
-    return f"""Your previous response below was supposed to be ONLY a raw JSON object, but it was not valid JSON (it likely included markdown formatting, prose, or headers instead of / around the JSON). Convert it into the required JSON shape now. Do not re-analyze the market or change any figures, strikes, or conclusions -- just losslessly reformat your own content below into valid JSON.
-
-YOUR PREVIOUS RESPONSE:
-{raw_analysis}
-
---------------------------------------------------------------------------------
-LIVE DATA (for reference only, to correctly copy expiry dates / figures if needed):
-{live_data_block}
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "horizons": [
-    {{
-      "horizon": "Weekly",
-      "expiry_date": "...",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "...",
-      "strategy_name": "One of exactly: 'Bull Call Spread', 'Bear Call Spread', 'Bull Put Spread', 'Bear Put Spread', 'Iron Condor', 'Iron Butterfly'",
-      "legs": "Comma-separated string, e.g. 'Sell 24000 PE, Buy 23800 PE'",
-      "strike_rationale": "...",
-      "confidence": "High",
-      "data_status": "live"
-    }},
-    {{
-      "horizon": "Next Week",
-      "expiry_date": "...",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "...",
-      "strategy_name": "One of allowed defined-risk structures",
-      "legs": "Comma-separated string",
-      "strike_rationale": "...",
-      "confidence": "High",
-      "data_status": "live"
-    }},
-    {{
-      "horizon": "Next to Next Week",
-      "expiry_date": "...",
-      "bias": "One of: Bullish / Bearish / Neutral / Range-bound",
-      "next_week_bias": "n/a",
-      "bias_reason": "...",
-      "strategy_name": "One of allowed defined-risk structures",
-      "legs": "Comma-separated string",
-      "strike_rationale": "...",
-      "confidence": "High",
-      "data_status": "live"
-    }}
-  ],
-  "portfolio_view": "..."
-}}
-"""
+    return load_prompt(
+        "option/reformat",
+        raw_analysis=raw_analysis,
+        live_data_block=live_data_block,
+    )
 
 
 def reformat_unparseable_analysis(analysis, live_data):
@@ -4400,11 +4266,20 @@ def reformat_unparseable_analysis(analysis, live_data):
     should now be treated as "the analysis" going forward (for the raw-text
     fallback branch, if this rescue attempt also fails), or the original
     `analysis` unchanged if the reformat call itself couldn't be attempted.
+
+    This is a lossless reformat of the model's own prior answer -- no new
+    analysis, no new facts, no re-reading live data -- so it uses the
+    non-live generate_synthesis() tier (plain Groq -> plain Gemini)
+    instead of the full live-search cascade, keeping groq/compound,
+    Tavily, Gemini-grounding, and Mistral quota free for calls in this
+    run that actually depend on live search.
     """
     reformat_prompt = build_reformat_prompt(analysis, live_data)
     try:
-        reformatted_text, _sources, _used_search = swing.generate_analysis(
-            reformat_prompt, validate_fn=lambda t: _parse_analysis_json(t)[0] is not None
+        reformatted_text = swing.generate_synthesis(
+            reformat_prompt,
+            validate_fn=lambda t: _parse_analysis_json(t)[0] is not None,
+            log_label="option reformat pass",
         )
     except Exception as e:
         log.warning(f"Reformat pass call failed; keeping original unparseable output. Exception: {e}", exc_info=True)

@@ -60,6 +60,7 @@ from email.mime.text import MIMEText
 
 from utils import config
 from utils.logger import log
+from utils.prompt_loader import load_prompt
 from llm import llm_backend
 from utils.compliance import build_compliance_block_html
 from controllers.swing_controller import (
@@ -67,7 +68,7 @@ from controllers.swing_controller import (
     generate_analysis,
     _strip_code_fences,
     _build_sources_html,
-    _generate_local,
+    generate_synthesis,
     _require_live_or_abort,
 )
 
@@ -364,35 +365,14 @@ def _run_context():
 # -----------------------------
 def build_market_prompt(today_str, lookback_note):
     topic_list = ", ".join(MARKET_TOPICS)
-    return f"""Act as a CFA charterholder and mutual fund research analyst covering the Indian market. Using the most current data as of {today_str}, {lookback_note}
-
-Find and summarize the most important developments across these topics: {topic_list}.
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-For each topic, search for what actually happened in the window above (index levels/moves, RBI policy actions, inflation prints, GDP releases, FII/DII net flows, Fed decisions, crude/gold/DXY moves, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "market_sentiment": "Bullish | Neutral | Bearish",
-  "sentiment_reason": "One or two sentences on why",
-  "developments": [
-    {{
-      "date": "DD Month YYYY",
-      "topic": "one of: {topic_list}",
-      "headline": "Short headline",
-      "summary": "2-3 sentence summary",
-      "sip_investor_impact": "How this specifically affects a long-term (5-20yr) SIP investor holding diversified Indian equity, US equity, manufacturing, and multi-asset/commodity mutual funds -- not just a restatement of the headline",
-      "confidence": "High | Medium | Low"
-    }}
-  ]
-}}
-List 15-25 genuine, dated developments across the topics above, in roughly chronological order. It is fine for some topics to have fewer items than others if less happened.
-"""
+    return load_prompt(
+        "mutual_fund/market",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        topic_list=topic_list,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -417,55 +397,14 @@ def build_fund_prompt(funds_batch, today_str, lookback_note):
         fund_blocks.append(f"- {name}{fact_str}")
 
     listing = "\n".join(fund_blocks)
-    return f"""Act as a SEBI-aware mutual fund research analyst. Using the most current data as of {today_str}, {lookback_note}
-
-For EACH of the following Indian mutual funds, research recent news, portfolio/AUM changes, and performance:
-{listing}
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-For each fund, look for: AMC announcements, fund manager changes, portfolio additions/exits or sector-weight shifts disclosed in the latest factsheet, AUM changes, category-average/benchmark comparison, and any news specifically naming this fund or its major holdings. Where pre-fetched facts are provided above, use those values directly for nav_latest, fund_category, one_year_return_pct, three_year_return_pct -- do not override them with guesses.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "funds": [
-    {{
-      "fund_name": "Exact fund name as given above",
-      "news_timeline": [
-        {{
-          "date": "DD Month YYYY",
-          "headline": "Short headline",
-          "summary": "2-3 sentence summary",
-          "why_it_matters": "One sentence",
-          "impact_on_fund": "Positive | Neutral | Negative",
-          "confidence": "High | Medium | Low"
-        }}
-      ],
-      "portfolio_changes": "New additions, exits, increased/reduced holdings, sector-allocation shifts, cash allocation, AUM change, or fund-manager updates this month -- or 'No material disclosed changes found this window' if none verifiable",
-      "monthly_return_pct": "Approximate % return this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'monthly_return_pct' only.",
-      "benchmark_comparison": "How the fund did vs its benchmark/category this window -- cite specific benchmark name and index level or category average if known",
-      "fund_category": "Short fund category label, e.g. 'Large & Mid Cap' or 'Flexi Cap'",
-      "benchmark": "Benchmark index name (e.g. 'NIFTY Large Midcap 250 TRI') or 'Not disclosed'",
-      "nav_latest": "Latest NAV as a plain number string, or 'Not disclosed'",
-      "aum_cr": "Latest AUM in crore as a plain number string from AMFI/Value Research (e.g. '44048'), or 'Not disclosed'",
-      "expense_ratio_pct": "Latest expense ratio as a plain number string (e.g. '0.84'), or 'Not disclosed'",
-      "one_year_return_pct": "Latest 1-year CAGR return as a plain number string, or 'Not disclosed'",
-      "three_year_return_pct": "Latest 3-year CAGR return as a plain number string, or 'Not disclosed'",
-      "risk_level": "Low | Medium | High | Very High (from SEBI riskometer or AMC factsheet) or 'Not disclosed'",
-      "decision_note": "One short sentence on why this fund is attractive, neutral, or unattractive for a long-term SIP investor",
-      "assessment": "Positive | Neutral | Negative",
-      "short_term_outlook": "3-6 month outlook, 1-2 sentences referencing specific macro or sector factors",
-      "long_term_outlook": "5-20 year outlook, 1-2 sentences",
-      "recommendation": "Strong Buy | Buy | Continue SIP | Hold | Review | Reduce | Exit"
-    }}
-  ]
-}}
-Include one object per fund listed above, even if you found little news for it (in that case say so plainly rather than inventing content).
-"""
+    return load_prompt(
+        "mutual_fund/fund",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        listing=listing,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -473,30 +412,14 @@ Include one object per fund listed above, even if you found little news for it (
 # -----------------------------
 def build_sector_prompt(sectors_batch, today_str, lookback_note):
     listing = ", ".join(sectors_batch)
-    return f"""Act as an equity sector analyst covering the Indian and relevant global (US tech) markets. Using the most current data as of {today_str}, {lookback_note}
-
-For EACH of these sectors, summarize the past month's performance and outlook: {listing}.
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "sectors": [
-    {{
-      "sector": "Exact sector name as given above",
-      "monthly_performance": "1-2 sentences on how the sector index/theme moved this window",
-      "key_news": "1-2 sentences on the most important dated news item(s)",
-      "outlook": "1-2 sentences, next 3-6 months",
-      "rating": "Integer 1-5 (5 = most favorable outlook)"
-    }}
-  ]
-}}
-Include one object per sector listed above.
-"""
+    return load_prompt(
+        "mutual_fund/sector",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        listing=listing,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -508,19 +431,13 @@ def build_synthesis_prompt(market_data, funds_data, sectors_data, portfolio, tod
         ensure_ascii=False,
     )
     fund_list = ", ".join(portfolio)
-    return f"""You are a CFA charterholder and SEBI-aware mutual fund research analyst. You have ALREADY researched the material below (already dated/sourced -- do not re-search or add new facts, just reason over what's here):
-
-{context}
-
-The investor's portfolio is exactly these {len(portfolio)} funds: {fund_list}.
-
-Using ONLY the material above, produce a synthesis for a long-term (5-20 year) SIP investor. Respond with ONLY raw JSON matching this schema, nothing else (no markdown, no code fences, no commentary before or after):
-
-{{
-  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"]
-}}
-As of {today_str}.
-"""
+    return load_prompt(
+        "mutual_fund/synthesis",
+        context=context,
+        portfolio_count=len(portfolio),
+        fund_list=fund_list,
+        today_str=today_str,
+    )
 
 
 # -----------------------------
@@ -696,46 +613,16 @@ def _plain_generate(prompt, max_tokens=3800):
     """
     Stage 4 is reasoning over already-gathered, already-cited output from
     Stages 1-3 -- it isn't fetching new facts, so it doesn't need (and
-    isn't gated by) live web search. Tries Groq (plain) -> Gemini (plain)
-    -> local model, mirroring generate_analysis's backend order without
-    any of the search-cascade machinery.
+    isn't gated by) live web search. Thin wrapper around
+    llm_backend.generate_synthesis() -- the shared non-live reasoning
+    tier (plain Groq -> plain Gemini) -- so this stage doesn't spend
+    groq/compound, Tavily, Gemini-grounding, or Mistral quota that
+    Stages 1-3's genuinely search-dependent calls may still need this run.
+    Returns "" (falsy) rather than None on failure, matching
+    generate_synthesis()'s contract -- update callers accordingly.
     """
-    backend = llm_backend.init_llm_generator()
-    log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
-
-    if backend == "groq" and getattr(llm_backend, "groq_client", None) is not None:
-        try:
-            response = llm_backend.groq_client.chat.completions.create(
-                model=llm_backend.SYNTHESIS_MODELS[0],
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=3800,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            log.error(f"Groq synthesis call failed: {e}")
-
-    have_gemini = getattr(llm_backend, "gemini_client", None) is not None or (
-        os.getenv("GOOGLE_API_KEY") and getattr(llm_backend, "genai", None) is not None
-    )
-    if backend == "gemini" or have_gemini:
-        try:
-            if getattr(llm_backend, "gemini_client", None) is None:
-                llm_backend.gemini_client = llm_backend.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = llm_backend.gemini_client.models.generate_content(
-                model=llm_backend.GEMINI_MODEL, contents=prompt
-            )
-            return response.text.strip()
-        except Exception as e:
-            log.error(f"Gemini synthesis call failed: {e}")
-
-    local_backend = llm_backend.init_llm_generator(force_local=True)
-    if local_backend == "local" and llm_backend.llm_pipeline is not None:
-        text = _generate_local(prompt)
-        if text:
-            return text
-
-    return None
+    log.info("Stage 4 (synthesis) using non-live generate_synthesis().")
+    return generate_synthesis(prompt, max_tokens=max_tokens, log_label="Stage 4 (synthesis)")
 
 
 def run_synthesis_stage(market_data, funds_data, sectors_data, today_str):

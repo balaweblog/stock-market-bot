@@ -1,0 +1,37 @@
+STAGE 1 OF 2 -- FUNDAMENTALS SCREEN ONLY. Using the most current data as of {today_str}, {lookback_note}
+
+Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
+
+{mega_large_cap_caution}
+
+{SOURCE_QUALITY_NOTE}
+
+Search ONLY within these sectors this pass: {sector_list}. (Other sectors are covered in separate passes this run -- stay focused here so you search a handful of names deeply rather than many names thinly.)
+
+Search Strategy:
+- Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular, already-large names.
+- Run systematic, screener-style searches per sector, biased toward small/mid-cap universes, e.g.: "<sector> smallcap midcap NSE BSE India net profit growth above {min_growth_yoy_pct}% YoY Q1 FY27", "<sector> India smallcap quarterly results revenue growth {min_growth_yoy_pct} percent {today_str}", "BSE SmallCap 250 <sector> results beat estimates", "BSE MidCap 150 <sector> Q1 FY27 results", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups that explicitly cover smaller names, not just index heavyweights.
+- Aim to individually check at least 8-12 distinct real companies across the sectors above (weighted toward small/mid-cap) before concluding few or none qualify.
+{exclude_block}
+
+Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
+- Latest quarter: net profit OR revenue growth above {min_growth_yoy_pct}% YoY (only one of the two needs to clear the bar, not both), with margin expansion.
+- Low debt-to-equity (or strong asset quality for financials).
+- High/improving ROCE/ROE, and check for promoter/institutional buying last quarter if known.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, nothing else (no markdown, no code fences, no commentary before or after):
+
+{{
+  "candidates": [
+    {{
+      "name": "Stock name",
+      "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS') -- must be a real symbol you are confident is correct",
+      "sector": "One of the sectors listed above",
+      "market_cap_bucket": "One of: 'Small-cap', 'Mid-cap', 'Large-cap' -- your best estimate",
+      "revenue_growth_yoy_pct": "e.g. 24.5",
+      "profit_growth_yoy_pct": "e.g. 31.2",
+      "why": "One sentence on the growth driver"
+    }}
+  ]
+}}
+List every genuine candidate you find meeting the bar in these sectors -- up to 20, and favor small/mid-cap names per the market-cap steering above. It is normal for very few (even zero) to qualify in a given sector slice -- return "candidates": [] rather than padding the list.

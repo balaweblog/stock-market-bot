@@ -19,6 +19,7 @@ except ImportError:
 # live in llm_backend.py (shared with swing_trade_advisor.py and
 # optionstrategy.py) -- see the llm_backend import below.
 from utils.config import *
+from utils.prompt_loader import load_prompt
 from services.stock_fetcher import fetch_fundamentals
 from models.fundamentals import score_fundamentals
 from models.advanced_fundamentals import fetch_advanced_fundamentals, score_advanced_fundamentals
@@ -44,9 +45,10 @@ import threading
 # LLM client state and init now live in llm_backend.py (shared with
 # swing_trade_advisor.py / optionstrategy.py). These names are kept as
 # thin aliases so any external code still referencing stockpredictor.groq_client /
-# stockpredictor.gemini_client / stockpredictor.llm_pipeline / stockpredictor.model_lock /
+# stockpredictor.gemini_client / stockpredictor.model_lock /
 # stockpredictor.init_llm_generator keeps working -- they all point at the same
-# shared module state.
+# shared module state. (There is no local-model tier -- see llm_backend.py's
+# module docstring, "Removed tiers" -- so there's no llm_pipeline to alias.)
 model_lock = llm_backend.model_lock
 init_llm_generator = llm_backend.init_llm_generator
 
@@ -54,18 +56,18 @@ init_llm_generator = llm_backend.init_llm_generator
 # model_lock and init_llm_generator above are safe as plain aliases --
 # a threading.Lock() is a single object that's mutated in place, and
 # init_llm_generator is a function that's never rebound after import.
-# groq_client / gemini_client / llm_pipeline / genai are different:
-# llm_backend.init_llm_generator() REBINDS those names inside
-# llm_backend's own namespace at runtime (e.g. `global groq_client;
-# groq_client = Groq(...)`). A plain `groq_client = llm_backend.groq_client`
-# captured here at import time -- before init_llm_generator() has ever
-# run -- would freeze at None forever, regardless of what llm_backend
-# later assigns. stock_market_advisor.py and mutual_fund_advisor.py both
-# read stockpredictor.groq_client / stockpredictor.gemini_client /
-# stockpredictor.llm_pipeline / stockpredictor.genai after calling
-# init_llm_generator(), so they need the LIVE current value, not a
-# snapshot -- hence a PEP 562 module __getattr__ that forwards to
-# llm_backend on every lookup instead of copying once.
+# groq_client / gemini_client / genai are different: llm_backend.
+# init_llm_generator() REBINDS those names inside llm_backend's own
+# namespace at runtime (e.g. `global groq_client; groq_client = Groq(...)`).
+# A plain `groq_client = llm_backend.groq_client` captured here at import
+# time -- before init_llm_generator() has ever run -- would freeze at
+# None forever, regardless of what llm_backend later assigns.
+# stock_market_advisor.py and mutual_fund_advisor.py both read
+# stockpredictor.groq_client / stockpredictor.gemini_client /
+# stockpredictor.genai after calling init_llm_generator(), so they need
+# the LIVE current value, not a snapshot -- hence a PEP 562 module
+# __getattr__ that forwards to llm_backend on every lookup instead of
+# copying once.
 def __getattr__(name):
     if hasattr(llm_backend, name):
         return getattr(llm_backend, name)
@@ -280,40 +282,13 @@ def _gather_ai_stocks_story_context(stock_names, today_str):
 
 def _build_ai_stocks_story_prompt(stock_names, context_text, today_str):
     names_block = "\n".join(f"- {n}" for n in stock_names)
-    return (
-        f"{context_text}"
-        f"Today is {today_str}. For EACH stock listed below, write an \"AI Stock Story\": "
-        f"exactly {AI_STORY_BULLETS_PER_STOCK} short bullet points (max 15 words each, plain "
-        f"text, no sub-bullets, no markdown) covering, in order: "
-        f"1) the single most important recent driver, catalyst, or news item, "
-        f"2) the current momentum/sentiment read, "
-        f"3) the key risk or watch-item. "
-        f"Base each story on the live news snippets above where one exists for that stock; "
-        f"otherwise give a brief, generic-but-accurate read rather than inventing specifics.\n\n"
-        f"Then also write ONE \"Portfolio Summary\" laid out like the front-page digest of a "
-        f"financial newspaper (think a Bloomberg/WSJ \"markets at a glance\" box), synthesizing "
-        f"the picture ACROSS all the stocks together:\n"
-        f"1) \"headline\": one punchy news-style headline (max 12 words, title case, no ending "
-        f"period) capturing today's overall portfolio tone (risk-on/risk-off/mixed).\n"
-        f"2) \"points\": exactly {AI_PORTFOLIO_SUMMARY_POINTS} short, scannable news-brief bullet "
-        f"points (max 18 words each, plain text, no sub-bullets, no markdown, each reading like a "
-        f"newspaper digest item), covering across all points: the overall tone, the one or two "
-        f"most notable opportunities, and the one or two biggest risks or things to watch this "
-        f"week. No generic filler, every point must say something specific.\n\n"
-        f"Stocks:\n{names_block}\n\n"
-        "OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code "
-        "fences, no commentary before or after):\n"
-        "{\n"
-        '  "stories": {\n'
-        '    "<exact stock name as listed above>": ["bullet 1", "bullet 2", "bullet 3"],\n'
-        "    ...\n"
-        "  },\n"
-        '  "portfolio_summary": {\n'
-        '    "headline": "punchy news-style headline here",\n'
-        '    "points": ["news-brief point 1", "news-brief point 2", "..."]\n'
-        "  }\n"
-        "}\n"
-        "Every stock listed above must appear as a key, using the exact name given."
+    return load_prompt(
+        "stock/ai_story",
+        context_text=context_text,
+        today_str=today_str,
+        ai_story_bullets_per_stock=AI_STORY_BULLETS_PER_STOCK,
+        ai_portfolio_summary_points=AI_PORTFOLIO_SUMMARY_POINTS,
+        names_block=names_block,
     )
 
 

@@ -1,0 +1,13 @@
+You previously generated a Nifty options strategy report. The horizons below were REJECTED because their legs did not form a valid risk-defined structure. Fix ONLY the legs for these horizons, using the same live data feed as before -- do not change any other horizon.
+
+{live_data_block}
+
+REJECTED HORIZONS TO FIX:
+{bad_block}
+
+Respond with ONLY raw JSON:
+{{
+  "horizons": [
+    {{"horizon": "<name>", "strategy_name": "<corrected strategy name>", "legs": "<corrected legs string>"}}
+  ]
+}}

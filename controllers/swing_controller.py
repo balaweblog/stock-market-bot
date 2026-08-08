@@ -42,6 +42,7 @@ from utils import email_service
 
 from utils import config
 from utils.logger import log
+from utils.prompt_loader import load_prompt
 from services.stock_fetcher import fetch_stock_data
 from models.market_context import classify_market
 from utils.yf_throttle import get_shared_session, call_with_retries
@@ -1083,44 +1084,16 @@ def build_growth_screen_prompt(sectors, exclude_tickers, today_str, lookback_not
         "rejected earlier this run: " + ", ".join(sorted(t for t in exclude_tickers if t)) + "."
         if exclude_tickers else ""
     )
-    return f"""STAGE 1 OF 2 -- FUNDAMENTALS SCREEN ONLY. Using the most current data as of {today_str}, {lookback_note}
-
-Your ONLY job in this stage is to find genuine candidate stocks with an exceptionally strong recent quarter. Do NOT evaluate technicals (SMA/RSI/MACD), entry/exit levels, or risk:reward yet -- that happens in a separate Stage 2 call, only for whichever of your candidates survive independent verification against real financial data. Do not fabricate a growth figure -- if you cannot verify a real current number, omit the stock rather than guessing.
-
-{_mega_large_cap_caution()}
-
-{SOURCE_QUALITY_NOTE}
-
-Search ONLY within these sectors this pass: {sector_list}. (Other sectors are covered in separate passes this run -- stay focused here so you search a handful of names deeply rather than many names thinly.)
-
-Search Strategy:
-- Do NOT rely on generic "stocks to buy today" / "top picks" / "5 shares to buy" listicle articles -- these recycle the same handful of already-popular, already-large names.
-- Run systematic, screener-style searches per sector, biased toward small/mid-cap universes, e.g.: "<sector> smallcap midcap NSE BSE India net profit growth above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY Q1 FY27", "<sector> India smallcap quarterly results revenue growth {_fmt_num(MIN_GROWTH_YOY_PCT)} percent {today_str}", "BSE SmallCap 250 <sector> results beat estimates", "BSE MidCap 150 <sector> Q1 FY27 results", company investor-relations / exchange-filing results pages, and sector-specific earnings roundups that explicitly cover smaller names, not just index heavyweights.
-- Aim to individually check at least 8-12 distinct real companies across the sectors above (weighted toward small/mid-cap) before concluding few or none qualify.
-{exclude_block}
-
-Mandatory fundamentals filters (only stocks meeting ALL of these belong in your output):
-- Latest quarter: net profit OR revenue growth above {_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY (only one of the two needs to clear the bar, not both), with margin expansion.
-- Low debt-to-equity (or strong asset quality for financials).
-- High/improving ROCE/ROE, and check for promoter/institutional buying last quarter if known.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, nothing else (no markdown, no code fences, no commentary before or after):
-
-{{
-  "candidates": [
-    {{
-      "name": "Stock name",
-      "ticker": "Exact, currently-listed Yahoo Finance ticker (e.g. 'RELIANCE.NS') -- must be a real symbol you are confident is correct",
-      "sector": "One of the sectors listed above",
-      "market_cap_bucket": "One of: 'Small-cap', 'Mid-cap', 'Large-cap' -- your best estimate",
-      "revenue_growth_yoy_pct": "e.g. 24.5",
-      "profit_growth_yoy_pct": "e.g. 31.2",
-      "why": "One sentence on the growth driver"
-    }}
-  ]
-}}
-List every genuine candidate you find meeting the bar in these sectors -- up to 20, and favor small/mid-cap names per the market-cap steering above. It is normal for very few (even zero) to qualify in a given sector slice -- return "candidates": [] rather than padding the list.
-"""
+    return load_prompt(
+        "swing/growth_screen",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        mega_large_cap_caution=_mega_large_cap_caution(),
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        sector_list=sector_list,
+        min_growth_yoy_pct=_fmt_num(MIN_GROWTH_YOY_PCT),
+        exclude_block=exclude_block,
+    )
 
 
 def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note):
@@ -1143,50 +1116,20 @@ def build_technical_prompt(candidates, exclude_tickers, today_str, lookback_note
         "earlier this run: " + ", ".join(sorted(t for t in exclude_tickers if t)) + "."
         if exclude_tickers else ""
     )
-    return f"""STAGE 2 OF 2 -- TECHNICALS, SENTIMENT, AND TRADE PLAN. Using the most current market data as of {today_str}, {lookback_note}
-
-The stocks below have ALREADY passed independent fundamentals verification (>={_fmt_num(MIN_GROWTH_YOY_PCT)}% YoY revenue or profit growth, confirmed against real financial data, low debt, strong ROE) -- do not re-justify growth in your rationale beyond a brief mention. Your job now is to check EACH of these against the technical and sentiment filters below and build a trade plan ONLY for the ones that genuinely pass. It is fine, and expected, for some or all of these to fail on technicals (e.g. overbought, no bullish MACD signal) -- do not force a pick that doesn't qualify.
-
-Fundamentally-qualified shortlist to evaluate (do not propose any stock outside this list):
-{listing}
-{exclude_block}
-
-{STRATEGY_TYPES_BLOCK}
-
-Mandatory technical / sentiment / risk filters:
-- Technicals (multi-month swing view): {"price above its 50-day MA; " if REQUIRE_UPTREND_FILTER else ""}weekly RSI between {_fmt_num(MIN_RSI_OVERSOLD)} and {_fmt_num(MAX_RSI_OVERBOUGHT)} (day-to-day direction doesn't matter); bullish MACD signal (MACD line above its signal line, OR the MACD histogram has been rising for 2+ consecutive weekly sessions -- a fresh crossover is not required).
-- Sentiment: recent positive catalysts (analyst upgrades, sector tailwinds, large orders) and supportive FII/DII activity.
-- Risk/reward: minimum 1:{_fmt_num(MIN_RISK_REWARD)} based on your own proposed stop-loss and target -- before answering, verify the arithmetic yourself: risk_reward_ratio must equal (target1_pct / stop_loss_pct) to one decimal place; if it doesn't, adjust the target or stop-loss rather than reporting a mismatched ratio.
-- Do not fabricate a price, RSI value, or news item -- if you cannot verify a real current number, say so in "rationale" instead of inventing one.
-- Only include a stock if it can be supported by verified current data and internally consistent numbers; if any required value is unverifiable, inconsistent, or weak, return an empty list rather than forcing a pick.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching the schema below, and nothing else (no markdown, no code fences, no commentary before or after). Plain text/numbers only (no HTML):
-
-{{
-  "stocks": [
-    {{
-      "name": "Stock name",
-      "ticker": "Exact ticker from the shortlist above",
-      "allocation_pct": "e.g. 5-10%",
-      "entry_date": "Targeted entry date",
-      "exit_date": "Your own rough estimated exit date for the setup -- the report separately derives an independent target-distance-based horizon from real ATR data, so don't force this to any fixed window",
-      "strategy_type": "Strategy name used",
-      "confidence_score": "Conviction out of 10 (e.g. 8.8) -- weigh fundamental + technical + sentiment strength together",
-      "risk_level": "One word: 'Medium' or 'High'",
-      "key_catalysts": "2-4 near-term catalysts, comma-separated, e.g. 'Earnings, Order Win, Sector Upgrade'",
-      "risk_reward_ratio": "e.g. '1 : 2.5' -- must arithmetically match stop_loss_pct and target1_pct below",
-      "upside_target_pct": "Favourable % you expect this setup to reach -- the time it should take is derived separately from this figure and real volatility data, not assumed to be a fixed period",
-      "stop_loss_pct": "Risk % (Stop-Loss)",
-      "target1_pct": "Expected Profit % (T1)",
-      "target2_pct": "Expected Profit % (T2), optional",
-      "top_buyers": "Recent FII/DII activity, if known",
-      "broker_recommendations": "e.g. 'Buy' with target X from a named brokerage, if known",
-      "rationale": "Two to three sentences covering technical + sentiment rationale (fundamentals already confirmed) and the key risk to watch"
-    }}
-  ]
-}}
-Only include a stock if it truly satisfies every mandatory technical/sentiment/risk filter with real, verifiable current data. Return "stocks": [] if none from the shortlist genuinely pass right now -- do not force a pick.
-"""
+    uptrend_clause = "price above its 50-day MA; " if REQUIRE_UPTREND_FILTER else ""
+    return load_prompt(
+        "swing/technical",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        min_growth_yoy_pct=_fmt_num(MIN_GROWTH_YOY_PCT),
+        listing=listing,
+        exclude_block=exclude_block,
+        STRATEGY_TYPES_BLOCK=STRATEGY_TYPES_BLOCK,
+        uptrend_clause=uptrend_clause,
+        min_rsi_oversold=_fmt_num(MIN_RSI_OVERSOLD),
+        max_rsi_overbought=_fmt_num(MAX_RSI_OVERBOUGHT),
+        min_risk_reward=_fmt_num(MIN_RISK_REWARD),
+    )
 
 
 # -----------------------------
@@ -1303,12 +1246,20 @@ def generate_analysis(prompt, max_tokens=1200, extra_context_queries=None, valid
     """
     Thin wrapper around llm_backend.generate_analysis() -- this module used
     to hand-roll its own copy of the entire fallback chain (groq/compound ->
-    compound-mini -> Tavily+synthesis -> Gemini -> Mistral -> local); that
-    logic now lives once in llm_backend.py, shared with main.py's AI Stocks
-    Story and (via this function) optionstrategy.py.
+    compound-mini -> Tavily+synthesis -> Gemini -> Mistral); that logic now
+    lives once in llm_backend.py, shared with main.py's AI Stocks Story and
+    (via this function) optionstrategy.py.
 
     Only the swing-trade-specific piece stays here: which Tavily queries to
     run for the "grounded" tier (see _gather_tavily_context above).
+
+    This is the LIVE-SEARCH tier -- use it only for calls that need to find
+    or verify current facts (prices, fundamentals, news). For a call that's
+    reasoning over data already gathered earlier in the same run (a
+    reformat/repair pass, a final synthesis stage), use
+    llm_backend.generate_synthesis() instead -- it skips the search
+    cascade entirely rather than spending live-search quota on a call that
+    can't use it.
 
     extra_context_queries: optional list of extra search terms to fold into
     the Tavily grounding tier -- pass the specific stock/fund names a batch
@@ -1319,7 +1270,7 @@ def generate_analysis(prompt, max_tokens=1200, extra_context_queries=None, valid
     Without this, the chain's default validator only checks "non-empty" --
     so a tier that ignores the "respond with ONLY raw JSON" instruction and
     returns commentary/preamble text still counts as a "success", and the
-    chain never falls through to a later tier (Gemini/Mistral/local) that
+    chain never falls through to a later tier (Gemini/Mistral) that
     might have actually returned parseable JSON. Callers building Stage 1/
     Stage 2 prompts should pass a validator that confirms the response
     parses as their expected schema (see run()'s call sites) so a
@@ -3517,20 +3468,16 @@ def run():
 # -----------------------------------------------------------------------
 # Backward-compat shim (PEP 562)
 # -----------------------------------------------------------------------
-# stock_market_advisor.py and mutual_fund_advisor.py still do
-#   from swing_trade_advisor import (..., _generate_local, ...)
-# from before the LLM fallback chain (model init, groq/gemini clients,
-# _generate_local, etc.) was consolidated into llm_backend.py. This
-# module no longer defines those names itself -- it only calls
-# llm_backend.generate_analysis() -- so a plain `from swing_trade_advisor
-# import _generate_local` now raises ImportError.
-#
-# Rather than either breaking those two callers or re-adding a stale
-# duplicate implementation here, forward any attribute this module
+# nifty_stock_controller.py and mutual_fund_controller.py import
+# generate_synthesis (the non-live reasoning-only tier -- see its
+# docstring in llm_backend.py) via
+#   from controllers.swing_controller import (..., generate_synthesis, ...)
+# This module doesn't define that name itself -- it only wraps
+# llm_backend.generate_analysis() -- so forward any attribute this module
 # doesn't define itself to llm_backend, where it actually lives. This
-# covers _generate_local specifically (the one causing the ImportError)
-# as well as anything else callers may still expect at
-# swing_trade_advisor.<name> from the pre-consolidation layout.
+# also covers the now-removed _generate_local name and anything else
+# callers may still expect at swing_trade_advisor.<name> from the
+# pre-consolidation layout, without re-adding stale duplicate code here.
 def __getattr__(name):
     if hasattr(llm_backend, name):
         return getattr(llm_backend, name)

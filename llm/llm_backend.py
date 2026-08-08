@@ -33,8 +33,8 @@ FALLBACK CHAIN (all live-search paths tried before any non-live generation)
      `pip install mistralai`) -- tried regardless of which primary backend
      was selected, since it shares no quota with anything above.
 Only if every one of those fails, and only if REQUIRE_LIVE_DATA=false (the
-project default is "true"), does this fall through to non-live generation:
-plain Groq, then the local Qwen2.5-1.5B model.
+project default is "true"), does this fall through to non-live plain-Groq
+generation (no local-model tier -- see "Removed tiers" below).
 
 The list above is the order used when nothing is known about current
 quota yet (e.g. the first stock of a batch run). From the 2nd call
@@ -52,6 +52,26 @@ Callers own their own prompt construction, response parsing, and
 domain-specific context gathering (e.g. which Tavily queries to run) --
 this module only owns "which model, in which order, with which
 retry/backoff policy, and which error is worth retrying at all."
+
+REMOVED TIERS (financial-analysis fit / dead-code cleanup)
+------------------------------------------------------------
+  - Local Qwen2.5-1.5B-Instruct fallback: dropped. A 1.5B local model has
+    no web-search access and is unreliable at numeric/financial reasoning
+    (stock prices, mutual-fund NAVs, ratios) -- not fit for this project's
+    domain even as a last resort. It was also unreachable in practice:
+    REQUIRE_LIVE_DATA defaults to "true", and generate_analysis() returns
+    before ever reaching a local-model call when that's set (a stale,
+    non-live answer for stock/fund analysis is worse than no answer).
+    Removing it also drops the transformers/torch dependency for a path
+    that never fired.
+  - llama-3.1-8b-instant dropped from SYNTHESIS_MODELS: an 8B model is
+    meaningfully weaker than the 70B tier at numeric/financial reasoning
+    and more prone to inventing figures. Unlike the compound/Gemini/
+    Mistral tiers, it isn't a quota-independent path (same Groq account,
+    just a smaller model), so it added hallucination risk without adding
+    real resilience.
+  - openai / anthropic imports removed: never referenced anywhere in this
+    module -- dead imports.
 """
 
 import os
@@ -61,10 +81,6 @@ import json
 import threading
 
 try:
-    from transformers import pipeline
-except ImportError:
-    pipeline = None
-try:
     from groq import Groq
 except ImportError:
     Groq = None
@@ -72,16 +88,6 @@ try:
     from google import genai
 except ImportError:
     genai = None
-
-try:
-    import openai
-except ImportError:
-    openai = None
-
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
 
 from utils.logger import log
 
@@ -129,7 +135,12 @@ GROQ_COMPOUND_MINI_ATTEMPTS = _env_int("GROQ_COMPOUND_MINI_ATTEMPTS", 2)
 #     fire on its own (tool_use_failed) even with no tools passed, so it
 #     isn't reliable for plain synthesis calls. Add it back explicitly via
 #     SYNTHESIS_MODELS if you want to try it anyway.
-DEFAULT_SYNTHESIS_MODELS = "llama-3.3-70b-versatile,llama-3.1-8b-instant"
+#   - llama-3.1-8b-instant: dropped as of this revision -- an 8B model is
+#     too weak at numeric/financial reasoning for stock/mutual-fund
+#     analysis and shares the 70B tier's Groq account rather than adding
+#     an independent quota path. Add it back via SYNTHESIS_MODELS if a
+#     future caller has a lower-stakes, non-financial use for it.
+DEFAULT_SYNTHESIS_MODELS = "llama-3.3-70b-versatile"
 SYNTHESIS_MODELS = [
     m.strip() for m in os.getenv("SYNTHESIS_MODELS", DEFAULT_SYNTHESIS_MODELS).split(",")
     if m.strip()
@@ -137,7 +148,6 @@ SYNTHESIS_MODELS = [
 
 GEMINI_MODEL = "gemini-flash-latest"
 MISTRAL_MODEL = "mistral-medium-latest"
-LOCAL_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 
 # Hard ceiling on any single call's max_tokens, regardless of what a caller
 # requests -- keeps a bug in one caller's token-budget math from turning
@@ -150,7 +160,6 @@ MAX_TOKENS_CEILING = 4200
 # Shared client state (mirrors what main.py used to hold module-globally)
 # -----------------------------------------------------------------------
 model_lock = threading.Lock()
-llm_pipeline = None
 use_gemini_flash = False
 gemini_client = None
 use_groq = False
@@ -324,83 +333,45 @@ def _tavily_remaining_credits():
         return None
 
 
-def init_llm_generator(force_local=False):
+def init_llm_generator():
     """
     Initializes whichever LLM backend is available.
-    Priority: Groq (free tier) if GROQ_API_KEY is present, then Gemini
-    2.5 Flash if GOOGLE_API_KEY is present, then the local Qwen2.5-1.5B
-    model.
-
-    force_local=True skips the Groq/Gemini checks entirely and goes
-    straight to the local model. Use this when Groq/Gemini were already
-    tried by an earlier call in the same fallback chain and exhausted
-    their quota -- otherwise this function always re-picks Groq first
-    because it only checks whether GROQ_API_KEY is set, not whether it
-    still has quota left.
+    Priority: Groq (free tier) if GROQ_API_KEY is present, else Gemini
+    Flash if GOOGLE_API_KEY is present. Returns None if neither key is
+    configured -- there is no local-model fallback (see module docstring,
+    "Removed tiers": a local 1.5B model isn't fit for stock/mutual-fund
+    analysis and was unreachable in practice anyway).
     """
-    global llm_pipeline, use_gemini_flash, gemini_client, use_groq, groq_client
+    global use_gemini_flash, gemini_client, use_groq, groq_client
 
-    if not force_local:
-        groq_key = os.getenv("GROQ_API_KEY")
-        if groq_key and Groq is not None:
-            try:
-                log.info("Groq API key detected. Initializing Groq (Free Tier)...")
-                groq_client = Groq(api_key=groq_key)
-                use_groq = True
-                log.info("Groq initialized successfully.")
-                return "groq"
-            except Exception as exc:
-                log.warning(f"Failed to initialize Groq, falling back: {exc}")
-                use_groq = False
-                groq_client = None
-
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if api_key and genai is not None:
-            try:
-                log.info("Google API key detected. Initializing Gemini 2.5 Flash (Free Cloud Tier)...")
-                gemini_client = genai.Client(api_key=api_key)
-                use_gemini_flash = True
-                log.info("Gemini 2.5 Flash initialized successfully.")
-                return "gemini"
-            except Exception as exc:
-                log.warning(f"Failed to initialize Gemini, falling back to local model: {exc}")
-                use_gemini_flash = False
-                gemini_client = None
-
-    if pipeline is None:
-        log.warning("The 'transformers' library is not installed. LLM reasoning will be disabled.")
-        return None
-
-    if llm_pipeline is None:
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key and Groq is not None:
         try:
-            import torch
-            device = -1
-            torch_dtype = torch.float32
+            log.info("Groq API key detected. Initializing Groq (Free Tier)...")
+            groq_client = Groq(api_key=groq_key)
+            use_groq = True
+            log.info("Groq initialized successfully.")
+            return "groq"
+        except Exception as exc:
+            log.warning(f"Failed to initialize Groq, falling back: {exc}")
+            use_groq = False
+            groq_client = None
 
-            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                device = "mps"
-                torch_dtype = torch.float16
-                log.info("Apple Silicon GPU (MPS) detected. Enabling hardware acceleration.")
-            elif torch.cuda.is_available():
-                device = 0
-                torch_dtype = torch.float16
-                log.info("Nvidia GPU (CUDA) detected. Enabling hardware acceleration.")
-            else:
-                log.info("No compatible GPU detected. Running model on CPU.")
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if api_key and genai is not None:
+        try:
+            log.info("Google API key detected. Initializing Gemini Flash (Free Cloud Tier)...")
+            gemini_client = genai.Client(api_key=api_key)
+            use_gemini_flash = True
+            log.info("Gemini Flash initialized successfully.")
+            return "gemini"
+        except Exception as exc:
+            log.warning(f"Failed to initialize Gemini: {exc}")
+            use_gemini_flash = False
+            gemini_client = None
 
-            log.info(f"Initializing local AI model ({LOCAL_MODEL})...")
-            llm_pipeline = pipeline(
-                "text-generation",
-                model=LOCAL_MODEL,
-                device=device,
-                torch_dtype=torch_dtype,
-            )
-            log.info("Local AI model initialized successfully.")
-        except Exception as e:
-            log.error(f"Failed to initialize local AI model: {e}")
-            llm_pipeline = None
-
-    return "local" if llm_pipeline is not None else None
+    log.warning("Neither GROQ_API_KEY nor GOOGLE_API_KEY is configured. LLM reasoning will be disabled.")
+    return None
 
 # -----------------------------------------------------------------------
 # Error classification (single copy -- previously duplicated verbatim)
@@ -695,30 +666,71 @@ def _try_mistral_web_search(prompt, max_tokens=1500, log_label="analysis"):
         return None
 
 
-def _generate_local(prompt, max_new_tokens=1200, log_label="analysis"):
-    """Runs `prompt` through the local Qwen2.5-1.5B pipeline. Returns the
-    generated text, or None if unavailable/failed."""
-    if llm_pipeline is None:
-        return None
-    try:
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = llm_pipeline.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        with model_lock:
-            outputs = llm_pipeline(
-                formatted_prompt,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,
+# -----------------------------------------------------------------------
+# Non-live synthesis tier -- for reasoning over data that's ALREADY been
+# gathered (no new facts needed), e.g. reformatting a prior model reply
+# into strict JSON, repairing a rejected subset of an earlier analysis,
+# or a final synthesis stage over earlier stages' already-live-sourced
+# output. Deliberately skips groq/compound, Tavily, Gemini-grounding, and
+# Mistral entirely -- none of those add anything when the prompt already
+# contains everything the model needs, and running them anyway just burns
+# live-search quota that a genuinely search-dependent call elsewhere in
+# the same batch/run may need. Use generate_analysis() instead whenever
+# the call needs to find or verify current facts (prices, news, NAVs).
+# -----------------------------------------------------------------------
+def generate_synthesis(prompt, max_tokens=1200, validate_fn=None, log_label="synthesis"):
+    """
+    Lightweight two-tier fallback (plain Groq -> plain Gemini) for
+    reasoning-only calls. No search, no sources, no live-data flag --
+    callers that need any of those want generate_analysis() instead.
+
+    validate_fn: optional text -> bool, same idea as generate_analysis()'s
+    validate_fn. If Groq's reply fails this check (e.g. doesn't parse as
+    the expected JSON shape), it's treated as a failure and Gemini is
+    tried next, instead of returning content the caller can't use.
+    Defaults to "non-empty".
+
+    Returns the generated text, or "" (falsy) on total failure -- same
+    falsy-on-failure contract as generate_analysis()'s text slot, so
+    existing `if not text:` checks in callers work unchanged.
+    """
+    global gemini_client
+    if validate_fn is None:
+        validate_fn = lambda t: bool(t and t.strip())
+    max_tokens = min(max_tokens, MAX_TOKENS_CEILING)
+    backend = init_llm_generator()
+    log.info(f"{log_label} using LLM backend: {backend}")
+
+    if backend == "groq" and groq_client is not None and SYNTHESIS_MODELS:
+        try:
+            response = groq_client.chat.completions.create(
+                model=SYNTHESIS_MODELS[0],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.4,
-                top_k=50,
-                top_p=0.95,
+                max_tokens=max_tokens,
             )
-        generated_text = outputs[0]["generated_text"]
-        return generated_text.split("<|im_start|>assistant\n")[-1].replace("<|im_end|>", "").strip()
-    except Exception as e:
-        log.error(f"Local {log_label} generation failed: {e}")
-        return None
+            text = response.choices[0].message.content.strip()
+            if validate_fn(text):
+                return text
+            log.warning(f"Plain Groq synthesis for {log_label} didn't match the expected format -- trying Gemini.")
+        except Exception as e:
+            log.warning(f"Plain Groq synthesis failed for {log_label}: {e} -- trying Gemini.")
+
+    have_gemini = gemini_client is not None or (os.getenv("GOOGLE_API_KEY") and genai is not None)
+    if have_gemini:
+        try:
+            if gemini_client is None:
+                gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+            response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+            text = response.text.strip()
+            if validate_fn(text):
+                return text
+            log.warning(f"Plain Gemini synthesis for {log_label} didn't match the expected format.")
+        except Exception as e:
+            log.error(f"Plain Gemini synthesis failed for {log_label}: {e}")
+
+    log.error(f"Both plain-Groq and plain-Gemini synthesis failed for {log_label}.")
+    return ""
 
 
 # -----------------------------------------------------------------------
@@ -916,16 +928,9 @@ def generate_analysis(
         log.info(
             f"Every live-search path failed for {log_label}, and REQUIRE_LIVE_DATA=true "
             "means a non-search fallback's output would be discarded anyway -- skipping "
-            "the no-search Groq/Gemini call and the local model entirely rather than "
-            "spending remaining quota/CPU time on a result that can't be used. Set "
-            "REQUIRE_LIVE_DATA=false to allow a clearly-labeled stale-data run instead."
+            "the no-search Groq/Gemini call entirely rather than spending remaining quota "
+            "on a result that can't be used. Set REQUIRE_LIVE_DATA=false to allow a "
+            "clearly-labeled stale-data run instead."
         )
-        return "", [], False
-
-    local_backend = init_llm_generator(force_local=True)
-    if local_backend == "local" and llm_pipeline is not None:
-        text = _generate_local(prompt, max_new_tokens=min(max_tokens, 1200), log_label=log_label)
-        if text and _validate(text, "local model"):
-            return text, [], False
 
     return "", [], False

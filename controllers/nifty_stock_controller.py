@@ -59,6 +59,7 @@ import pandas as pd
 
 from utils import config
 from utils.logger import log
+from utils.prompt_loader import load_prompt
 from utils.compliance import build_compliance_block_html
 from utils.constants import WATCHLIST
 from controllers.swing_controller import (
@@ -66,7 +67,7 @@ from controllers.swing_controller import (
     generate_analysis,
     _strip_code_fences,
     _build_sources_html,
-    _generate_local,
+    generate_synthesis,
     _require_live_or_abort,
 )
 from llm import llm_backend
@@ -421,43 +422,14 @@ def _run_context():
 # -----------------------------
 def build_market_prompt(today_str, lookback_note):
     topic_list = ", ".join(MARKET_TOPICS)
-    return f"""Act as a CFA charterholder and equity market analyst covering the Indian market. Using the most current data as of {today_str}, {lookback_note}
-
-Find and summarize the most important developments across these topics: {topic_list}.
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-For each topic, search for what actually happened in the window above (index levels/moves, RBI actions, inflation prints, FII/DII net flows, Fed decisions, crude/gold moves, notable IPOs, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "market_sentiment": "Bullish | Neutral | Bearish",
-  "sentiment_reason": "One or two sentences on why",
-  "key_indicators": {{
-    "fii_flow_cr": "Most recent single-session FII net equity flow in \u20b9 crore as a plain signed number string (e.g. '-1245' or '850'), or null if not verifiable",
-    "fii_flow_date": "Date that FII figure is for (DD Month YYYY), or null",
-    "dii_flow_cr": "Most recent single-session DII net equity flow in \u20b9 crore as a plain signed number string, or null if not verifiable",
-    "dii_flow_date": "Date that DII figure is for (DD Month YYYY), or null",
-    "gsec_10y_yield_pct": "Latest India 10-year G-Sec yield as a plain number string (e.g. '6.98'), or null if not verifiable",
-    "gsec_10y_wow_change_bps": "Week-over-week change in the 10Y yield in basis points, as a signed plain number string (e.g. '+4' or '-3'), or null if not verifiable"
-  }},
-  "developments": [
-    {{
-      "date": "DD Month YYYY",
-      "topic": "one of: {topic_list}",
-      "headline": "Short headline",
-      "summary": "2-3 sentence summary",
-      "investor_impact": "How this specifically affects a long-term equity investor holding major Indian indices and blue-chips -- not just a restatement of the headline",
-      "confidence": "High | Medium | Low"
-    }}
-  ]
-}}
-List 15-25 genuine, dated developments across the topics above, in roughly chronological order. It is fine for some topics to have fewer items than others if less happened.
-"""
+    return load_prompt(
+        "nifty_stock/market",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        topic_list=topic_list,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -465,53 +437,14 @@ List 15-25 genuine, dated developments across the topics above, in roughly chron
 # -----------------------------
 def build_stock_prompt(stocks_batch, today_str, lookback_note):
     listing = "\n".join(f"- {s}" for s in stocks_batch)
-    return f"""Act as an equity research analyst. Using the most current data as of {today_str}, {lookback_note}
-
-For EACH of the following stocks, research recent news, price action, and corporate actions:
-{listing}
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-For each stock, look for: earnings/results, management commentary, analyst rating or target-price changes, M&A or capex announcements, regulatory action, order wins/losses, and any other news specifically naming this company.
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "stocks": [
-    {{
-      "stock_name": "Exact stock name as given above",
-      "news_timeline": [
-        {{
-          "date": "DD Month YYYY",
-          "headline": "Short headline",
-          "summary": "2-3 sentence summary",
-          "source_url": "URL if available"
-        }}
-      ],
-      "impact_on_stock": "Positive | Neutral | Negative",
-      "confidence": "High | Medium | Low",
-      "corporate_actions": "Earnings, buybacks, splits, bonus issues, board changes, M&A, or capex announcements this week -- or 'No material disclosed changes found this window' if none verifiable",
-      "weekly_return_pct": "Approximate % price move this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'weekly_return_pct' only.",
-      "analyst_view": "Any analyst rating/target-price change mentioned, or 'No update found this window'",
-      "current_price": "Latest price as a plain number string, or 'Not disclosed'",
-      "market_cap_cr": "Market cap in ₹ crore as a plain number string, or 'Not disclosed'",
-      "pe_ratio": "PE ratio as a plain number string, or 'Not disclosed'",
-      "sector": "Sector name or 'Not disclosed'",
-      "beta": "Beta as a plain number string, or 'Not disclosed'",
-      "risk_level": "Low | Medium | High or 'Not disclosed'",
-      "decision_note": "One short sentence on why this stock is attractive, neutral, or unattractive for a short-term or swing-trading investor",
-      "assessment": "Positive | Neutral | Negative",
-      "short_term_outlook": "1-4 week outlook, 1-2 sentences",
-      "recommendation": "Strong Buy | Buy | Hold | Review | Reduce | Exit",
-      "action": "One of exactly these five values: ACCUMULATE | CONTINUE SIP | HOLD | REDUCE SIP | EXIT / REPLACE -- the SIP-investor action this week. Use ACCUMULATE for a clear buying opportunity (dip into strength, positive catalyst); CONTINUE SIP when the long-term thesis is intact and regular SIP investing should carry on unchanged; HOLD when the picture is genuinely mixed and it's a wait-and-watch week; REDUCE SIP when conviction has weakened and future SIP amounts should be trimmed (but the thesis isn't broken); EXIT / REPLACE when the thesis is broken and the position should be exited or swapped for a stronger alternative."
-    }}
-  ]
-}}
-Include one object per stock listed above, even if you found little news for it (in that case say so plainly rather than inventing content).
-"""
+    return load_prompt(
+        "nifty_stock/stock",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        listing=listing,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -519,32 +452,14 @@ Include one object per stock listed above, even if you found little news for it 
 # -----------------------------
 def build_sector_prompt(sectors_batch, today_str, lookback_note):
     listing = ", ".join(sectors_batch)
-    return f"""Act as an equity sector analyst covering the Indian and relevant global (US tech) markets. Using the most current data as of {today_str}, {lookback_note}
-
-For EACH of these sectors, summarize the past week's performance and outlook: {listing}.
-
-{SOURCE_QUALITY_NOTE}
-
-{NO_FABRICATION_NOTE}
-
-OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "sectors": [
-    {{
-      "sector": "Sector Name",
-      "weekly_performance": "One sentence summarizing the sector's performance or trend this week",
-      "key_news": "One sentence on a major policy, earnings trend, or macro event impacting this sector",
-      "outlook": "One sentence forward-looking view for the next 2-4 weeks",
-      "rating": "A number from 1 to 5 (integer, e.g., 4) representing overall attractiveness right now",
-      "earnings_trend": "One of exactly: Positive | Neutral | Negative -- direction of this sector's earnings/results commentary this window",
-      "valuation": "One of exactly: Attractive | Fair | Expensive -- this sector's current valuation relative to its own history/peers"
-    }}
-  ]
-}}
-Include one object per sector listed above.
-"""
+    return load_prompt(
+        "nifty_stock/sector",
+        today_str=today_str,
+        lookback_note=lookback_note,
+        listing=listing,
+        SOURCE_QUALITY_NOTE=SOURCE_QUALITY_NOTE,
+        NO_FABRICATION_NOTE=NO_FABRICATION_NOTE,
+    )
 
 
 # -----------------------------
@@ -556,27 +471,13 @@ def build_synthesis_prompt(market_data, stocks_data, sectors_data, watchlist, to
         ensure_ascii=False,
     )
     stock_list = ", ".join(watchlist)
-    return f"""You are a CFA charterholder and equity research analyst. You have ALREADY researched the material below (already dated/sourced -- do not re-search or add new facts, just reason over what's here):
-
-{context}
-
-The investor's watchlist is exactly these {len(watchlist)} stocks: {stock_list}.
-
-Using ONLY the material above, produce a synthesis for an active equity investor. OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
-CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
-
-{{
-  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"],
-  "this_week_changes": [
-    {{
-      "change": "A short declarative statement of ONE significant shift this week, e.g. 'Banking leadership strengthened' or 'IT sector weakened' -- grounded in a specific WoW %, rating, flow figure, or news item already present in the material above",
-      "direction": "Positive | Negative | Neutral -- from a long-term equity investor's perspective"
-    }}
-  ]
-}}
-Exactly 5 items in this_week_changes, ranked by significance (most important first) -- draw from index leadership/laggards, sector rotation, FII/DII flow direction, VIX/crude/currency moves, and notable stock-level shifts in the material above. Do NOT claim a trend "reversed" or "turned" from a prior period unless the material above explicitly states what the prior period looked like -- describe what happened THIS window only.
-As of {today_str}.
-"""
+    return load_prompt(
+        "nifty_stock/synthesis",
+        context=context,
+        watchlist_count=len(watchlist),
+        stock_list=stock_list,
+        today_str=today_str,
+    )
 
 
 # -----------------------------
@@ -742,46 +643,16 @@ def _plain_generate(prompt, max_tokens=3800):
     """
     Stage 4 is reasoning over already-gathered, already-cited output from
     Stages 1-3 -- it isn't fetching new facts, so it doesn't need (and
-    isn't gated by) live web search. Tries Groq (plain) -> Gemini (plain)
-    -> local model, mirroring generate_analysis's backend order without
-    any of the search-cascade machinery.
+    isn't gated by) live web search. Thin wrapper around
+    llm_backend.generate_synthesis() -- the shared non-live reasoning
+    tier (plain Groq -> plain Gemini) -- so this stage doesn't spend
+    groq/compound, Tavily, Gemini-grounding, or Mistral quota that
+    Stages 1-3's genuinely search-dependent calls may still need this run.
+    Returns "" (falsy) rather than None on failure, matching
+    generate_synthesis()'s contract -- update callers accordingly.
     """
-    backend = llm_backend.init_llm_generator()
-    log.info(f"Stage 4 (synthesis) using LLM backend: {backend}")
-
-    if backend == "groq" and getattr(llm_backend, "groq_client", None) is not None:
-        try:
-            response = llm_backend.groq_client.chat.completions.create(
-                model=llm_backend.SYNTHESIS_MODELS[0],
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=3800,
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            log.error(f"Groq synthesis call failed: {e}")
-
-    have_gemini = getattr(llm_backend, "gemini_client", None) is not None or (
-        os.getenv("GOOGLE_API_KEY") and getattr(llm_backend, "genai", None) is not None
-    )
-    if backend == "gemini" or have_gemini:
-        try:
-            if getattr(llm_backend, "gemini_client", None) is None:
-                llm_backend.gemini_client = llm_backend.genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-            response = llm_backend.gemini_client.models.generate_content(
-                model=llm_backend.GEMINI_MODEL, contents=prompt
-            )
-            return response.text.strip()
-        except Exception as e:
-            log.error(f"Gemini synthesis call failed: {e}")
-
-    local_backend = llm_backend.init_llm_generator(force_local=True)
-    if local_backend == "local" and llm_backend.llm_pipeline is not None:
-        text = _generate_local(prompt)
-        if text:
-            return text
-
-    return None
+    log.info("Stage 4 (synthesis) using non-live generate_synthesis().")
+    return generate_synthesis(prompt, max_tokens=max_tokens, log_label="Stage 4 (synthesis)")
 
 
 def _normalize_weekly_changes(raw):

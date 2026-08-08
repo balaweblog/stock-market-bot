@@ -1,0 +1,25 @@
+Act as an equity sector analyst covering the Indian and relevant global (US tech) markets. Using the most current data as of {today_str}, {lookback_note}
+
+For EACH of these sectors, summarize the past week's performance and outlook: {listing}.
+
+{SOURCE_QUALITY_NOTE}
+
+{NO_FABRICATION_NOTE}
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "sectors": [
+    {{
+      "sector": "Sector Name",
+      "weekly_performance": "One sentence summarizing the sector's performance or trend this week",
+      "key_news": "One sentence on a major policy, earnings trend, or macro event impacting this sector",
+      "outlook": "One sentence forward-looking view for the next 2-4 weeks",
+      "rating": "A number from 1 to 5 (integer, e.g., 4) representing overall attractiveness right now",
+      "earnings_trend": "One of exactly: Positive | Neutral | Negative -- direction of this sector's earnings/results commentary this window",
+      "valuation": "One of exactly: Attractive | Fair | Expensive -- this sector's current valuation relative to its own history/peers"
+    }}
+  ]
+}}
+Include one object per sector listed above.

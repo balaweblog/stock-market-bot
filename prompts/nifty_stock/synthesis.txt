@@ -1,0 +1,20 @@
+You are a CFA charterholder and equity research analyst. You have ALREADY researched the material below (already dated/sourced -- do not re-search or add new facts, just reason over what's here):
+
+{context}
+
+The investor's watchlist is exactly these {watchlist_count} stocks: {stock_list}.
+
+Using ONLY the material above, produce a synthesis for an active equity investor. OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "top_developments": ["Up to 10 of the single most important developments from the material above, one sentence each, most important first"],
+  "this_week_changes": [
+    {{
+      "change": "A short declarative statement of ONE significant shift this week, e.g. 'Banking leadership strengthened' or 'IT sector weakened' -- grounded in a specific WoW %, rating, flow figure, or news item already present in the material above",
+      "direction": "Positive | Negative | Neutral -- from a long-term equity investor's perspective"
+    }}
+  ]
+}}
+Exactly 5 items in this_week_changes, ranked by significance (most important first) -- draw from index leadership/laggards, sector rotation, FII/DII flow direction, VIX/crude/currency moves, and notable stock-level shifts in the material above. Do NOT claim a trend "reversed" or "turned" from a prior period unless the material above explicitly states what the prior period looked like -- describe what happened THIS window only.
+As of {today_str}.

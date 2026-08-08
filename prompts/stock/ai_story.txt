@@ -1,0 +1,21 @@
+{context_text}Today is {today_str}. For EACH stock listed below, write an "AI Stock Story": exactly {ai_story_bullets_per_stock} short bullet points (max 15 words each, plain text, no sub-bullets, no markdown) covering, in order: 1) the single most important recent driver, catalyst, or news item, 2) the current momentum/sentiment read, 3) the key risk or watch-item. Base each story on the live news snippets above where one exists for that stock; otherwise give a brief, generic-but-accurate read rather than inventing specifics.
+
+Then also write ONE "Portfolio Summary" laid out like the front-page digest of a financial newspaper (think a Bloomberg/WSJ "markets at a glance" box), synthesizing the picture ACROSS all the stocks together:
+1) "headline": one punchy news-style headline (max 12 words, title case, no ending period) capturing today's overall portfolio tone (risk-on/risk-off/mixed).
+2) "points": exactly {ai_portfolio_summary_points} short, scannable news-brief bullet points (max 18 words each, plain text, no sub-bullets, no markdown, each reading like a newspaper digest item), covering across all points: the overall tone, the one or two most notable opportunities, and the one or two biggest risks or things to watch this week. No generic filler, every point must say something specific.
+
+Stocks:
+{names_block}
+
+OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code fences, no commentary before or after):
+{{
+  "stories": {{
+    "<exact stock name as listed above>": ["bullet 1", "bullet 2", "bullet 3"],
+    ...
+  }},
+  "portfolio_summary": {{
+    "headline": "punchy news-style headline here",
+    "points": ["news-brief point 1", "news-brief point 2", "..."]
+  }}
+}}
+Every stock listed above must appear as a key, using the exact name given.

@@ -1,0 +1,36 @@
+Act as a CFA charterholder and equity market analyst covering the Indian market. Using the most current data as of {today_str}, {lookback_note}
+
+Find and summarize the most important developments across these topics: {topic_list}.
+
+{SOURCE_QUALITY_NOTE}
+
+{NO_FABRICATION_NOTE}
+
+For each topic, search for what actually happened in the window above (index levels/moves, RBI actions, inflation prints, FII/DII net flows, Fed decisions, crude/gold moves, notable IPOs, etc.) -- do not pad with generic commentary that isn't tied to a dated event.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "market_sentiment": "Bullish | Neutral | Bearish",
+  "sentiment_reason": "One or two sentences on why",
+  "key_indicators": {{
+    "fii_flow_cr": "Most recent single-session FII net equity flow in \u20b9 crore as a plain signed number string (e.g. '-1245' or '850'), or null if not verifiable",
+    "fii_flow_date": "Date that FII figure is for (DD Month YYYY), or null",
+    "dii_flow_cr": "Most recent single-session DII net equity flow in \u20b9 crore as a plain signed number string, or null if not verifiable",
+    "dii_flow_date": "Date that DII figure is for (DD Month YYYY), or null",
+    "gsec_10y_yield_pct": "Latest India 10-year G-Sec yield as a plain number string (e.g. '6.98'), or null if not verifiable",
+    "gsec_10y_wow_change_bps": "Week-over-week change in the 10Y yield in basis points, as a signed plain number string (e.g. '+4' or '-3'), or null if not verifiable"
+  }},
+  "developments": [
+    {{
+      "date": "DD Month YYYY",
+      "topic": "one of: {topic_list}",
+      "headline": "Short headline",
+      "summary": "2-3 sentence summary",
+      "investor_impact": "How this specifically affects a long-term equity investor holding major Indian indices and blue-chips -- not just a restatement of the headline",
+      "confidence": "High | Medium | Low"
+    }}
+  ]
+}}
+List 15-25 genuine, dated developments across the topics above, in roughly chronological order. It is fine for some topics to have fewer items than others if less happened.

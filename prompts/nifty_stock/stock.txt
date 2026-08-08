@@ -1,0 +1,46 @@
+Act as an equity research analyst. Using the most current data as of {today_str}, {lookback_note}
+
+For EACH of the following stocks, research recent news, price action, and corporate actions:
+{listing}
+
+{SOURCE_QUALITY_NOTE}
+
+{NO_FABRICATION_NOTE}
+
+For each stock, look for: earnings/results, management commentary, analyst rating or target-price changes, M&A or capex announcements, regulatory action, order wins/losses, and any other news specifically naming this company.
+
+OUTPUT FORMAT -- respond with ONLY raw JSON matching this schema, nothing else.
+CRITICAL INSTRUCTION: Do NOT include any markdown formatting (like ```json), no headers, no prose. Your ENTIRE response MUST be a single valid JSON object starting with {{ and ending with }}.
+
+{{
+  "stocks": [
+    {{
+      "stock_name": "Exact stock name as given above",
+      "news_timeline": [
+        {{
+          "date": "DD Month YYYY",
+          "headline": "Short headline",
+          "summary": "2-3 sentence summary",
+          "source_url": "URL if available"
+        }}
+      ],
+      "impact_on_stock": "Positive | Neutral | Negative",
+      "confidence": "High | Medium | Low",
+      "corporate_actions": "Earnings, buybacks, splits, bonus issues, board changes, M&A, or capex announcements this week -- or 'No material disclosed changes found this window' if none verifiable",
+      "weekly_return_pct": "Approximate % price move this window as a plain number string (e.g. '2.4'), or null if not verifiable. Return the value under the exact key 'weekly_return_pct' only.",
+      "analyst_view": "Any analyst rating/target-price change mentioned, or 'No update found this window'",
+      "current_price": "Latest price as a plain number string, or 'Not disclosed'",
+      "market_cap_cr": "Market cap in \u20b9 crore as a plain number string, or 'Not disclosed'",
+      "pe_ratio": "PE ratio as a plain number string, or 'Not disclosed'",
+      "sector": "Sector name or 'Not disclosed'",
+      "beta": "Beta as a plain number string, or 'Not disclosed'",
+      "risk_level": "Low | Medium | High or 'Not disclosed'",
+      "decision_note": "One short sentence on why this stock is attractive, neutral, or unattractive for a short-term or swing-trading investor",
+      "assessment": "Positive | Neutral | Negative",
+      "short_term_outlook": "1-4 week outlook, 1-2 sentences",
+      "recommendation": "Strong Buy | Buy | Hold | Review | Reduce | Exit",
+      "action": "One of exactly these five values: ACCUMULATE | CONTINUE SIP | HOLD | REDUCE SIP | EXIT / REPLACE -- the SIP-investor action this week. Use ACCUMULATE for a clear buying opportunity (dip into strength, positive catalyst); CONTINUE SIP when the long-term thesis is intact and regular SIP investing should carry on unchanged; HOLD when the picture is genuinely mixed and it's a wait-and-watch week; REDUCE SIP when conviction has weakened and future SIP amounts should be trimmed (but the thesis isn't broken); EXIT / REPLACE when the thesis is broken and the position should be exited or swapped for a stronger alternative."
+    }}
+  ]
+}}
+Include one object per stock listed above, even if you found little news for it (in that case say so plainly rather than inventing content).
