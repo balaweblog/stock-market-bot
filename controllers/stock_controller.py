@@ -35,7 +35,7 @@ from utils.logger import log
 from services.commodity_tracker import CommodityTracker
 from utils.compliance import build_compliance_block_html
 from utils import email_service
-from models.track_record import update_track_record
+from models.track_record import update_track_record, build_track_record_html
 from models.support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
 from llm import llm_backend
 
@@ -92,6 +92,22 @@ SECTOR_CONCENTRATION_THRESHOLD_PCT = float(os.getenv("SECTOR_CONCENTRATION_THRES
 # dividend date in another and connect the two themselves.
 DIVIDEND_SELL_CONFLICT_WINDOW_DAYS = int(os.getenv("DIVIDEND_SELL_CONFLICT_WINDOW_DAYS", "10"))
 EVENT_RISK_PRIORITY_WINDOW_DAYS = int(os.getenv("EVENT_RISK_PRIORITY_WINDOW_DAYS", "2"))
+
+# Recommendation Aging thresholds (in days since a signal was FIRST issued,
+# not since it was last re-confirmed -- see _compute_signal_since()). A
+# STRONG BUY issued three weeks ago on stale market conditions shouldn't
+# read as freshly-minted advice just because today's run happened to repeat
+# it, so every stock card shows how old its current call actually is.
+#   age <= FRESH_DAYS               -> 🟢 Fresh
+#   FRESH_DAYS  < age <= AGING_DAYS -> 🟡 Aging
+#   age > AGING_DAYS                -> 🔴 Re-evaluate
+# REEVALUATE_DAYS is kept as the documented headline number ("after 30
+# days, re-evaluate") even though anything past AGING_DAYS already renders
+# as the same worst tier -- it exists so the badge's tooltip/copy can cite
+# a concrete "definitely stale by" day count.
+RECOMMENDATION_AGING_FRESH_DAYS = int(os.getenv("RECOMMENDATION_AGING_FRESH_DAYS", "7"))
+RECOMMENDATION_AGING_AGING_DAYS = int(os.getenv("RECOMMENDATION_AGING_AGING_DAYS", "14"))
+RECOMMENDATION_AGING_REEVALUATE_DAYS = int(os.getenv("RECOMMENDATION_AGING_REEVALUATE_DAYS", "30"))
 
 # Cash figures used by apply_risk_management() to size every equity position
 # (risk_per_trade % of this, per stock). Previously a single literal 100000
@@ -894,6 +910,72 @@ def fetch_macro_snapshot():
     }
 
 
+# Index used to compute "Alpha" for the track record: India-listed tickers
+# (.NS/.BO) are compared against Nifty 50, everything else against S&P 500.
+# Fetched once per run (lru_cache) since every call opened/closed this run
+# uses the same current index price.
+TRACK_RECORD_BENCHMARK_BY_MARKET = {
+    "India": "^NSEI",
+    "US": "^GSPC",
+}
+
+
+@functools.lru_cache(maxsize=1)
+def fetch_benchmark_snapshot():
+    """
+    One-per-run snapshot of the current Nifty 50 / S&P 500 level, used to
+    freeze a benchmark entry price when a track-record call opens and to
+    compute its realized Alpha when the call closes. Returns None for a
+    leg that fails to fetch, same degrade-gracefully pattern as
+    fetch_macro_snapshot() -- a flaky index fetch should cost that run's
+    Alpha numbers, not the whole report.
+    """
+    snapshot = {}
+    for market, index_ticker in TRACK_RECORD_BENCHMARK_BY_MARKET.items():
+        try:
+            hist = yf.Ticker(index_ticker).history(period="5d")
+            closes = hist["Close"].dropna()
+            snapshot[market] = round(float(closes.iloc[-1]), 2) if len(closes) else None
+        except Exception as exc:
+            print(f"Benchmark fetch failed for {index_ticker}: {exc}")
+            snapshot[market] = None
+    return snapshot
+
+
+def benchmark_for_ticker(ticker):
+    """Returns (benchmark_ticker, benchmark_price) for the given stock
+    ticker's market, or (None, None) if the snapshot leg failed to fetch."""
+    market = classify_market(ticker)
+    index_ticker = TRACK_RECORD_BENCHMARK_BY_MARKET.get(market)
+    price = (fetch_benchmark_snapshot() or {}).get(market)
+    if price is None:
+        return None, None
+    return index_ticker, price
+
+
+# Default horizon (in days) frozen onto a new track-record call -- "3
+# months", matching the report's usual swing/position-trade timeframe.
+# Overridable per-deployment since a more active or more patient book
+# would want a different default.
+TRACK_RECORD_DEFAULT_HORIZON_DAYS = int(os.getenv("TRACK_RECORD_DEFAULT_HORIZON_DAYS", "90"))
+
+
+def estimate_call_probability_pct(total_score):
+    """
+    Maps the 0-100 combined score onto a rough 50-90% "model confidence"
+    band for display alongside a call's frozen target/stop. This is a
+    heuristic readout of the model's own conviction, NOT a statistically
+    calibrated win probability -- it isn't backtested against the actual
+    hit rate, so it shouldn't be read as "62% of these hit their target".
+    The real, empirical hit rate is whatever build_track_record_html()
+    reports from the closed-call history once enough calls have closed.
+    """
+    if total_score is None:
+        return None
+    score = max(0.0, min(100.0, float(total_score)))
+    return round(50 + (score / 100) * 40, 1)
+
+
 # Sector/industry keyword -> which macro leg is relevant and how to phrase
 # it. Checked against market_context's sector/industry strings (lowercased).
 # Deliberately narrow: only fires for names where the macro driver is a
@@ -1139,6 +1221,185 @@ def build_signal_confirmation_html(confirmation):
                             </tr>"""
 
 
+# ---------------------------------------------------------------------------
+# Signal Matrix -- formal version of the ad hoc Technical-vs-Fundamental
+# conflict check above (compute_signal_confirmation), generalized to a
+# proper 3-input (Technical / Fundamental / Sentiment) traffic-light matrix
+# that resolves to one decision label per stock, e.g. the BAJFINANCE case
+# (Technical 96.3, Fundamental 0) reads as a direct 🟢/🔴 conflict and
+# resolves to WAIT rather than being averaged away into a mid-scale number.
+#
+# Resolution order (first match wins):
+#   1. Technical vs Fundamental DIRECT disagreement (one 🟢, other 🔴) is
+#      called out explicitly as WAIT/WATCH regardless of what Sentiment
+#      says -- averaging a green/red clash on the two structural signals
+#      into a mid-scale score would hide the disagreement, which is
+#      exactly the failure mode this feature exists to formalize away.
+#   2. Otherwise every level is worth +1 (🟢) / 0 (🟡) / -1 (🔴) and the
+#      three are summed (-3..+3) into a decision via
+#      SIGNAL_MATRIX_DECISIONS_BY_TOTAL.
+# ---------------------------------------------------------------------------
+_SIGNAL_LEVEL_ICON = {"bullish": "🟢", "neutral": "🟡", "bearish": "🔴"}
+_SIGNAL_LEVEL_POINTS = {"bullish": 1, "neutral": 0, "bearish": -1}
+
+# total -> (decision, color, background, border). Only reached when
+# Technical and Fundamental are NOT in direct 🟢/🔴 opposition (see the
+# WAIT/WATCH overrides in compute_signal_matrix) -- e.g. total=3 is only
+# reachable via 🟢🟢🟢, total=-3 only via 🔴🔴🔴, matching the two clean
+# ends of the matrix in the spec exactly.
+SIGNAL_MATRIX_DECISIONS_BY_TOTAL = {
+    3:  ("STRONG BUY", "#047857", "#dcfce7", "#86efac"),
+    2:  ("BUY",        "#047857", "#dcfce7", "#86efac"),
+    1:  ("ACCUMULATE", "#0f766e", "#ecfdf5", "#99f6e4"),
+    0:  ("HOLD",       "#A6812F", "#fdf3d9", "#f0dca0"),
+    -1: ("REDUCE",     "#c2410c", "#fff1e6", "#fcd9b8"),
+    -2: ("SELL",       "#8B2E2E", "#fff7f7", "#f5c2c7"),
+    -3: ("EXIT",       "#8B2E2E", "#fff7f7", "#f5c2c7"),
+}
+
+
+def compute_signal_matrix(tech_score, fund_score, sentiment_score, sentiment_label):
+    """
+    Buckets Technical / Fundamental / Sentiment each into bullish/neutral/
+    bearish (same thresholds compute_signal_confirmation already uses --
+    80/50 for tech, 70/40 for fund, 60/40 for sentiment), then resolves
+    the 3-way combination to one decision label per the module docstring
+    above.
+
+    Returns a dict: tech_level/fund_level/sent_level ("bullish"/"neutral"/
+    "bearish"/None), icons (🟢/🟡/🔴/⚪ per factor), decision, color/
+    background/border for display, and a one-line rationale.
+    """
+    tech_level = _signal_direction(tech_score, 80, 50)
+    fund_level = _signal_direction(fund_score, 70, 40)
+    sent_level = None
+    if sentiment_label != "Data Unavailable" and sentiment_score is not None:
+        sent_level = _signal_direction(sentiment_score, 60, 40)
+
+    icons = {
+        "technical": _SIGNAL_LEVEL_ICON.get(tech_level, "⚪"),
+        "fundamental": _SIGNAL_LEVEL_ICON.get(fund_level, "⚪"),
+        "sentiment": _SIGNAL_LEVEL_ICON.get(sent_level, "⚪"),
+    }
+
+    if tech_level is None or fund_level is None:
+        return {
+            "tech_level": tech_level, "fund_level": fund_level, "sent_level": sent_level,
+            "icons": icons, "decision": None, "color": "#8A8F9C", "background": "#F4F2ED",
+            "border": "#E7E4DC", "rationale": "Not enough data to place this stock on the Signal Matrix.",
+        }
+
+    if tech_level == "bullish" and fund_level == "bearish":
+        decision, color, bg, border = "WAIT", "#A6812F", "#fdf3d9", "#f0dca0"
+        rationale = (
+            f"Technical reads bullish ({tech_score}) but Fundamental reads bearish "
+            f"({fund_score}/100) -- a direct conflict on the two structural signals. "
+            f"Wait for fundamentals to confirm before treating the technical strength as buyable."
+        )
+    elif tech_level == "bearish" and fund_level == "bullish":
+        decision, color, bg, border = "WATCH", "#A6812F", "#fdf3d9", "#f0dca0"
+        rationale = (
+            f"Fundamental reads bullish ({fund_score}/100) but Technical reads bearish "
+            f"({tech_score}) -- solid fundamentals, broken technicals. Watch for the "
+            f"technical picture to turn before adding rather than buying the weakness."
+        )
+    else:
+        total = (
+            _SIGNAL_LEVEL_POINTS.get(tech_level, 0)
+            + _SIGNAL_LEVEL_POINTS.get(fund_level, 0)
+            + (_SIGNAL_LEVEL_POINTS.get(sent_level, 0) if sent_level is not None else 0)
+        )
+        decision, color, bg, border = SIGNAL_MATRIX_DECISIONS_BY_TOTAL.get(total, ("HOLD", "#A6812F", "#fdf3d9", "#f0dca0"))
+        sent_text = f"Sentiment {sent_level}" if sent_level else "Sentiment n/a"
+        rationale = f"Technical {tech_level}, Fundamental {fund_level}, {sent_text} -- combined score {total:+d}/3."
+
+    return {
+        "tech_level": tech_level, "fund_level": fund_level, "sent_level": sent_level,
+        "icons": icons, "decision": decision, "color": color, "background": bg,
+        "border": border, "rationale": rationale,
+    }
+
+
+def build_signal_matrix_html(matrix):
+    """Renders the per-stock Signal Matrix badge: the three factor icons,
+    the resolved Decision, and a one-line rationale. Returns "" if there
+    wasn't enough data to classify (matches build_signal_confirmation_html's
+    own "nothing to show" behavior)."""
+    if not matrix or not matrix.get("decision"):
+        return ""
+    icons = matrix["icons"]
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding:6px 0;">
+                                    <div style="padding:8px 10px;border-radius:6px;background:{matrix['background']};border:1px solid {matrix['border']};">
+                                        <strong style="color:{matrix['color']};">Signal Matrix: {html.escape(matrix['decision'])}</strong>
+                                        <span style="margin-left:8px;font-size:13px;letter-spacing:0.15em;">{icons['technical']}{icons['fundamental']}{icons['sentiment']}</span>
+                                        <div style="color:#475569;margin-top:3px;font-size:12px;">{html.escape(matrix['rationale'])}</div>
+                                    </div>
+                                </td>
+                            </tr>"""
+
+
+def build_signal_matrix_legend_html():
+    """
+    Static reference table for the Signal Matrix, rendered once near the
+    top of the report so a reader can look up what any given 🟢/🟡/🔴
+    combination on a stock card resolves to. Mirrors
+    SIGNAL_MATRIX_DECISIONS_BY_TOTAL plus the two hard-conflict overrides
+    computed by compute_signal_matrix(), rather than hand-duplicating the
+    logic -- this iterates the same code path so the legend can never
+    drift out of sync with what the per-stock badges actually show.
+    """
+    def _row(tech, fund, sent, decision, color):
+        return (
+            '<tr>'
+            f'<td style="padding:5px 10px;text-align:center;font-size:14px;">{tech}</td>'
+            f'<td style="padding:5px 10px;text-align:center;font-size:14px;">{fund}</td>'
+            f'<td style="padding:5px 10px;text-align:center;font-size:14px;">{sent}</td>'
+            f'<td style="padding:5px 10px;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Helvetica,Arial,sans-serif;font-size:12px;font-weight:700;color:{color};">{decision}</td>'
+            '</tr>'
+        )
+
+    # Representative rows -- one canonical combination per decision bucket
+    # (using neutral/🟡 sentiment as the default third leg) plus both
+    # hard-conflict overrides, rather than all 27 permutations.
+    rows = [
+        ("🟢", "🟢", "🟢", "STRONG BUY", "#047857"),
+        ("🟢", "🟢", "🟡", "BUY", "#047857"),
+        ("🟢", "🟡", "🟡", "ACCUMULATE", "#0f766e"),
+        ("🟡", "🟡", "🟡", "HOLD", "#A6812F"),
+        ("🟡", "🔴", "🟡", "REDUCE", "#c2410c"),
+        ("🔴", "🔴", "🟡", "SELL", "#8B2E2E"),
+        ("🔴", "🔴", "🔴", "EXIT", "#8B2E2E"),
+        ("🟢", "🔴", "🟢", "WAIT", "#A6812F"),
+        ("🔴", "🟢", "🟢", "WATCH", "#A6812F"),
+    ]
+    rows_html = "".join(_row(*r) for r in rows)
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:14px 20px;border:1px solid #E7E4DC;border-radius:4px;overflow:hidden;">
+      <tr>
+        <td style="background:#14213D;padding:9px 14px;">
+          <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:12px;font-weight:700;color:#ffffff;">Signal Matrix Legend</span>
+          <span style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:11px;color:#B7BEC9;margin-left:8px;">How Technical / Fundamental / Sentiment combine into each stock's Decision below</span>
+        </td>
+      </tr>
+      <tr>
+        <td style="padding:4px 4px 8px;">
+          <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+            <tr>
+              <td style="padding:6px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#8A8F9C;">Technical</td>
+              <td style="padding:6px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#8A8F9C;">Fundamental</td>
+              <td style="padding:6px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#8A8F9C;">Sentiment</td>
+              <td style="padding:6px 10px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;text-transform:uppercase;letter-spacing:0.05em;color:#8A8F9C;">Decision</td>
+            </tr>
+            {rows_html}
+          </table>
+        </td>
+      </tr>
+    </table>
+    """
+
+
 def _safe_float(value):
     try:
         numeric_value = float(value)
@@ -1249,6 +1510,11 @@ def calculate_risk_meter(df, latest, beta=None):
         "border": overall_meta["border"],
         "score": overall_score,
         "factors": factor_rows,
+        # Raw (unformatted) volatility, kept alongside the display-ready
+        # factor_rows entry above so build_caution_flags() below can
+        # threshold on the number without re-parsing "12.34%" back out of
+        # the formatted string.
+        "volatility_pct": volatility_pct,
     }
 
 
@@ -1394,6 +1660,100 @@ def build_52_week_range_html(range_data):
                                                     <div style="font-size:10px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">vs 52W Low</div>
                                                     <div style="margin-top:4px;font-size:13px;font-weight:800;color:{range_data['low_distance_color']};">{range_data['low_distance_text']}</div>
                                                 </div>
+                                            </td>
+                                        </tr>
+                                    </table>
+                                </td>
+                            </tr>
+    """
+
+
+# ---------------------------------------------------------------------------
+# "Why NOT to Buy" -- counter-signal panel for the per-stock card.
+#
+# calculate_score()'s `reason` list already makes the case FOR a signal
+# (trend/RSI/MACD/ADX/volume), but says nothing about entry timing risk --
+# a stock can score high on structure and still be a bad entry TODAY if
+# it's up sharply on the day (chasing, not dipping), stretched well above
+# its EMA20, RSI-overbought, sitting right under its 52-week high
+# (resistance overhead), unusually volatile, or offering a thin reward:risk.
+# This surfaces those as an explicit "DON'T BUY because" list rendered next
+# to the existing reasons, so a BUY signal shows its entry-risk caveats
+# instead of reading as unconditionally clean.
+#
+# Each check is independently opt-in (a None input just skips that check)
+# since not every caller has every value on hand.
+# ---------------------------------------------------------------------------
+CAUTION_DAY_MOVE_PCT = float(os.getenv("CAUTION_DAY_MOVE_PCT", "3.0"))
+CAUTION_EMA20_STRETCH_PCT = float(os.getenv("CAUTION_EMA20_STRETCH_PCT", "6.0"))
+CAUTION_RSI_OVERBOUGHT = float(os.getenv("CAUTION_RSI_OVERBOUGHT", "70"))
+CAUTION_VOLATILITY_PCT = float(os.getenv("CAUTION_VOLATILITY_PCT", "35.0"))
+CAUTION_NEAR_52W_HIGH_PCT = float(os.getenv("CAUTION_NEAR_52W_HIGH_PCT", "3.0"))
+CAUTION_MIN_RR = float(os.getenv("CAUTION_MIN_RR", "1.5"))
+
+
+def build_caution_flags(day_change_pct=None, price_vs_ema20_pct=None, rsi=None,
+                         volatility_pct=None, range_52w=None, risk_reward_ratio=None):
+    """
+    Returns a list of (text, severity) "Why NOT to Buy" caution tuples.
+    severity is 'high' or 'medium', used only to pick the display icon --
+    it doesn't gate whether the flag shows up.
+    """
+    flags = []
+
+    if day_change_pct is not None and day_change_pct >= CAUTION_DAY_MOVE_PCT:
+        flags.append((f"Already up {day_change_pct:.1f}% today -- may be chasing, not a genuine dip", "high"))
+
+    if price_vs_ema20_pct is not None and price_vs_ema20_pct >= CAUTION_EMA20_STRETCH_PCT:
+        flags.append((f"{price_vs_ema20_pct:.1f}% above EMA20 -- stretched, pullback risk", "medium"))
+
+    if rsi is not None and rsi >= CAUTION_RSI_OVERBOUGHT:
+        flags.append((f"RSI at {rsi:.0f} -- overbought territory", "medium"))
+
+    if volatility_pct is not None and volatility_pct >= CAUTION_VOLATILITY_PCT:
+        flags.append((f"Volatility {volatility_pct:.1f}% (annualized) -- wide swings", "medium"))
+
+    if range_52w:
+        high_52w = range_52w.get("high_52w")
+        current_price = range_52w.get("current_price")
+        if high_52w and current_price and high_52w > 0:
+            pct_below_high = ((current_price - high_52w) / high_52w) * 100
+            if pct_below_high >= -CAUTION_NEAR_52W_HIGH_PCT:
+                flags.append(("Trading right at its 52-week high -- limited headroom, resistance overhead", "medium"))
+
+    if risk_reward_ratio is not None and risk_reward_ratio < CAUTION_MIN_RR:
+        flags.append((f"Reward:risk only {risk_reward_ratio}:1 -- thin margin versus the stop", "medium"))
+
+    return flags
+
+
+def build_why_buy_why_not_html(reasons, caution_flags):
+    """Renders the two-column 'BUY because / DON'T BUY because' panel that
+    sits under the existing card metrics. Returns "" if there's nothing on
+    either side (so callers can splice it into an f-string unconditionally)."""
+    if not reasons and not caution_flags:
+        return ""
+
+    buy_items = "".join(
+        f'<div style="padding:2px 0;">✅ {html.escape(str(r))}</div>' for r in reasons
+    ) or '<div style="padding:2px 0;color:#8A8F9C;">No strong technical drivers</div>'
+
+    caution_items = "".join(
+        f'<div style="padding:2px 0;">⚠️ {html.escape(text)}</div>' for text, _sev in caution_flags
+    ) or '<div style="padding:2px 0;color:#8A8F9C;">No notable entry-timing caution flags</div>'
+
+    return f"""
+                            <tr>
+                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+                                        <tr>
+                                            <td style="width:50%;vertical-align:top;padding-right:8px;">
+                                                <div style="font-size:11px;color:#2F5233;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">BUY because</div>
+                                                <div style="margin-top:4px;font-size:12px;line-height:1.5;color:#0f172a;">{buy_items}</div>
+                                            </td>
+                                            <td style="width:50%;vertical-align:top;padding-left:8px;border-left:1px solid #eef2f7;">
+                                                <div style="font-size:11px;color:#8B2E2E;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">DON'T BUY because</div>
+                                                <div style="margin-top:4px;font-size:12px;line-height:1.5;color:#0f172a;">{caution_items}</div>
                                             </td>
                                         </tr>
                                     </table>
@@ -1755,6 +2115,12 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         conviction_rating["confirmation"] = signal_confirmation
         conviction_breakdown_html = build_conviction_breakdown_html(conviction_breakdown)
 
+        # Formal Signal Matrix (Technical/Fundamental/Sentiment -> Decision)
+        # -- generalizes compute_signal_confirmation above into the full
+        # traffic-light engine; cap_conviction wiring stays on
+        # signal_confirmation untouched, this only replaces what's displayed.
+        signal_matrix = compute_signal_matrix(tech_score, fund_score, sentiment_score, sentiment_label)
+
         macro_snapshot = fetch_macro_snapshot()
         macro_note = _macro_note_for_stock(market_context, macro_snapshot)
 
@@ -1762,6 +2128,21 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
         # trend (ADX >= 25) mirrors the recurring high-conviction setups
         # already used for stocks like BEL / ICICI Bank.
         swing_setup = ("Near 20-day breakout" in reasons) and ("ADX strong trend" in reasons)
+
+        # "Why NOT to Buy" -- only meaningful for a BUY-leaning signal (a
+        # HOLD/SELL already reads as cautious on its own); computed from
+        # values already on hand for the card rather than re-deriving them.
+        caution_flags = build_caution_flags(
+            day_change_pct=prev_close_change_pct,
+            price_vs_ema20_pct=entry_context.get("price_vs_ema20_pct"),
+            rsi=_safe_float(latest.get("rsi")),
+            volatility_pct=risk_meter.get("volatility_pct"),
+            range_52w=range_52w,
+            risk_reward_ratio=entry_context.get("risk_reward_ratio"),
+        )
+        why_buy_why_not_html = (
+            build_why_buy_why_not_html(reasons, caution_flags) if "buy" in signal.lower() else ""
+        )
 
         # AI Stock Story: looked up from the single combined call made once
         # for every stock in generate_ai_stocks_story() (see main()) rather
@@ -1922,7 +2303,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                                 <td style="padding:6px 0;"><strong>Technical Score</strong><div style="color:#0f172a;margin-top:4px;">{tech_score}</div></td>
                                 <td style="padding:6px 0;"><strong>Sentiment</strong><div style="color:{sentiment_color};margin-top:4px;">{"Data Unavailable" if sentiment_label == "Data Unavailable" else f"{sentiment_score} ({sentiment_label})"}</div></td>
                             </tr>
-                            {build_signal_confirmation_html(signal_confirmation)}
+                            {build_signal_matrix_html(signal_matrix)}
                             <tr>
                                 <td style="padding:6px 0;"><strong>Target / Stop</strong><div style="color:#0f172a;margin-top:4px;">{risk_data['target']} / {risk_data['stop_loss']}</div></td>
                                 <td style="padding:6px 0;"><strong>Trend</strong><div style="color:#0f172a;margin-top:4px;">{market_context['trend']}</div></td>
@@ -1931,6 +2312,7 @@ def process_stock(stock_name, ticker, use_llm=True, detailed_llm=False, ai_stori
                             {build_fundamentals_html(fund_raw, fund_score)}
                             {build_support_resistance_html(pivot_levels, swing_zones, round(latest['close'], 2))}
                             {build_52_week_range_html(range_52w)}
+                            {why_buy_why_not_html}
                             {build_risk_meter_html(risk_meter)}
                         </table>
                     </td>
@@ -3009,14 +3391,82 @@ def get_india_market_section_html(market_label, india_groups):
 # Report enhancements: change tracking, breach alerts, swing tags,
 # quick-jump table, concentration alerts, error banner, CSV export
 # -----------------------------
-def build_stock_enrichment_html(summary_entry, prior_entry):
+def _compute_signal_since(current_signal, prior_entry):
+    """
+    Returns the ISO timestamp (Asia/Kolkata) marking when `current_signal`
+    was FIRST issued for this stock, for use by _recommendation_aging_badge().
+
+    If the previous run's stored signal matches today's signal, the prior
+    "signal_since" carries forward unchanged -- a recommendation that keeps
+    getting re-confirmed run after run is NOT a new recommendation each
+    time. Only an actual signal change (or the very first time this ticker
+    is seen) resets the clock to now.
+    """
+    now_iso = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+    if not prior_entry:
+        return now_iso
+    prior_signal = prior_entry.get("signal")
+    prior_since = prior_entry.get("signal_since")
+    if prior_signal == current_signal and prior_signal not in (None, "ERROR") and prior_since:
+        return prior_since
+    return now_iso
+
+
+def _recommendation_aging_badge(signal_since_iso):
+    """
+    Renders the "Recommendation Aging" badge -- how long the CURRENT signal
+    has been standing, not how long since the stock was last analyzed (every
+    run re-analyzes every stock; a signal can be re-confirmed for weeks
+    without ever being "new"). Market conditions move even when a signal
+    doesn't get re-evaluated, so a stale-but-unchanged call needs to be
+    visibly flagged rather than looking as fresh as one issued this morning.
+
+        age <= RECOMMENDATION_AGING_FRESH_DAYS             -> 🟢 Fresh
+        <= RECOMMENDATION_AGING_AGING_DAYS                 -> 🟡 Aging
+        beyond that (RECOMMENDATION_AGING_REEVALUATE_DAYS+) -> 🔴 Re-evaluate
+
+    Returns "" if signal_since is missing/unparseable so a bad/legacy
+    history entry never breaks report rendering.
+    """
+    if not signal_since_iso:
+        return ""
+    try:
+        issued_dt = datetime.fromisoformat(signal_since_iso)
+    except (TypeError, ValueError):
+        return ""
+    now = datetime.now(issued_dt.tzinfo or ZoneInfo("Asia/Kolkata"))
+    age_days = (now - issued_dt).days
+    issued_label = issued_dt.strftime("%d-%b")
+
+    if age_days <= RECOMMENDATION_AGING_FRESH_DAYS:
+        icon, color, bg, tier = "🟢", "#047857", "#dcfce7", "Fresh"
+    elif age_days <= RECOMMENDATION_AGING_AGING_DAYS:
+        icon, color, bg, tier = "🟡", "#a16207", "#fef3c7", "Aging"
+    else:
+        icon, color, bg, tier = "🔴", "#dc2626", "#fee2e2", "Re-evaluate"
+
+    return (
+        f'<span title="Signal issued {issued_label} &middot; {age_days}d old &middot; '
+        f're-evaluate after {RECOMMENDATION_AGING_REEVALUATE_DAYS}d" '
+        f'style="display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:999px;'
+        f'font-size:11px;font-weight:700;color:{color};background:{bg};border:1px solid {color}33;">'
+        f'{icon} {tier} &middot; issued {issued_label}</span>'
+    )
+
+
+def build_stock_enrichment_html(summary_entry, prior_entry, signal_since=None):
     """
     Builds a small badge row shown above a stock's card:
     - signal-change badge (vs the previous run)
     - stop-loss / target breach badge (current price vs the previous run's levels)
     - swing-setup tag
+    - recommendation-aging badge (how long the CURRENT signal has stood)
     """
     badges = []
+
+    aging_badge = _recommendation_aging_badge(signal_since)
+    if aging_badge:
+        badges.append(aging_badge)
 
     signal = summary_entry.get("signal") or ""
     if prior_entry:
@@ -3676,7 +4126,13 @@ def main(mode, use_llm, detailed_llm=False):
                 if result:
                     pr, score, name, row_html, summary_entry = result
                     prior_entry = prev_stock_history.get(ticker)
-                    enrichment_html = build_stock_enrichment_html(summary_entry, prior_entry)
+                    # Computed once here (not inside build_stock_enrichment_html)
+                    # because the SAME value also needs to be persisted into
+                    # new_stock_history below -- otherwise next run would have
+                    # no prior "signal_since" to carry forward and every
+                    # recommendation would look freshly-issued on every run.
+                    signal_since = _compute_signal_since(summary_entry.get("signal"), prior_entry)
+                    enrichment_html = build_stock_enrichment_html(summary_entry, prior_entry, signal_since)
                     enriched_html = enrichment_html + row_html
                     rows.append((pr, score, name, enriched_html, summary_entry, market))
                     summary_rows.append(summary_entry)
@@ -3688,7 +4144,9 @@ def main(mode, use_llm, detailed_llm=False):
                             "target": summary_entry.get("target"),
                             "stop_loss": summary_entry.get("stop_loss"),
                             "last_run_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+                            "signal_since": signal_since,
                         }
+                        benchmark_ticker, benchmark_price = benchmark_for_ticker(ticker)
                         update_track_record(
                             track_record_state,
                             ticker,
@@ -3697,6 +4155,10 @@ def main(mode, use_llm, detailed_llm=False):
                             summary_entry.get("current_price"),
                             summary_entry.get("target"),
                             summary_entry.get("stop_loss"),
+                            horizon_days=TRACK_RECORD_DEFAULT_HORIZON_DAYS,
+                            probability_pct=estimate_call_probability_pct(summary_entry.get("total_score")),
+                            benchmark_ticker=benchmark_ticker,
+                            benchmark_price=benchmark_price,
                         )
                     elif prior_entry:
                         # Keep the last known-good entry so a single failed
@@ -3981,14 +4443,12 @@ def main(mode, use_llm, detailed_llm=False):
                 levels=silver_levels, plan=silver_plan,
                 sparkline_history=commodity_data["silver"].get("sparkline_history"),
             )
+            # Reuses the tracker's own section banner (navy/gold masthead
+            # style) instead of a plain <h2>, so this section reads as part
+            # of the same research note as the rest of the report rather
+            # than a visually separate block.
             commodity_section_html = f"""
-                <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-                    <tr>
-                        <td style="padding:12px 0 0;">
-                            <h2 style="margin:0;font-size:15px;color:#111827;">Commodities (2)</h2>
-                        </td>
-                    </tr>
-                </table>
+                {tracker._section_banner_html(2)}
                 {gold_card}
                 {silver_card}"""
             commodity_row_html = f"""
@@ -4051,6 +4511,15 @@ def main(mode, use_llm, detailed_llm=False):
         gold_plan=gold_plan, silver_plan=silver_plan,
     )
 
+    # Prediction vs Reality: renders "" until at least one call has closed,
+    # so a brand-new deployment doesn't show an empty/zero panel.
+    track_record_html = build_track_record_html(track_record_state)
+
+    # Signal Matrix reference table -- static (doesn't depend on this run's
+    # data), shown once so per-stock "Signal Matrix: WAIT 🟢🔴🟢" badges
+    # further down have something to look up against.
+    signal_matrix_legend_html = build_signal_matrix_legend_html()
+
     # Build new report-enhancement blocks
     error_summary_html = build_error_summary_html(groups)
     quick_jump_html = build_quick_jump_table_html(
@@ -4089,8 +4558,10 @@ def main(mode, use_llm, detailed_llm=False):
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html
+        + track_record_html
         + action_plan_html
         + data_quality_banner_html
+        + signal_matrix_legend_html
         + summary_html
         + commodity_row_html
         + concentration_alert_html
@@ -4114,6 +4585,7 @@ def main(mode, use_llm, detailed_llm=False):
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html
+        + track_record_html
         + action_plan_html
         + data_quality_banner_html
         + commodity_row_html

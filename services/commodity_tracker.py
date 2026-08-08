@@ -308,16 +308,62 @@ class CommodityTracker:
         return ""
 
     # ---------------- HTML helpers ----------------
+    # Palette matches the report's own header/banner theme (navy + gold),
+    # so the commodity cards read as one continuous "research note" rather
+    # than a visually separate widget bolted onto the stock sections.
+    _METAL_THEME = {
+        "gold":   {"accent": "#B08D57", "accent_dark": "#8A6B3E", "panel_bg": "#FBF7EF", "panel_border": "#B08D5755"},
+        "silver": {"accent": "#7C8798", "accent_dark": "#475569", "panel_bg": "#F8FAFC", "panel_border": "#7C879855"},
+    }
+
+    def _metal_theme(self, ticker_label):
+        return self._METAL_THEME["gold"] if str(ticker_label).upper().startswith("XAU") else self._METAL_THEME["silver"]
+
+    def _kpi_tile_html(self, label, value_html, value_color="#14213D", font_size=14):
+        """One stat tile in the KPI grid -- uppercase label over a bold
+        value, boxed and lightly shaded so the six key numbers (price,
+        trend, bias, entry zone, stop, target) scan as a unified dashboard
+        instead of a stack of loose label/value lines."""
+        return f"""
+                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#FAFAF8;border:1px solid #EDEAE2;border-radius:6px;">
+                                        <tr>
+                                            <td style="padding:10px 12px;">
+                                                <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;color:#8A8F9C;">{label}</div>
+                                                <div style="margin-top:5px;font-size:{font_size}px;font-weight:800;color:{value_color};line-height:1.3;word-break:break-word;">{value_html}</div>
+                                            </td>
+                                        </tr>
+                                    </table>"""
+
+    def _entry_chip_html(self, tier_label, price, highlighted, accent):
+        """One Patient/Optimal/Aggressive entry chip. The tier that matches
+        the resolved recommendation is filled solid in the metal's accent
+        color; the other two stay as plain outlined chips -- so the reader's
+        eye lands on the ONE price that's actually being recommended instead
+        of three equal-weight numbers."""
+        if highlighted:
+            style = f"background:{accent};border:1px solid {accent};color:#ffffff;"
+            label_style = "color:#ffffff;opacity:0.85;"
+        else:
+            style = "background:#ffffff;border:1px solid #E5E7EB;color:#475569;"
+            label_style = "color:#8A8F9C;"
+        return f"""<div style="display:inline-block;margin:8px 8px 0 0;padding:6px 12px;border-radius:6px;{style}">
+                                        <div style="font-size:9px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;{label_style}">{tier_label}</div>
+                                        <div style="margin-top:2px;font-size:13px;font-weight:800;">&#8377;{price:.2f}</div>
+                                    </div>"""
+
     def _history_rows_html(self, history):
         rows = ""
-        for row in reversed(history):
-            color = "#16a34a" if row["change"] >= 0 else "#dc2626"
+        for i, row in enumerate(reversed(history)):
+            is_up = row["change"] >= 0
+            color = "#047857" if is_up else "#dc2626"
+            arrow = "&#9650;" if is_up else "&#9660;"
             sign = "+" if row["change"] > 0 else ""
+            bg = "#ffffff" if i % 2 == 0 else "#FAFAF8"
             rows += (
-                '<tr style="border-bottom:1px solid #f1f5f9;">'
-                f'<td style="padding:8px 6px 8px 0;font-size:13px;color:#0f172a;">{row["date"]}</td>'
-                f'<td style="padding:8px 6px;font-size:13px;color:#0f172a;">&#8377;{row["price"]:.2f}</td>'
-                f'<td style="padding:8px 0 8px 6px;font-size:13px;font-weight:700;color:{color};">{sign}{row["change"]:.2f}%</td>'
+                f'<tr style="background:{bg};">'
+                f'<td style="padding:8px 10px;font-size:12px;color:#14213D;border-bottom:1px solid #F1F1EC;">{row["date"]}</td>'
+                f'<td align="right" style="padding:8px 10px;font-size:12px;font-family:\'SF Mono\',Menlo,Consolas,\'Courier New\',monospace;color:#14213D;border-bottom:1px solid #F1F1EC;">&#8377;{row["price"]:.2f}</td>'
+                f'<td align="right" style="padding:8px 10px;font-size:12px;font-weight:700;color:{color};border-bottom:1px solid #F1F1EC;white-space:nowrap;">{arrow} {sign}{row["change"]:.2f}%</td>'
                 '</tr>'
             )
         return rows
@@ -377,15 +423,18 @@ class CommodityTracker:
     def _commodity_card_html(self, name, ticker_label, current_price, change, history, levels, plan, sparkline_history=None):
         """Renders one commodity card using the exact same table/card structure as stock cards."""
         buy_signal_html = self.buy_signal(history, name)
-        change_color = "#16a34a" if change >= 0 else "#dc2626"
+        change_color = "#047857" if change >= 0 else "#dc2626"
         change_bg    = "#dcfce7" if change >= 0 else "#fee2e2"
         change_sign  = "+" if change > 0 else ""
+        change_arrow = "&#9650;" if change >= 0 else "&#9660;"
         history_rows = self._history_rows_html(history)
+        theme = self._metal_theme(ticker_label)
+        accent, accent_dark = theme["accent"], theme["accent_dark"]
 
         bias_color = "#047857" if plan["bias"] == "Bullish" else "#dc2626" if plan["bias"] == "Bearish" else "#64748b"
         macro_note = self._macro_note_for_commodity()
         macro_html = (
-            f'<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:#f8fafc;'
+            f'<div style="margin-top:12px;padding:9px 12px;border-radius:6px;background:#f8fafc;'
             f'border:1px solid #e2e8f0;font-size:12px;color:#475569;">{macro_note}</div>'
         ) if macro_note else ""
 
@@ -395,90 +444,83 @@ class CommodityTracker:
         spark_prices = [row["price"] for row in spark_source]
         spark_days = len(spark_prices)
         sparkline_text = self.generate_sparkline(spark_prices) if spark_days >= 2 else ""
-        spark_trend_color = "#16a34a" if (spark_prices and spark_prices[-1] >= spark_prices[0]) else "#dc2626"
-        sparkline_html = ""
-        if sparkline_text:
-            sparkline_html = f"""
-                                    <div style="margin-top:8px;">
-                                        <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:#64748b;">{spark_days}-Day Trend</div>
-                                        <div style="margin-top:4px;font-size:18px;line-height:1;letter-spacing:1px;color:{spark_trend_color};font-family:'SF Mono',Menlo,Consolas,'Courier New',monospace;">{sparkline_text}</div>
-                                    </div>"""
+        spark_trend_color = "#047857" if (spark_prices and spark_prices[-1] >= spark_prices[0]) else "#dc2626"
+        trend_value_html = (
+            f'<span style="color:{spark_trend_color};font-family:\'SF Mono\',Menlo,Consolas,\'Courier New\',monospace;letter-spacing:1px;font-size:16px;">{sparkline_text}</span>'
+            if sparkline_text else "&mdash;"
+        )
+
+        # Which entry tier the recommendation actually landed on, so the
+        # matching chip below can be visually singled out instead of all
+        # three reading as equally-weighted options.
+        rec_label = str(levels.get("recommended_entry_label", "")).lower()
+
+        # KPI grid -- Current Price / Trend / Bias on row one, Entry Zone /
+        # Stop Loss / Target on row two. Same six numbers the old stacked
+        # layout showed, now scannable as a dashboard instead of a list.
+        kpi_grid_html = f"""
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:16px;">
+                                <tr>
+                                    <td width="33.33%" style="padding:0 4px 8px 0;">{self._kpi_tile_html("Current Price", f'&#8377;{current_price:.2f}<div style="margin-top:2px;font-size:10px;font-weight:500;color:#8A8F9C;">per gram</div>')}</td>
+                                    <td width="33.33%" style="padding:0 4px 8px 4px;">{self._kpi_tile_html(f"{spark_days}-Day Trend", trend_value_html)}</td>
+                                    <td width="33.34%" style="padding:0 0 8px 4px;">{self._kpi_tile_html("Bias", plan['bias'], value_color=bias_color)}</td>
+                                </tr>
+                                <tr>
+                                    <td width="33.33%" style="padding:0 4px 0 0;">{self._kpi_tile_html("Entry Zone", f"&#8377;{plan['entry_low']:.2f} &ndash; &#8377;{plan['entry_high']:.2f}", font_size=13)}</td>
+                                    <td width="33.33%" style="padding:0 4px 0 4px;">{self._kpi_tile_html("Stop Loss", f"&#8377;{plan['stop_loss']:.2f}", value_color="#dc2626")}</td>
+                                    <td width="33.34%" style="padding:0 0 0 4px;">{self._kpi_tile_html("Target", f"&#8377;{plan['target_low']:.2f} &ndash; &#8377;{plan['target_high']:.2f}", value_color="#047857", font_size=13)}</td>
+                                </tr>
+                            </table>"""
+
+        buy_levels_html = f"""
+                            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:12px;border-radius:8px;background:{theme['panel_bg']};border:1px solid {theme['panel_border']};">
+                                <tr>
+                                    <td style="padding:12px 14px 14px;">
+                                        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;color:{accent_dark};">Buy Levels</div>
+                                        <div style="margin-top:6px;font-size:13px;color:#14213D;">
+                                            Recommended <strong>{levels['recommended_entry_label']}</strong>:
+                                            <span style="margin-left:2px;font-size:16px;font-weight:800;color:#047857;">&#8377;{levels['recommended_buy_level']:.2f}</span>
+                                        </div>
+                                        <div>
+                                            {self._entry_chip_html("Patient", levels['patient_entry'], "patient" in rec_label, accent)}
+                                            {self._entry_chip_html("Optimal", levels['optimal_entry'], "optimal" in rec_label, accent)}
+                                            {self._entry_chip_html("Aggressive", levels['aggressive_entry'], "aggressive" in rec_label, accent)}
+                                        </div>
+                                    </td>
+                                </tr>
+                            </table>"""
+
+        price_history_html = f"""
+                            <div style="margin-top:16px;padding-top:14px;border-top:1px solid #EDEAE2;">
+                                <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;color:#8A8F9C;">Price History &middot; Last {len(history)} Days</div>
+                                <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:8px;border-collapse:collapse;border:1px solid #EDEAE2;border-radius:6px;overflow:hidden;">
+                                    <tr style="background:#14213D;">
+                                        <th align="left" style="padding:8px 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#EFEAE0;">Date</th>
+                                        <th align="right" style="padding:8px 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#EFEAE0;">Price</th>
+                                        <th align="right" style="padding:8px 10px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.05em;color:#EFEAE0;">Change</th>
+                                    </tr>
+                                    {history_rows}
+                                </table>
+                            </div>"""
 
         return f"""
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:12px 0;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;">
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin:14px 0;border-radius:10px;background:#ffffff;border:1px solid #DAD5CB;overflow:hidden;">
                 <tr>
-                    <td style="padding:14px;">
-                        <!-- Header: name + price -->
-                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
-                            <tr>
-                                <td style="vertical-align:top;">
-                                    <h3 style="margin:0;font-size:16px;color:#0f172a;line-height:1.2;">{name} <span style="font-size:13px;color:#64748b;">{ticker_label}</span></h3>
-                                    <div style="margin:6px 0 0;">
-                                        <span style="display:inline-block;padding:4px 10px;border-radius:999px;font-weight:700;font-size:13px;background:{change_bg};color:{change_color};">{change_sign}{change}%</span>{buy_signal_html}
-                                    </div>
-                                </td>
-                                <td style="width:150px;text-align:right;vertical-align:top;">
-                                    <div style="font-size:11px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;color:#64748b;">Current Price</div>
-                                    <div style="margin-top:6px;font-size:16px;font-weight:800;color:#111827;">&#8377;{current_price:.2f}</div>
-                                    <div style="margin-top:4px;font-size:11px;color:#64748b;">per gram</div>{sparkline_html}
-                                </td>
-                            </tr>
-                        </table>
-                        <!-- Metrics table -->
-                        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:10px;font-size:13px;color:#475569;">
-                            <tr>
-                                <td style="padding:6px 10px 6px 0;width:50%;vertical-align:top;">
-                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Bias</div>
-                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:{bias_color};">{plan['bias']}</div>
-                                </td>
-                                <td style="padding:6px 0 6px 10px;width:50%;vertical-align:top;">
-                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Entry Zone</div>
-                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#0f172a;">&#8377;{plan['entry_low']:.2f} &ndash; &#8377;{plan['entry_high']:.2f}</div>
-                                </td>
-                            </tr>
-                            <tr>
-                                <td style="padding:6px 10px 6px 0;width:50%;vertical-align:top;">
-                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Stop Loss</div>
-                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#dc2626;">&#8377;{plan['stop_loss']:.2f}</div>
-                                </td>
-                                <td style="padding:6px 0 6px 10px;width:50%;vertical-align:top;">
-                                    <div style="font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:0.03em;">Target (momentum est.)</div>
-                                    <div style="margin-top:4px;font-size:13px;font-weight:800;color:#047857;">&#8377;{plan['target_low']:.2f} &ndash; &#8377;{plan['target_high']:.2f}</div>
-                                </td>
-                            </tr>
-                            <!-- Buy Levels -->
-                            <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="font-size:13px;color:#475569;font-weight:700;">Buy Levels</div>
-                                    <div style="margin-top:6px;font-size:12px;">
-                                        <span style="color:#047857;font-weight:700;">Recommended {levels['recommended_entry_label']}: <strong>&#8377;{levels['recommended_buy_level']:.2f}</strong></span>
-                                        <div style="margin-top:5px;color:#64748b;">
-                                            Patient: <strong>&#8377;{levels['patient_entry']:.2f}</strong> &bull;
-                                            Optimal: <strong>&#8377;{levels['optimal_entry']:.2f}</strong> &bull;
-                                            Aggressive: <strong>&#8377;{levels['aggressive_entry']:.2f}</strong>
-                                        </div>
-                                    </div>
-                                </td>
-                            </tr>
-                            <!-- Macro -->
-                            <tr>
-                                <td colspan="2" style="padding-top:10px;">{macro_html}</td>
-                            </tr>
-                            <!-- Price History -->
-                            <tr>
-                                <td colspan="2" style="padding-top:10px;border-top:1px solid #eef2f7;">
-                                    <div style="font-size:13px;color:#475569;font-weight:700;">Price History (7 days)</div>
-                                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;margin-top:8px;">
-                                        <tr style="background:#f8fafc;">
-                                            <th align="left" style="padding:8px 6px 8px 0;font-size:11px;font-weight:700;text-transform:uppercase;color:#64748b;border-bottom:1px solid #e5e7eb;">Date</th>
-                                            <th align="left" style="padding:8px 6px;font-size:11px;font-weight:700;text-transform:uppercase;color:#64748b;border-bottom:1px solid #e5e7eb;">Price</th>
-                                            <th align="left" style="padding:8px 0 8px 6px;font-size:11px;font-weight:700;text-transform:uppercase;color:#64748b;border-bottom:1px solid #e5e7eb;">Change</th>
-                                        </tr>
-                                        {history_rows}
-                                    </table>
-                                </td>
-                            </tr>
-                        </table>
+                    <td style="height:4px;line-height:4px;font-size:0;background:{accent};">&nbsp;</td>
+                </tr>
+                <tr>
+                    <td style="padding:18px 20px 20px;">
+                        <div>
+                            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:{accent};">{ticker_label}</div>
+                            <h3 style="margin:4px 0 0;font-family:Georgia,'Times New Roman',serif;font-size:19px;font-weight:400;color:#14213D;">{name}</h3>
+                            <div style="margin-top:8px;">
+                                <span style="display:inline-block;padding:5px 12px;border-radius:999px;font-weight:700;font-size:13px;background:{change_bg};color:{change_color};">{change_arrow} {change_sign}{change}%</span>{buy_signal_html}
+                            </div>
+                        </div>
+                        {kpi_grid_html}
+                        {buy_levels_html}
+                        {macro_html}
+                        {price_history_html}
                     </td>
                 </tr>
             </table>"""
@@ -510,15 +552,23 @@ class CommodityTracker:
         )
 
         return f"""
-            <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
-                <tr>
-                    <td style="padding:12px 0 0;">
-                        <h2 style="margin:0;font-size:15px;color:#111827;">Commodities (2)</h2>
-                    </td>
-                </tr>
-            </table>
+            {self._section_banner_html(2)}
             {gold_card}
             {silver_card}"""
+
+    def _section_banner_html(self, count):
+        """Section banner matching the report's own navy/gold masthead
+        styling, so 'Commodities' reads as a section of the same research
+        note rather than a visually separate block bolted on afterward."""
+        return f"""
+            <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:16px;">
+                <tr>
+                    <td style="padding:0 0 4px;border-bottom:2px solid #B08D57;">
+                        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;font-size:10px;font-weight:700;letter-spacing:0.14em;text-transform:uppercase;color:#B08D57;">Precious Metals &amp; Trade Levels</div>
+                        <h2 style="margin:4px 0 8px;font-family:Georgia,'Times New Roman',serif;font-size:18px;font-weight:400;color:#14213D;">Commodities <span style="font-size:13px;color:#8A8F9C;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">({count})</span></h2>
+                    </td>
+                </tr>
+            </table>"""
 
 
 if __name__ == "__main__":
