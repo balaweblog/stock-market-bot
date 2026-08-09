@@ -76,6 +76,11 @@ def detect_resistance_breakout(df, i, lookback=20, min_range_days=10, buffer=0.0
             "pattern": "Resistance Breakout",
             "signal_price": float(today["Close"]),
             "detail": f"Broke {lookback}-day range high of ₹{resistance:.2f} (range was {range_pct*100:.1f}% wide).",
+            # Raw base geometry, stashed for utils.breakout_targets' measured-move
+            # projection -- so it never has to re-derive (and risk disagreeing
+            # with) the exact range that actually fired.
+            "resistance": float(resistance),
+            "support": float(support),
         }
     return None
 
@@ -178,6 +183,10 @@ def detect_bollinger_squeeze_breakout(df, i, window=20, squeeze_lookback=60, squ
             "pattern": "Bollinger Squeeze Breakout",
             "signal_price": float(today["Close"]),
             "detail": f"Bandwidth was in its tightest {percentile_rank*100:.0f}th percentile over {squeeze_lookback} days, then closed above the upper band (₹{upper.iloc[-1]:.2f}).",
+            # Raw band levels at the moment of breakout -- utils.breakout_targets
+            # uses the band width as this pattern's measured-move height.
+            "band_lower": float(lower.iloc[-1]),
+            "band_upper": float(upper.iloc[-1]),
         }
     return None
 
@@ -218,6 +227,12 @@ def detect_flag_pattern(df, i, pole_lookback=15, flag_lookback=8, min_pole_move=
             "pattern": "Bull Flag Breakout",
             "signal_price": float(today["Close"]),
             "detail": f"Pole move of {pole_move*100:.0f}% then a {flag_range_pct*100:.1f}%-wide flag, broke above flag high ₹{flag_high:.2f}.",
+            # Raw pole endpoints -- utils.breakout_targets projects the pole's
+            # own price move forward from the flag breakout (classic
+            # "flagpole" measured move).
+            "pole_start": float(pole["Close"].iloc[0]),
+            "pole_end": float(pole["Close"].iloc[-1]),
+            "flag_high": float(flag_high),
         }
     return None
 
@@ -253,6 +268,11 @@ def detect_triangle_pattern(df, i, lookback=40, min_touches=2):
             "pattern": "Triangle Breakout",
             "signal_price": float(today["Close"]),
             "detail": f"Range narrowed from ₹{early_range:.2f} to ₹{late_range:.2f} wide over {lookback} days, broke above ₹{upper_trendline:.2f}.",
+            # Widest (early) part of the triangle -- utils.breakout_targets
+            # projects that full range forward from the breakout, the
+            # standard triangle measured-move convention.
+            "early_range": float(early_range),
+            "upper_trendline": float(upper_trendline),
         }
     return None
 
@@ -296,6 +316,10 @@ def detect_cup_and_handle(df, i, cup_lookback=90, handle_lookback=12, max_handle
             "pattern": "Cup and Handle Breakout",
             "signal_price": float(today["Close"]),
             "detail": f"{depth*100:.0f}% deep cup over {cup_lookback} days, {handle_pct*100:.1f}%-wide handle, broke above ₹{rim_level:.2f}.",
+            # Cup depth -- utils.breakout_targets projects it forward from the
+            # rim, the standard cup-and-handle measured-move convention.
+            "cup_low": float(cup_low),
+            "rim_level": float(rim_level),
         }
     return None
 
