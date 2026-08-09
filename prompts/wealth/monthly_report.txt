@@ -1,18 +1,29 @@
-{context_text}Today is {today_str}. Below is Bala's monthly SIP / wealth-building portfolio -- recurring monthly contributions across PPF, mutual funds, NPS, direct equity, gold, silver, EPF and US stocks. Review it as a monthly portfolio checkup against current market conditions.
+{context_text}Today is {today_str}. Below is Bala's monthly SIP / wealth-building portfolio -- recurring monthly contributions across PPF, mutual funds, NPS, direct equity, gold, silver, EPF and US stocks. Review it as a monthly portfolio checkup against current, real market conditions -- not a generic finance essay.
 
-For EACH instrument listed below, give exactly ONE verdict from this fixed set: "Continue", "Increase", "Reduce", "Exit", "At Risk" -- plus one short reason (max 12 words, plain text, no markdown). Base the verdict on real recent developments for that instrument/sector where you have them; otherwise give a brief, sensible, generic-but-accurate read rather than inventing specifics.
+ACCURACY RULES -- apply these to every verdict, note, and suggestion below:
+- Ground your read in real, current developments where you have them: actual recent price moves, index/sector performance, policy or rate changes, earnings, fund manager changes. If you don't have a specific, reliable fact for an instrument, give a brief, sensible, generic-but-accurate read instead of inventing one -- never fabricate a statistic, news event, price move, or fund performance number.
+- Only name a specific real-world fund, ETF, ticker, or stock if you are reasonably confident it actually exists and is realistically investable by an Indian retail investor (domestic route) or via standard US brokerage / GIFT City / LRS routes (US and international route). If you're not confident a name is real, describe the category or sector instead of guessing a name.
+- Do not present outdated information as current, and do not state a specific date-stamped fact (e.g. "cut rates last week") unless you are confident it is accurate as of {today_str}.
+- Any rupee or dollar amount you propose changing must be consistent with that instrument's actual monthly contribution as listed in the portfolio below -- never propose cutting an instrument by more than it currently contributes, and never invent a figure unrelated to the listed amount.
+- Keep instrument_verdicts and the Portfolio Take internally consistent: if an instrument is verdicted "Reduce", "Exit", or "At Risk", no suggestion should casually contradict that (e.g. don't verdict something "Exit" while a suggestion proposes increasing it), and vice versa.
+
+For EACH instrument listed below, give exactly ONE verdict from this fixed set: "Continue", "Increase", "Reduce", "Exit", "At Risk" -- plus one short reason (max 12 words, plain text, no markdown) tied to the accuracy rules above.
 
 Then write a "Portfolio Take" section synthesizing the WHOLE portfolio together:
 1) "headline": one punchy line (max 12 words, title case, no ending period) capturing this month's overall portfolio health.
-2) "diversification_notes": exactly {ai_diversification_points} short bullet points (max 18 words each, plain text, no markdown) on real gaps, overlaps or concentration risk in the current equity/debt/gold/international mix.
-3) "suggestions": exactly {ai_suggestion_points} short, specific, actionable bullet points (max 18 words each, plain text, no markdown) -- concrete "add X", "reduce Y", "rebalance toward Z" style moves for next month, grounded in the market read above. No generic filler.
+2) "diversification_notes": exactly {ai_diversification_points} short bullet points (max 18 words each, plain text, no markdown) on real gaps, overlaps, or concentration risk in the current equity/debt/gold/international mix. Name the specific sector, market-cap band, geography, or asset class involved -- not a vague "needs more diversification".
+3) "suggestions": exactly {ai_suggestion_points} short, specific, actionable bullet points (max 18 words each, plain text, no markdown). Each suggestion must:
+   - State a concrete move with a number: an exact rupee/dollar amount or a from-to change (e.g. "Cut SBI Small Cap SIP from ₹5,000 to ₹3,500/month"), not a bare percentage.
+   - Name a specific real-world fund, ETF, sector, or stock to move into or out of wherever relevant (e.g. "Nippon India Gold ETF", "Motilal Oswal Nasdaq 100 ETF", "renewable energy sector") -- not "a diversified fund" or "an international option". Follow the fabrication rule above -- skip the name rather than guess if unsure.
+   - Reference only instruments actually listed in the portfolio below -- never propose changing an instrument that isn't held.
+   No generic filler ("diversify more", "monitor closely") -- every suggestion must be something Bala could literally go execute this month.
 
 Keep the whole thing SHORT and skimmable -- this is a one-minute monthly checkup email, not a research report. No long paragraphs anywhere.
 
 Portfolio (monthly contribution per instrument):
 {holdings_block}
 
-OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code fences, no commentary before or after):
+OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code fences, no commentary before or after). Use the EXACT instrument names as listed above as keys -- do not rename, abbreviate, translate, or paraphrase them:
 {{
   "instrument_verdicts": {{
     "<exact instrument name as listed above>": {{"verdict": "Continue|Increase|Reduce|Exit|At Risk", "reason": "short reason here"}},
@@ -24,4 +35,4 @@ OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code 
     "suggestions": ["suggestion 1", "suggestion 2"]
   }}
 }}
-Every instrument listed above must appear as a key in instrument_verdicts, using the exact name given.
+Every instrument listed above must appear as a key in instrument_verdicts, using the exact name given -- do not skip, merge, or omit any instrument.

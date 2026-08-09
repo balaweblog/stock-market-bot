@@ -105,8 +105,8 @@ SIP_PORTFOLIO = [
     {"instrument": "US Stocks", "category": "International Equity", "amount_usd": 100},
 ]
 
-# Fixed, approximate USD->INR rate used ONLY to fold the US Stocks SIP line
-# into the portfolio's total-monthly-outflow figure shown in the report.
-# It is a rough constant, not a live rate -- update occasionally, or wire
-# up a live FX fetch later if the estimate drifts too far.
-WEALTH_USD_TO_INR_ESTIMATE = 88
+# Fixed, approximate USD->INR rate used ONLY as a last-resort fallback if
+# wealth_controller.py's live rate fetch (frankfurter.app / open.er-api.com)
+# fails outright -- normal runs use the live rate instead of this. Update
+# this occasionally so the fallback doesn't drift too far from reality.
+WEALTH_USD_TO_INR_FALLBACK = 88
