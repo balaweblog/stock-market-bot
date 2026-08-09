@@ -1,0 +1,27 @@
+{context_text}Today is {today_str}. Below is Bala's monthly SIP / wealth-building portfolio -- recurring monthly contributions across PPF, mutual funds, NPS, direct equity, gold, silver, EPF and US stocks. Review it as a monthly portfolio checkup against current market conditions.
+
+For EACH instrument listed below, give exactly ONE verdict from this fixed set: "Continue", "Increase", "Reduce", "Exit", "At Risk" -- plus one short reason (max 12 words, plain text, no markdown). Base the verdict on real recent developments for that instrument/sector where you have them; otherwise give a brief, sensible, generic-but-accurate read rather than inventing specifics.
+
+Then write a "Portfolio Take" section synthesizing the WHOLE portfolio together:
+1) "headline": one punchy line (max 12 words, title case, no ending period) capturing this month's overall portfolio health.
+2) "diversification_notes": exactly {ai_diversification_points} short bullet points (max 18 words each, plain text, no markdown) on real gaps, overlaps or concentration risk in the current equity/debt/gold/international mix.
+3) "suggestions": exactly {ai_suggestion_points} short, specific, actionable bullet points (max 18 words each, plain text, no markdown) -- concrete "add X", "reduce Y", "rebalance toward Z" style moves for next month, grounded in the market read above. No generic filler.
+
+Keep the whole thing SHORT and skimmable -- this is a one-minute monthly checkup email, not a research report. No long paragraphs anywhere.
+
+Portfolio (monthly contribution per instrument):
+{holdings_block}
+
+OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code fences, no commentary before or after):
+{{
+  "instrument_verdicts": {{
+    "<exact instrument name as listed above>": {{"verdict": "Continue|Increase|Reduce|Exit|At Risk", "reason": "short reason here"}},
+    ...
+  }},
+  "portfolio_take": {{
+    "headline": "punchy headline here",
+    "diversification_notes": ["note 1", "note 2"],
+    "suggestions": ["suggestion 1", "suggestion 2"]
+  }}
+}}
+Every instrument listed above must appear as a key in instrument_verdicts, using the exact name given.
