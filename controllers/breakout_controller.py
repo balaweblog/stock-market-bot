@@ -64,7 +64,18 @@ Pipeline, per run:
       fallen back below its own breakout-day low within
       utils.breakout_failure.FAILURE_WINDOW_DAYS days on this exact stock
       before -- informational context, not a second gate.
-  12. Breakout Confirmation Score (utils.breakout_confirmation): a
+  12a. Fundamental quality gate, Confirmed Breakouts ONLY: for any row
+      still on track for Confirmed after steps 10-11, fetch yfinance's
+      .info for that symbol (lazily -- only for rows about to qualify,
+      not the whole universe) and require ROE, Debt/Equity, and latest
+      earnings growth to each clear a classic quality-stock bar where
+      that metric is available. A row that clears the technical bar but
+      fails an available fundamentals check is pulled into Watch List
+      with a note, never dropped; a symbol with none of the three metrics
+      available is left ungated (data gap, not a fail). This makes
+      "Confirmed" mean high quality on the chart AND the balance sheet,
+      not chart mechanics alone.
+  12b. Breakout Confirmation Score (utils.breakout_confirmation): a
       9-point checklist tally (price vs resistance, volume, close
       position, RSI band, moving averages, relative strength vs NIFTY,
       sector confirmation, the NIFTY regime read from step 6, and
@@ -129,6 +140,77 @@ MAX_FAILED_BREAKOUT_ROWS = 15
 
 ENTRY_CLASSIFIER_CONFIG = ClassifierConfig()
 TARGETS_CONFIG = TargetsConfig()
+
+# -----------------------------------------------------------------------
+# Fundamental quality gate -- Confirmed Breakouts ONLY.
+#
+# The rest of this pipeline is purely technical (price/volume/pattern
+# mechanics, backtested against the stock's own history). This gate adds
+# one more requirement before a row is allowed to sit in the "Confirmed"
+# bucket: the underlying business has to look financially sound too, not
+# just the chart. It is fetched from yfinance's .info (P/E, ROE,
+# debt/equity, earnings growth, margins) -- the same "classic quality
+# stock" screen: low debt, strong return on equity, growing earnings.
+#
+# Fail-soft, same convention as every other filter in this file:
+#   - Fetched LAZILY, only for rows that already cleared the technical
+#     backtest bar (i.e. rows that would otherwise land in Confirmed) --
+#     not for the whole NIFTY 500 universe, to keep the run fast.
+#   - If yfinance has NONE of the three metrics for a symbol, the gate is
+#     treated as unavailable and does NOT block the row -- a data gap
+#     elsewhere in the pipeline never silently disqualifies a signal.
+#   - If AT LEAST ONE metric is available and it fails the bar, the row
+#     is pulled out of Confirmed into Watch List (never dropped), same as
+#     the Bearish-regime downgrade -- see row["fundamental_downgraded"].
+FUNDAMENTAL_MIN_ROE = 0.15                 # Return on Equity >= 15%
+FUNDAMENTAL_MAX_DEBT_TO_EQUITY = 100.0     # Debt/Equity <= 100 (yfinance reports this as a percentage, e.g. 45.2 == 45.2%)
+FUNDAMENTAL_MIN_EARNINGS_GROWTH = 0.0      # Latest earnings growth must be non-negative, not shrinking
+
+
+def _fetch_fundamentals_info(symbol, cache):
+    """Raw yfinance .info dict for one symbol, cached per run. Fail-soft --
+    returns {} (not None) on any fetch error so callers don't need a
+    separate None-check path; an empty dict is treated the same as "no
+    metrics available" by evaluate_fundamental_quality."""
+    if symbol in cache:
+        return cache[symbol]
+    info = {}
+    try:
+        info = yf.Ticker(f"{symbol}.NS").info or {}
+    except Exception as e:
+        log.warning(f"Breakout Screener: fundamentals fetch failed for {symbol}: {e}")
+    cache[symbol] = info
+    return info
+
+
+def evaluate_fundamental_quality(symbol, cache):
+    """Returns a dict:
+      available: True if yfinance returned at least one of the three
+        metrics for this symbol.
+      passed: True only if available AND every metric that WAS returned
+        clears its threshold (missing individual metrics don't count
+        against the row, same fail-soft principle as Risk:Reward).
+      checks: list of (label, passed, display_value) for the metrics that
+        were available, for the email to show its work.
+    """
+    info = _fetch_fundamentals_info(symbol, cache)
+    roe = info.get("returnOnEquity")
+    debt_to_equity = info.get("debtToEquity")
+    earnings_growth = info.get("earningsGrowth")
+    if earnings_growth is None:
+        earnings_growth = info.get("earningsQuarterlyGrowth")
+
+    checks = []
+    if roe is not None:
+        checks.append(("ROE", roe >= FUNDAMENTAL_MIN_ROE, f"{roe*100:.1f}%"))
+    if debt_to_equity is not None:
+        checks.append(("Debt/Equity", debt_to_equity <= FUNDAMENTAL_MAX_DEBT_TO_EQUITY, f"{debt_to_equity:.0f}%"))
+    if earnings_growth is not None:
+        checks.append(("Earnings growth", earnings_growth >= FUNDAMENTAL_MIN_EARNINGS_GROWTH, f"{earnings_growth*100:+.1f}%"))
+
+    available = bool(checks)
+    passed = available and all(ok for _, ok, _ in checks)
+    return {"available": available, "passed": passed, "checks": checks}
 
 # Bare NSE symbols (constants.STOCKS keys, e.g. "BEL", "SBIN", "ITC") from
 # Bala's own direct-equity list -- NOT constants.WATCHLIST, which holds
@@ -258,6 +340,7 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
     confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch = [], [], [], [], []
     skipped_count = 0
     market_trend_supportive = regime.entries_supportive
+    fundamentals_cache = {}  # per-run cache, symbol -> yfinance .info dict
 
     for symbol, df in histories.items():
         ok, dq_notes = data_quality_check(symbol, df, bhav_df)
@@ -323,6 +406,19 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
             else:
                 meets_confirmed_bar = cleared_backtest
 
+            # Fundamental quality gate -- Confirmed Breakouts only (see
+            # FUNDAMENTAL_MIN_ROE et al. above). Only bother fetching
+            # fundamentals for rows that are, on technicals alone, about
+            # to qualify for Confirmed -- keeps this an occasional
+            # per-signal yfinance call rather than a 500-symbol sweep.
+            fundamentals = None
+            fundamental_downgraded = False
+            if meets_confirmed_bar:
+                fundamentals = evaluate_fundamental_quality(symbol, fundamentals_cache)
+                if fundamentals["available"] and not fundamentals["passed"]:
+                    meets_confirmed_bar = False
+                    fundamental_downgraded = True
+
             row = {
                 "symbol": symbol,
                 "pattern": sig["pattern"],
@@ -336,12 +432,17 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
                 "risk_reward": risk_reward,
                 "failure_risk": failure_risk,
                 "confirmation": confirmation,
+                "fundamentals": fundamentals,
                 # Cleared the backtest but was pulled out of Confirmed
                 # specifically by the Bearish-regime bar (not by R:R,
                 # which has its own dedicated section) -- lets the email
                 # say WHY this row is sitting in Watch instead of leaving
                 # it unexplained.
-                "regime_downgraded": bool(regime.only_strongest and cleared_backtest and not meets_confirmed_bar),
+                "regime_downgraded": bool(regime.only_strongest and cleared_backtest and not meets_confirmed_bar and not fundamental_downgraded),
+                # Cleared backtest AND the regime bar, but pulled out of
+                # Confirmed specifically by weak/high-debt/shrinking
+                # fundamentals -- see evaluate_fundamental_quality above.
+                "fundamental_downgraded": fundamental_downgraded,
             }
 
             # Risk/Reward is a CORE FILTER, not decoration: a row with
@@ -607,6 +708,26 @@ def _confirmation_cell_html(score):
     return badge + failed_html
 
 
+def _fundamentals_note_html(fundamentals):
+    """Sub-line under the Quality badge showing the fundamental-quality
+    read (ROE / Debt-Equity / Earnings growth) for rows where it was
+    computed -- currently only rows that cleared the technical bar for
+    Confirmed. Other buckets pass row.get('fundamentals') == None and get
+    nothing rendered here."""
+    if fundamentals is None:
+        return ""
+    if not fundamentals["available"]:
+        return (
+            f'<div style="margin-top:3px;font-size:9.5px;color:#8A8F9C;">Fundamentals: data unavailable</div>'
+        )
+    color = "#0f5132" if fundamentals["passed"] else "#8a1c1c"
+    mark = "&#10003;" if fundamentals["passed"] else "&#10007;"
+    detail = " &middot; ".join(f"{html.escape(label)} {html.escape(val)}" for label, _, val in fundamentals["checks"])
+    return (
+        f'<div style="margin-top:3px;font-size:9.5px;color:{color};">{mark} Fundamentals: {detail}</div>'
+    )
+
+
 def _row_bg_for_symbol(symbol, default_bg):
     """Light-green override when this row's symbol is one of Bala's own
     stocks (constants.STOCKS) -- lets the personal holdings jump out
@@ -637,14 +758,22 @@ def _signal_rows_html(rows, row_bg):
                 f'\u2b07 Cleared the backtest, but held back from Confirmed by the 🔴 Bearish-regime filter '
                 f'(needs Quality \u2265{BEAR_MARKET_MIN_QUALITY_SCORE} and preferred Risk:Reward).</div>'
             )
+        fund_note = ""
+        if row.get("fundamental_downgraded"):
+            fund_note = (
+                f'<div style="margin-top:3px;font-size:10.5px;color:#7a5b00;">'
+                f'\u2b07 Cleared the backtest, but held back from Confirmed by the fundamentals gate '
+                f'(needs ROE \u2265{FUNDAMENTAL_MIN_ROE*100:.0f}%, Debt/Equity \u2264{FUNDAMENTAL_MAX_DEBT_TO_EQUITY:.0f}%, '
+                f'non-negative earnings growth -- see Quality column).</div>'
+            )
         bg = _row_bg_for_symbol(row["symbol"], row_bg)
         out.append(f"""
         <tr style="background:{bg};">
           <td style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}</td>
+          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{fund_note}</td>
           <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
           <td style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{_backtest_cell(row['backtest'])}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_quality_badge_html(row['quality'])}</td>
+          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_quality_badge_html(row['quality'])}{_fundamentals_note_html(row.get('fundamentals'))}</td>
           <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_entry_badge_html(row.get('entry'))}</td>
           <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_stop_loss_cell_html(row.get('entry'))}</td>
           <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_targets_cell_html(row.get('targets'))}</td>
@@ -913,7 +1042,8 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
 
     confirmed_subtitle = (
         f"Backtest cleared the bar: ≥{MIN_SAMPLES_FOR_CONFIDENCE} past occurrences and ≥{CONFIRM_HIT_RATE_THRESHOLD*100:.0f}% {PRIMARY_HORIZON}-day hit-rate, "
-        f"and Risk:Reward ≥ {RISK_REWARD_MIN_THRESHOLD:.1f}. "
+        f"Risk:Reward ≥ {RISK_REWARD_MIN_THRESHOLD:.1f}, and (where fundamentals data is available) ROE ≥{FUNDAMENTAL_MIN_ROE*100:.0f}%, "
+        f"Debt/Equity ≤{FUNDAMENTAL_MAX_DEBT_TO_EQUITY:.0f}%, non-negative earnings growth -- high quality on both the chart and the balance sheet, not chart-only. "
         "Entry column shows whether this is chaseable now, better bought on a retest, or neither -- see disclaimer below."
     )
     if regime.only_strongest:
@@ -932,6 +1062,7 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
     )
     if regime.only_strongest:
         watch_subtitle += " Rows marked with ⬇ below cleared the backtest but were held back from Confirmed by the Bearish-regime filter."
+    watch_subtitle += " Rows marked with ⬇ and 'fundamentals gate' cleared the backtest but were held back from Confirmed by weak/unavailable fundamentals."
     watch_block = _table_block(
         "👀 Unconfirmed / Watch List",
         watch_subtitle,
@@ -1066,6 +1197,16 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
                 9/9; unavailable checks are excluded from the tally rather than counted as a failure. This is
                 additional context on a row whose Confirmed/Watch/Filtered/Failed bucket is already decided --
                 it doesn't itself gate anything, the way Risk:Reward and the Failed Breakout check do.
+                <b>Fundamentals gate (Confirmed Breakouts only):</b> clearing the technical backtest bar is necessary but no
+                longer sufficient for the Confirmed section -- the underlying business also has to clear a classic
+                "quality stock" screen, pulled from yfinance at run time: Return on Equity \u2265{FUNDAMENTAL_MIN_ROE*100:.0f}%,
+                Debt/Equity \u2264{FUNDAMENTAL_MAX_DEBT_TO_EQUITY:.0f}%, and non-negative latest earnings growth. This is only
+                fetched for rows that already cleared the technical bar, and it never gates the Watch List, Filtered, Failed,
+                or Near-Breakout sections -- only Confirmed. Same "nothing silently dropped" rule as everything else here: a
+                row that clears technicals but fails an available fundamentals check is pulled into Watch List with a note
+                (⬇, see Pattern column), not discarded. If yfinance has none of the three metrics for a symbol, the gate is
+                skipped rather than treated as a fail -- a data gap doesn't disqualify a signal. The Quality column shows
+                which specific metrics were checked and whether each passed.
                 Rows shaded <span style="background:#E9F7ED;padding:0 3px;">light green</span> are symbols already
                 in your own direct-equity list (constants.STOCKS) -- called out purely to jump out from the wider
                 NIFTY 500 scan, not a separate signal.

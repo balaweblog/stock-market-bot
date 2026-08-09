@@ -871,68 +871,16 @@ def render_fund_cards(funds_data):
     return _fund_section_title("2. Fund-wise Analysis (Last 30 Days)", len(funds_data)) + "".join(cards)
 
 
-def render_market_news(market_data):
-    devs = market_data.get("developments") or []
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#8A8F9C;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(d.get("date",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(d.get("topic",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#1B2233;border-top:1px solid #EDEAE2;">'
-        f'<strong>{_esc(d.get("headline",""))}</strong><br>{_esc(d.get("summary",""))}'
-        f'<br><span style="color:#4A5063;"><em>SIP impact:</em> {_esc(d.get("sip_investor_impact",""))}</span></td></tr>'
-        for d in devs
-    )
-    if not rows:
-        rows = f'<tr><td colspan="3" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No market developments could be generated this run.</td></tr>'
-    return _section_title("3. Market News (Past 30 Days)") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Date</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Topic</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Development &amp; Impact</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
-def render_sector_table(sectors_data):
-    def stars(rating):
-        try:
-            n = max(0, min(5, round(float(rating))))
-        except (TypeError, ValueError):
-            n = 0
-        return "&#9733;" * n + "&#9734;" * (5 - n)
-
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(s.get("sector",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("monthly_performance",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("key_news",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("outlook",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;color:#B08D57;border-top:1px solid #EDEAE2;white-space:nowrap;">{stars(s.get("rating"))}</td></tr>'
-        for s in sectors_data
-    )
-    if not rows:
-        rows = f'<tr><td colspan="5" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No sector data could be generated this run.</td></tr>'
-    return _section_title("4. Sector Performance") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Sector</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Monthly Performance</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Key News</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Outlook</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Rating</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
 def build_email_html(market_data, funds_data, sectors_data, synthesis_data, sources, used_live_search, today_str):
+    # NOTE: "3. Market News (Past 30 Days)" and "4. Sector Performance" were
+    # removed from the email on request -- the underlying market_data /
+    # sectors_data are still fetched (Stage 1 / Stage 3 below) because
+    # market_data still feeds the Executive Summary's sentiment badge/reason
+    # and sectors_data still feeds Stage 4's synthesized "top developments"
+    # list -- only the two standalone tables are gone.
     sections = (
         render_executive_summary(market_data, synthesis_data)
         + render_fund_cards(funds_data)
-        + render_market_news(market_data)
-        + render_sector_table(sectors_data)
     )
     sources_html = _build_sources_html(sources)
 

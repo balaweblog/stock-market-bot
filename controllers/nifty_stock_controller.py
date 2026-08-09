@@ -275,119 +275,6 @@ def fetch_market_dashboard_indices():
     return results
 
 
-# -----------------------------
-# Sector Rotation Dashboard -- 1W/1M sector index returns computed from
-# real price data, not the LLM (same rationale as fetch_weekly_returns /
-# fetch_market_dashboard_indices above)
-# -----------------------------
-# Best-effort mapping of SECTORS_STOCK names to a representative Yahoo
-# Finance ticker for that sector's benchmark index. Only sectors with a
-# reasonably reliable free index ticker are mapped here -- anything
-# missing (or overridden) can be supplied via SECTOR_INDEX_TICKER_MAP_JSON
-# (same override pattern as STOCK_TICKER_MAP_JSON above). A sector with no
-# mapping simply shows "n/a" for 1W/1M rather than a guessed number --
-# render_sector_rotation_dashboard() never fabricates a price move.
-DEFAULT_SECTOR_INDEX_TICKERS = {
-    "Banking": "^NSEBANK",
-    "IT": "^CNXIT",
-    "Pharma": "^CNXPHARMA",
-    "Auto": "^CNXAUTO",
-    "FMCG": "^CNXFMCG",
-    "Metals": "^CNXMETAL",
-    "Energy": "^CNXENERGY",
-    "Realty": "^CNXREALTY",
-    "PSU": "^CNXPSUBANK",
-    "US Technology": "^NDX",
-}
-
-
-def _load_sector_index_ticker_map():
-    merged = dict(DEFAULT_SECTOR_INDEX_TICKERS)
-    raw = os.getenv("SECTOR_INDEX_TICKER_MAP_JSON")
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                merged.update({
-                    k.strip(): v.strip()
-                    for k, v in data.items()
-                    if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
-                })
-            else:
-                log.warning("SECTOR_INDEX_TICKER_MAP_JSON is not a JSON object -- ignoring.")
-        except json.JSONDecodeError as e:
-            log.warning(f"SECTOR_INDEX_TICKER_MAP_JSON is not valid JSON ({e}) -- ignoring.")
-    return merged
-
-
-SECTOR_INDEX_TICKERS = _load_sector_index_ticker_map()
-
-
-def fetch_sector_index_returns(sectors):
-    """
-    Returns {sector_name: {"wk1_pct": float|None, "mo1_pct": float|None}}
-    for each sector in `sectors` that has a mapping in
-    SECTOR_INDEX_TICKERS, using a single batched yf.download(period="45d")
-    call -- ~45 calendar days comfortably covers the ~22 trading days
-    needed for a trailing-1-month change on top of the ~6 needed for
-    trailing-1-week, without a second network round trip.
-
-    Sectors with no ticker mapping are omitted entirely (logged once);
-    render_sector_rotation_dashboard() shows "n/a" for anything missing
-    rather than falling back to an LLM-guessed number -- unlike stock/
-    sector price moves, an index-level return has a real deterministic
-    source available, so there's no reason to trust a guess here.
-    """
-    results = {}
-    valid_tickers = {name: SECTOR_INDEX_TICKERS[name] for name in sectors if SECTOR_INDEX_TICKERS.get(name)}
-    unmapped = [name for name in sectors if not SECTOR_INDEX_TICKERS.get(name)]
-
-    if unmapped:
-        log.warning(
-            "No sector index ticker mapping for: %s -- 1W/1M will show n/a for "
-            "these until added to DEFAULT_SECTOR_INDEX_TICKERS or "
-            "SECTOR_INDEX_TICKER_MAP_JSON." % ", ".join(unmapped)
-        )
-
-    if not valid_tickers:
-        return results
-
-    try:
-        tickers_list = list(valid_tickers.values())
-        hist_data = yf.download(tickers_list, period="45d", interval="1d", auto_adjust=True, progress=False)
-        is_multi = isinstance(hist_data.columns, pd.MultiIndex)
-
-        for name, ticker in valid_tickers.items():
-            try:
-                if is_multi:
-                    if "Close" not in hist_data.columns.levels[0] or ticker not in hist_data["Close"]:
-                        log.warning(f"No 'Close' price history found for sector {name} ({ticker}).")
-                        continue
-                    closes = hist_data["Close"][ticker].dropna()
-                else:
-                    if "Close" not in hist_data or hist_data["Close"].empty:
-                        log.warning(f"No 'Close' price history found for sector {name} ({ticker}).")
-                        continue
-                    closes = hist_data["Close"].dropna()
-
-                if len(closes) < 2:
-                    log.warning(f"Not enough price history to compute returns for sector {name} ({ticker}).")
-                    continue
-
-                recent = float(closes.iloc[-1])
-                week_ago = float(closes.iloc[max(0, len(closes) - 6)])
-                month_ago = float(closes.iloc[max(0, len(closes) - 22)])
-                wk1_pct = round((recent - week_ago) / week_ago * 100, 2) if week_ago else None
-                mo1_pct = round((recent - month_ago) / month_ago * 100, 2) if month_ago else None
-                results[name] = {"wk1_pct": wk1_pct, "mo1_pct": mo1_pct}
-            except Exception as e:
-                log.warning(f"Could not compute 1W/1M return for sector {name} ({ticker}): {e}")
-    except Exception as e:
-        log.warning(f"Batch yfinance download for sector index returns failed: {e}")
-
-    return results
-
-
 def _chunks(items, size):
     size = max(1, size)
     return [items[i:i + size] for i in range(0, len(items), size)]
@@ -641,17 +528,6 @@ def run_sector_stage(today_str, lookback_note):
             if src not in sources:
                 sources.append(src)
         used_live = used_live or live
-
-    index_returns = fetch_sector_index_returns(SECTORS_STOCK)
-    by_name = {s.get("sector"): s for s in all_sectors if isinstance(s, dict)}
-    for name, returns in index_returns.items():
-        sector = by_name.get(name)
-        if sector is not None:
-            sector["wk1_pct"] = returns.get("wk1_pct")
-            sector["mo1_pct"] = returns.get("mo1_pct")
-        else:
-            # LLM produced no card at all for this sector -- still surface the real numbers.
-            all_sectors.append({"sector": name, "wk1_pct": returns.get("wk1_pct"), "mo1_pct": returns.get("mo1_pct")})
 
     return all_sectors, sources, used_live
 
@@ -1070,112 +946,6 @@ def render_executive_summary(market_data, synthesis_data):
     """
 
 
-# -----------------------------
-# Sector Rotation Dashboard -- per-column signal derivation
-# -----------------------------
-# Momentum is derived purely from the deterministic wk1_pct/mo1_pct
-# computed by fetch_sector_index_returns() (same hand-picked-threshold
-# philosophy as the Market Regime Dashboard's _signal_* helpers above --
-# tune freely). Earnings/Valuation come from Stage 3's fixed LLM enums
-# and are mapped with a plain lookup, same pattern as _reco_color/
-# _sentiment_color. View is then derived deterministically from all
-# three -- never asked of the LLM directly -- so the same inputs always
-# produce the same allocation call run-to-run.
-GREEN, YELLOW, RED = "\U0001F7E2", "\U0001F7E1", "\U0001F534"
-
-EARNINGS_TREND_STYLE = {
-    "positive": GREEN,
-    "neutral": YELLOW,
-    "negative": RED,
-}
-
-VALUATION_STYLE = {
-    "attractive": GREEN,
-    "fair": YELLOW,
-    "expensive": RED,
-}
-
-
-def _signal_sector_momentum(wk1_pct, mo1_pct):
-    if wk1_pct is None or mo1_pct is None:
-        return YELLOW
-    if wk1_pct >= 0.5 and mo1_pct >= 0.5:
-        return GREEN
-    if wk1_pct <= -0.5 and mo1_pct <= -0.5:
-        return RED
-    return YELLOW
-
-
-def _sector_view(momentum_emoji, earnings_emoji, valuation_emoji):
-    emojis = [momentum_emoji, earnings_emoji, valuation_emoji]
-    greens, reds = emojis.count(GREEN), emojis.count(RED)
-    if greens and reds:
-        return "Selective"  # momentum and fundamentals disagree -- a broad allocation call isn't clean here, be a stock-picker
-    if greens == 3:
-        return "Overweight"
-    if greens == 2:
-        return "Positive"
-    if reds >= 2:
-        return "Underweight"
-    return "Neutral"
-
-
-def render_sector_rotation_dashboard(sectors_data):
-    """
-    Renders the "Sector Rotation Dashboard" -- a compact, scannable
-    front-page table (Sector / 1W / 1M / Momentum / Earnings / Valuation /
-    View) sitting between the Executive Summary and the per-stock cards,
-    so a reader gets the sector-allocation picture before drilling into
-    individual watchlist names. 1W/1M are real index returns (yfinance,
-    via fetch_sector_index_returns/run_sector_stage); Momentum/View are
-    derived deterministically from those numbers; Earnings/Valuation come
-    from Stage 3's live-search sector call.
-    """
-    by_name = {s.get("sector"): s for s in (sectors_data or []) if isinstance(s, dict)}
-
-    rows_spec = []
-    for name in SECTORS_STOCK:
-        s = by_name.get(name) or {}
-        wk1_pct, mo1_pct = s.get("wk1_pct"), s.get("mo1_pct")
-        momentum_emoji = _signal_sector_momentum(wk1_pct, mo1_pct)
-        earnings_emoji = EARNINGS_TREND_STYLE.get((s.get("earnings_trend") or "").strip().lower(), YELLOW)
-        valuation_emoji = VALUATION_STYLE.get((s.get("valuation") or "").strip().lower(), YELLOW)
-        view = _sector_view(momentum_emoji, earnings_emoji, valuation_emoji)
-        rows_spec.append((
-            name, _fmt_pct(wk1_pct), _fmt_pct(mo1_pct),
-            momentum_emoji, earnings_emoji, valuation_emoji, view,
-        ))
-
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(name)}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#1B2233;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(wk1)}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#1B2233;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(mo1)}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;border-top:1px solid #EDEAE2;text-align:center;">{mom}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;border-top:1px solid #EDEAE2;text-align:center;">{earn}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;border-top:1px solid #EDEAE2;text-align:center;">{val}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(view)}</td></tr>'
-        for name, wk1, mo1, mom, earn, val, view in rows_spec
-    )
-    if not rows:
-        rows = f'<tr><td colspan="7" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No sector data could be generated this run.</td></tr>'
-
-    return _section_title("4. Sector Rotation Dashboard") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Sector</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">1W</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">1M</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Momentum</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Earnings</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Valuation</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">View</td>
-      </tr>
-      {rows}
-    </table>
-    <p style="margin:6px 0 0;font-family:{SANS};font-size:10.5px;color:#8A8F9C;">1W/1M are computed directly from sector-index price history (yfinance) where a ticker mapping exists ("n/a" otherwise -- see SECTOR_INDEX_TICKERS). Momentum and View are deterministic derivations of the numbers in this row, not model output. Earnings and Valuation come from this run's live sector search and can be a session or two stale.</p>
-    """
-
-
 def _format_weekly_return_display(stock_data):
     for key in ("weekly_return_pct", "weekly_return", "weekly_return_percent", "return_pct"):
         value = stock_data.get(key)
@@ -1240,7 +1010,7 @@ def _action_now_text(stock_data):
 
 def render_stock_cards(stocks_data):
     if not stocks_data:
-        return _stock_section_title("5. Watchlist Stock Analysis (Last 7 Days)", 0) + (
+        return _stock_section_title("4. Watchlist Stock Analysis (Last 7 Days)", 0) + (
             f'<p style="font-family:{SANS};font-size:12.5px;color:#B0473F;">No stock data could be generated this run.</p>'
         )
     cards = []
@@ -1353,66 +1123,10 @@ def render_stock_cards(stocks_data):
         </table>
         """)
     return (
-        _stock_section_title("5. Watchlist Stock Analysis (Last 7 Days)", len(stocks_data))
+        _stock_section_title("4. Watchlist Stock Analysis (Last 7 Days)", len(stocks_data))
         + _action_legend_html()
         + "".join(cards)
     )
-
-
-def render_market_news(market_data):
-    devs = market_data.get("developments") or []
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#8A8F9C;border-top:1px solid #EDEAE2;white-space:nowrap;">{_esc(d.get("date",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(d.get("topic",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:12px;color:#1B2233;border-top:1px solid #EDEAE2;">'
-        f'<strong>{_esc(d.get("headline",""))}</strong><br>{_esc(d.get("summary",""))}'
-        f'<br><span style="color:#4A5063;"><em>Investor impact:</em> {_esc(d.get("investor_impact",""))}</span></td></tr>'
-        for d in devs
-    )
-    if not rows:
-        rows = f'<tr><td colspan="3" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No market developments could be generated this run.</td></tr>'
-    return _section_title("6. Market News (Past 7 Days)") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Date</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Topic</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Development &amp; Impact</td>
-      </tr>
-      {rows}
-    </table>
-    """
-
-
-def render_sector_table(sectors_data):
-    def stars(rating):
-        try:
-            n = max(0, min(5, round(float(rating))))
-        except (TypeError, ValueError):
-            n = 0
-        return "&#9733;" * n + "&#9734;" * (5 - n)
-
-    rows = "".join(
-        f'<tr><td style="padding:7px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:1px solid #EDEAE2;">{_esc(s.get("sector",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("weekly_performance",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("key_news",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:11.5px;color:#4A5063;border-top:1px solid #EDEAE2;">{_esc(s.get("outlook",""))}</td>'
-        f'<td style="padding:7px 10px;font-family:{SANS};font-size:14px;color:#B08D57;border-top:1px solid #EDEAE2;white-space:nowrap;">{stars(s.get("rating"))}</td></tr>'
-        for s in sectors_data
-    )
-    if not rows:
-        rows = f'<tr><td colspan="5" style="padding:10px;font-family:{SANS};font-size:12px;color:#8A8F9C;">No sector data could be generated this run.</td></tr>'
-    return _section_title("7. Sector Performance") + f"""
-    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #E7E4DC;border-radius:4px;border-collapse:collapse;">
-      <tr style="background:#F4F2ED;">
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Sector</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Weekly Performance</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Key News</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Outlook</td>
-        <td style="padding:7px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#8A8F9C;text-transform:uppercase;">Rating</td>
-      </tr>
-      {rows}
-    </table>
-    """
 
 
 def build_email_html(market_data, stocks_data, sectors_data, synthesis_data, sources, used_live_search, today_str):
@@ -1420,10 +1134,7 @@ def build_email_html(market_data, stocks_data, sectors_data, synthesis_data, sou
         render_market_dashboard(market_data)
         + render_weekly_changes(synthesis_data)
         + render_executive_summary(market_data, synthesis_data)
-        + render_sector_rotation_dashboard(sectors_data)
         + render_stock_cards(stocks_data)
-        + render_market_news(market_data)
-        + render_sector_table(sectors_data)
     )
     sources_html = _build_sources_html(sources)
 
