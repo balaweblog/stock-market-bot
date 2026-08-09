@@ -1,0 +1,41 @@
+name: Monthly Wealth Report Agent
+on:
+  workflow_dispatch:
+  schedule:
+    # 07:30 IST on the 1st of every month (IST = UTC+5:30 -> 02:00 UTC)
+    - cron: "0 2 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  wealth-report:
+    runs-on: ubuntu-latest
+
+    env:
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_CC: ${{ secrets.EMAIL_CC }}
+      EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      REQUIRE_LIVE_DATA: "true"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Monthly Wealth Report
+        run: python -m controllers.wealth_controller
