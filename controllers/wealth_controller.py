@@ -331,29 +331,73 @@ def generate_wealth_report(portfolio, usd_inr_rate):
         verdicts, portfolio_take = _parse_wealth_report_json(text, instrument_names)
         if verdicts:
             # Fill in any instrument the model skipped so the table is
-            # always complete, rather than silently missing a row. Log
-            # each backfill -- without this, "Not flagged by AI this
-            # run" in the report is indistinguishable from a genuine
-            # AI omission vs. a name the model returned that
-            # _match_instrument_name couldn't confidently resolve back
-            # to a configured instrument (those are dropped with a
-            # warning in _parse_wealth_report_json, but that warning
-            # alone doesn't say which configured instrument ended up
-            # defaulted as a result).
+            # always complete, rather than silently missing a row. Before
+            # giving up and defaulting to "Continue", retry once for just
+            # the missing instruments -- most of the time a partial miss
+            # is recoverable, so this should make the generic fallback
+            # text rare rather than routine.
             missing = [name for name in instrument_names if name not in verdicts]
             if missing:
                 log.warning(
                     f"Monthly Wealth Report: AI response covered {len(verdicts)}/{len(instrument_names)} "
-                    f"instruments -- defaulting to 'Continue' for: {', '.join(missing)}. "
+                    f"instruments -- retrying for: {', '.join(missing)}. "
                     f"Check above for 'unrecognized instrument' warnings -- if the AI returned a verdict "
                     f"under a name that didn't match, it's counted there instead of here."
                 )
-            for name in missing:
-                verdicts[name] = {"verdict": "Continue", "reason": "Not flagged by AI this run."}
+                retry_verdicts = _retry_missing_verdicts(missing, portfolio, usd_inr_rate)
+                if retry_verdicts:
+                    verdicts.update(retry_verdicts)
+                    log.info(
+                        f"Monthly Wealth Report: retry recovered AI verdicts for: {', '.join(retry_verdicts.keys())}."
+                    )
+                still_missing = [name for name in instrument_names if name not in verdicts]
+                if still_missing:
+                    log.warning(
+                        f"Monthly Wealth Report: still no AI verdict after retry for: {', '.join(still_missing)} "
+                        f"-- defaulting to 'Continue'."
+                    )
+            for name in instrument_names:
+                verdicts.setdefault(name, {"verdict": "Continue", "reason": "Not flagged by AI this run."})
             return verdicts, portfolio_take or _fallback_portfolio_take(), used_live
 
     log.error("Monthly Wealth Report: every AI tier failed or returned nothing usable -- using fallback verdicts.")
     return _fallback_verdicts(instrument_names), _fallback_portfolio_take(), False
+
+
+def _retry_missing_verdicts(missing_names, portfolio, usd_inr_rate):
+    """
+    One-shot retry for instruments the first AI call skipped entirely --
+    asks again, but only for those instruments, so a partial miss doesn't
+    fall straight through to the generic "Not flagged by AI this run"
+    filler. Uses the same prompt/parsing path as the main call, just
+    scoped to a smaller holdings block. Returns whatever subset of
+    verdicts it manages to recover (possibly empty if the retry also
+    fails) -- anything still missing after this is backfilled by the
+    caller as before.
+    """
+    missing_entries = [e for e in portfolio if e["instrument"] in missing_names]
+    if not missing_entries:
+        return {}
+
+    today_str = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d %B %Y")
+    holdings_block = _build_holdings_block(missing_entries, usd_inr_rate)
+    prompt = _build_wealth_prompt(holdings_block, today_str)
+
+    def _validate(text):
+        v, _ = _parse_wealth_report_json(text, missing_names)
+        return bool(v)
+
+    text, _sources, _used_live = llm_backend.generate_analysis(
+        prompt,
+        max_tokens=600,
+        validate_fn=_validate,
+        log_label="Monthly Wealth Report (retry - missing instruments)",
+    )
+    if not text:
+        return {}
+
+    verdicts, _take = _parse_wealth_report_json(text, missing_names)
+    return verdicts
 
 
 # -----------------------------------------------------------------------
@@ -363,14 +407,61 @@ SANS = "-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif"
 SERIF = "Georgia,'Times New Roman',Times,serif"
 
 
+# Category strings that should all display as one "Mutual Funds" group in
+# the report, regardless of how SIP_PORTFOLIO tags the underlying fund
+# type (equity/debt/index/ELSS/hybrid/etc.) -- so the table shows a single
+# consolidated mutual-fund bucket instead of splitting it by sub-type.
+# Matched as a substring against the lowercased category, so e.g. an
+# entry categorized "Equity Mutual Fund" or "Debt Fund" both collapse in.
+# Deliberately does NOT match "NPS"/"PPF"/"EPF" categories -- those stay
+# separate or fold into "Retirement" below. "Gold"/"Silver" fold into
+# "Commodities" below instead of staying standalone. Extend this list if
+# SIP_PORTFOLIO uses category labels not covered here.
+_MUTUAL_FUND_CATEGORY_KEYWORDS = (
+    "mutual fund", "elss", "index fund", "flexicap", "multicap",
+    "midcap fund", "smallcap fund", "small cap fund", "largecap fund",
+    "large cap fund", "hybrid fund", "liquid fund", "debt fund",
+    "sectoral fund", "thematic fund",
+)
+
+
+# Category strings that should all display as one "Retirement" group,
+# while each instrument (NPS, EPF, etc.) still shows as its own row within
+# that group -- only the category header consolidates, not the rows.
+# Deliberately excludes "PPF" (Public Provident Fund) -- kept as its own
+# category since it wasn't asked to be folded in here.
+_RETIREMENT_CATEGORY_KEYWORDS = ("nps", "epf", "retirement", "pension fund")
+
+# Category strings that should all display as one "Commodities" group --
+# Gold and Silver instruments (SGBs, ETFs, physical, digital) collapse
+# into this header while each instrument still shows as its own row.
+_COMMODITY_CATEGORY_KEYWORDS = ("gold", "silver", "commodit")
+
+
+def _display_category(category):
+    cat_lower = category.lower()
+    if any(kw in cat_lower for kw in _MUTUAL_FUND_CATEGORY_KEYWORDS):
+        return "Mutual Funds"
+    if any(kw in cat_lower for kw in _RETIREMENT_CATEGORY_KEYWORDS):
+        return "Retirement"
+    if any(kw in cat_lower for kw in _COMMODITY_CATEGORY_KEYWORDS):
+        return "Commodities"
+    return category
+
+
 def _group_by_category(portfolio):
-    """Groups instruments by category, preserving each category's first
-    order of appearance in SIP_PORTFOLIO -- no separate category-order
-    list to maintain when the portfolio changes."""
+    """Groups instruments by display category, preserving each category's
+    first order of appearance in SIP_PORTFOLIO -- no separate category-order
+    list to maintain when the portfolio changes. Category strings are passed
+    through _display_category first, so mutual-fund sub-types collapse into
+    "Mutual Funds", NPS/EPF collapse into "Retirement", and Gold/Silver
+    collapse into "Commodities" regardless of how SIP_PORTFOLIO tags them;
+    entries themselves are untouched and still render as separate rows --
+    this only consolidates the category header, not the underlying data."""
     groups = {}
     order = []
     for entry in portfolio:
-        cat = entry["category"]
+        cat = _display_category(entry["category"])
         if cat not in groups:
             groups[cat] = []
             order.append(cat)
@@ -386,11 +477,10 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
 
     for category, entries in grouped:
         category_total = sum(_instrument_monthly_inr(e, usd_inr_rate) for e in entries)
-        category_pct_of_total = (category_total / grand_total * 100) if grand_total else 0.0
         body_parts.append(f"""
             <tr>
-              <td colspan="5" style="padding:10px 10px 6px;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#B08D57;background:#FAF8F1;border-top:1px solid #E7DFC9;border-bottom:1px solid #E7DFC9;">
-                {html.escape(category)} &nbsp;&middot;&nbsp; ₹{category_total:,.0f}/mo &nbsp;&middot;&nbsp; {category_pct_of_total:.1f}% of total
+              <td colspan="4" style="padding:10px 10px 6px;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#B08D57;background:#FAF8F1;border-top:1px solid #E7DFC9;border-bottom:1px solid #E7DFC9;">
+                {html.escape(category)} &nbsp;&middot;&nbsp; ₹{category_total:,.0f}/mo
               </td>
             </tr>""")
         for entry in entries:
@@ -402,14 +492,10 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
                 f'font-size:11px;font-weight:700;color:{text_color};background:{bg_color};">'
                 f'{html.escape(v["verdict"])}</span>'
             )
-            entry_inr = _instrument_monthly_inr(entry, usd_inr_rate)
-            pct_of_category = (entry_inr / category_total * 100) if category_total else 0.0
-            pct_of_total = (entry_inr / grand_total * 100) if grand_total else 0.0
             body_parts.append(f"""
             <tr>
               <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;">{html.escape(name)}</td>
               <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;text-align:right;white-space:nowrap;">{html.escape(_format_amount(entry, usd_inr_rate))}</td>
-              <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:11px;color:#4A5063;text-align:right;white-space:nowrap;">{pct_of_category:.1f}% cat &nbsp;/&nbsp; {pct_of_total:.1f}% tot</td>
               <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;text-align:center;">{badge}</td>
               <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:11px;color:#4A5063;">{html.escape(v["reason"])}</td>
             </tr>""")
@@ -418,7 +504,6 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
             <tr>
               <td style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:2px solid #14213D;">Total</td>
               <td style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;text-align:right;white-space:nowrap;border-top:2px solid #14213D;">₹{grand_total:,.0f}/mo</td>
-              <td style="padding:10px 10px;font-family:{SANS};font-size:11px;font-weight:700;color:#14213D;text-align:right;white-space:nowrap;border-top:2px solid #14213D;">100.0% tot</td>
               <td style="padding:10px 10px;border-top:2px solid #14213D;" colspan="2"></td>
             </tr>""")
 
@@ -426,7 +511,6 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
             <tr>
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Instrument</th>
               <th style="padding:8px 10px;text-align:right;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Monthly SIP</th>
-              <th style="padding:8px 10px;text-align:right;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">% Cat / Tot</th>
               <th style="padding:8px 10px;text-align:center;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Verdict</th>
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Why</th>
             </tr>"""
