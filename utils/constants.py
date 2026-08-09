@@ -76,7 +76,7 @@ MF_PORTFOLIO = [
 # LLM and in the report table -- it doesn't drive any calculation.
 # -----------------------------------------------------------------------
 SIP_PORTFOLIO = [
-    {"instrument": "PPF", "category": "Government / Debt", "amount_inr": 5000},
+    {"instrument": "Public Provident Fund", "category": "Government / Debt", "amount_inr": 5000},
     {"instrument": "Mirae Asset Large & Midcap Fund", "category": "Mutual Fund - Large & Midcap", "amount_inr": 7000},
     {"instrument": "Parag Parikh Flexi Cap Fund", "category": "Mutual Fund - Flexi Cap", "amount_inr": 7000},
     {"instrument": "DSP Multi Asset Fund", "category": "Mutual Fund - Multi Asset", "amount_inr": 7000},
@@ -101,7 +101,7 @@ SIP_PORTFOLIO = [
     {"instrument": "Silver (Bhima Jewellers)", "category": "Physical Silver", "amount_inr": 5000},
     {"instrument": "ICICI Prudential Manufacturing Fund", "category": "Mutual Fund - Thematic", "amount_inr": 3000},
     {"instrument": "Nippon India Gold Savings Fund", "category": "Mutual Fund - Gold", "amount_inr": 1000},
-    {"instrument": "EPF", "category": "Retirement - EPF", "amount_inr": 33000},
+    {"instrument": "Employee Provident Fund", "category": "Retirement - EPF", "amount_inr": 33000},
     {"instrument": "US Stocks", "category": "International Equity", "amount_usd": 100},
 ]
 

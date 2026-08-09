@@ -1,13 +1,13 @@
 {context_text}Today is {today_str}. Below is Bala's monthly SIP / wealth-building portfolio -- recurring monthly contributions across PPF, mutual funds, NPS, direct equity, gold, silver, EPF and US stocks. Review it as a monthly portfolio checkup against current, real market conditions -- not a generic finance essay.
 
-ACCURACY RULES -- apply these to every verdict, note, and suggestion below:
+ACCURACY RULES -- apply these to every recommendation, note, and suggestion below:
 - Ground your read in real, current developments where you have them: actual recent price moves, index/sector performance, policy or rate changes, earnings, fund manager changes. If you don't have a specific, reliable fact for an instrument, give a brief, sensible, generic-but-accurate read instead of inventing one -- never fabricate a statistic, news event, price move, or fund performance number.
 - Only name a specific real-world fund, ETF, ticker, or stock if you are reasonably confident it actually exists and is realistically investable by an Indian retail investor (domestic route) or via standard US brokerage / GIFT City / LRS routes (US and international route). If you're not confident a name is real, name the category or sector instead of guessing -- but do not skip the numeric target just because you're skipping the name.
 - Do not present outdated information as current, and do not state a specific date-stamped fact (e.g. "cut rates last week") unless you are confident it is accurate as of {today_str}.
 - Any rupee or dollar amount you propose changing must be consistent with that instrument's actual monthly contribution as listed in the portfolio below -- never propose cutting an instrument by more than it currently contributes, and never invent a figure unrelated to the listed amount.
-- Keep instrument_verdicts and the Portfolio Take internally consistent: if an instrument is verdicted "Reduce", "Exit", or "At Risk", no suggestion should casually contradict that (e.g. don't verdict something "Exit" while a suggestion proposes increasing it), and vice versa.
+- Keep instrument_recommendations, the Portfolio Take, and the portfolio_snapshot internally consistent: if an instrument's recommendation is "Reduce", "Exit", or "At Risk", no suggestion should casually contradict that (e.g. don't recommend "Exit" for something while a suggestion proposes increasing it), and the snapshot's bands/overall score must reflect the same read as the per-instrument recommendations and diversification notes -- never contradict each other.
 
-For EACH instrument listed below, give exactly ONE verdict from this fixed set: "Continue", "Increase", "Reduce", "Exit", "At Risk" -- plus one short reason (max 12 words, plain text, no markdown) tied to the accuracy rules above.
+For EACH instrument listed below, give exactly ONE recommendation from this fixed set: "Continue", "Increase", "Reduce", "Exit", "At Risk" -- plus one short reason (max 12 words, plain text, no markdown) tied to the accuracy rules above.
 
 Then write a "Portfolio Take" section synthesizing the WHOLE portfolio together:
 
@@ -20,6 +20,19 @@ Then write a "Portfolio Take" section synthesizing the WHOLE portfolio together:
    - Together with the other suggestions, address DIFFERENT gaps -- don't have two suggestions solving the same concentration issue.
    No generic filler ("diversify more", "monitor closely", "shift a portion") -- every suggestion must be something Bala could literally go execute this month, with a stated reason it's worth doing.
 
+Then, separately, produce a "portfolio_snapshot" -- a compact scorecard giving Bala the complete picture at a glance. Rate EACH of the following dimensions based on the actual holdings below (not generic commentary), and return a "band" plus a short "label" for each:
+   - "equity_orientation": how equity-heavy the portfolio is overall (direct equity + equity mutual funds + equity-oriented NPS scheme, relative to total contributions).
+   - "retirement_discipline": how well retirement-dedicated instruments (EPF, NPS, PPF) are funded relative to total contributions.
+   - "debt_fixed_income_backing": how much stable debt/fixed-income exposure exists (PPF, EPF, NPS debt/gilt allocation, debt funds) relative to total.
+   - "diversification_by_products": how spread the money is across distinct product types (direct equity, mutual funds, retirement instruments, commodities, international).
+   - "diversification_by_underlying_risk": whether the underlying holdings (sectors, market-cap bands, fund styles) are genuinely different from each other or quietly correlated.
+   - "international_diversification": how much exposure exists outside India/INR (US stocks, international funds) relative to total.
+   - "precious_metal_allocation": how much sits in gold/silver relative to a sensible portfolio weight for that asset class.
+   - "direct_stock_concentration": how concentrated the direct-equity holdings are (few large single-stock bets vs a spread), and how large that direct-equity slice is relative to total.
+   - "fund_overlap": how much the mutual funds listed likely hold overlapping underlying stocks/sectors, based on their known real-world mandates.
+   Each "band" must be exactly one of: "Green" (strong/healthy), "Yellow" (moderate/worth a look), "Orange" (notable concern), "Red" (significant issue) -- pick the band strictly from the actual numbers/holdings below, not a default. Each "label" is a short (1-3 word) plain-text description consistent with its band (e.g. "Excellent", "Strong", "High", "Moderate", "Slightly High", "Meaningful", "Insufficient") -- never a label that contradicts its own band color.
+   Finally give "overall_portfolio_health": an integer 0-100 composite score that is internally consistent with the bands above (mostly Green/Yellow bands -> a high score; multiple Orange/Red bands -> a meaningfully lower score) -- never a score that contradicts the individual ratings.
+
 Keep the whole thing SHORT and skimmable -- this is a one-minute monthly checkup email, not a research report. No long paragraphs anywhere.
 
 Portfolio (monthly contribution per instrument):
@@ -27,14 +40,26 @@ Portfolio (monthly contribution per instrument):
 
 OUTPUT FORMAT -- respond with ONLY raw JSON, nothing else (no markdown, no code fences, no commentary before or after). Use the EXACT instrument names as listed above as keys -- do not rename, abbreviate, translate, or paraphrase them:
 {{
-  "instrument_verdicts": {{
-    "<exact instrument name as listed above>": {{"verdict": "Continue|Increase|Reduce|Exit|At Risk", "reason": "short reason here"}},
+  "instrument_recommendations": {{
+    "<exact instrument name as listed above>": {{"recommendation": "Continue|Increase|Reduce|Exit|At Risk", "reason": "short reason here"}},
     ...
   }},
   "portfolio_take": {{
     "headline": "punchy headline here",
     "diversification_notes": ["note 1", "note 2"],
     "suggestions": ["suggestion 1", "suggestion 2"]
+  }},
+  "portfolio_snapshot": {{
+    "equity_orientation": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "retirement_discipline": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "debt_fixed_income_backing": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "diversification_by_products": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "diversification_by_underlying_risk": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "international_diversification": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "precious_metal_allocation": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "direct_stock_concentration": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "fund_overlap": {{"band": "Green|Yellow|Orange|Red", "label": "short label"}},
+    "overall_portfolio_health": 0
   }}
 }}
-Every instrument listed above must appear as a key in instrument_verdicts, using the exact name given -- do not skip, merge, or omit any instrument.
+Every instrument listed above must appear as a key in instrument_recommendations, using the exact name given -- do not skip, merge, or omit any instrument. Every one of the nine portfolio_snapshot dimensions above must be present -- do not skip any.

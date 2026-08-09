@@ -10,7 +10,7 @@ exit / at risk" read per instrument plus a few portfolio-level
 diversification notes and suggestions for next month.
 
 Deliberately kept simple:
-  - One flat table (instrument, category, monthly amount, AI verdict,
+  - One flat table (instrument, category, monthly amount, AI recommendation,
     reason) -- no scoring engine, no charts, no PDF.
   - One short "Portfolio Take" block underneath (headline + a couple of
     diversification notes + a couple of suggestions).
@@ -44,14 +44,44 @@ from llm import llm_backend
 AI_DIVERSIFICATION_POINTS = 3
 AI_SUGGESTION_POINTS = 3
 
-VERDICT_STYLES = {
+RECOMMENDATION_STYLES = {
     "Continue": ("#0f5132", "#d1f2e0"),
     "Increase": ("#0f5132", "#d1f2e0"),
     "Reduce": ("#7a5b00", "#fdf0cc"),
     "At Risk": ("#7a5b00", "#fdf0cc"),
     "Exit": ("#8a1c1c", "#fbdada"),
+    "Unavailable": ("#4A5063", "#EDEAE2"),
 }
-DEFAULT_VERDICT_STYLE = ("#4A5063", "#EDEAE2")
+DEFAULT_RECOMMENDATION_STYLE = ("#4A5063", "#EDEAE2")
+
+# Portfolio Snapshot -- a compact scorecard (capacity + a handful of
+# AI-rated dimensions) giving the complete picture at a glance, separate
+# from the per-instrument table and the narrative Portfolio Take box.
+# Band -> (emoji, text color, background color). Reuses the same palette
+# as RECOMMENDATION_STYLES for Green/Yellow/Red so the report stays
+# visually consistent; "Orange" is a new, distinct step between the two.
+SNAPSHOT_BAND_STYLES = {
+    "Green": ("🟢", "#0f5132", "#d1f2e0"),
+    "Yellow": ("🟡", "#7a5b00", "#fdf0cc"),
+    "Orange": ("🟠", "#9a3412", "#ffe4cc"),
+    "Red": ("🔴", "#8a1c1c", "#fbdada"),
+}
+DEFAULT_SNAPSHOT_BAND_STYLE = ("⚪", "#4A5063", "#EDEAE2")
+
+# Fixed (key, display label) pairs for the AI-rated snapshot rows, in
+# display order. Keys must match what the prompt template asks the LLM
+# to return under "portfolio_snapshot" -- keep the two in sync.
+SNAPSHOT_FIELDS = [
+    ("equity_orientation", "Equity orientation"),
+    ("retirement_discipline", "Retirement discipline"),
+    ("debt_fixed_income_backing", "Debt/fixed-income backing"),
+    ("diversification_by_products", "Diversification by products"),
+    ("diversification_by_underlying_risk", "Diversification by underlying risk"),
+    ("international_diversification", "International diversification"),
+    ("precious_metal_allocation", "Precious-metal allocation"),
+    ("direct_stock_concentration", "Direct-stock concentration"),
+    ("fund_overlap", "Fund overlap"),
+]
 
 
 # -----------------------------------------------------------------------
@@ -126,6 +156,12 @@ def _portfolio_totals(portfolio, usd_inr_rate):
     return total_inr
 
 
+def _format_lakh(amount_inr):
+    """Formats an INR amount in lakhs (₹1,00,000 = 1 lakh), as commonly
+    used for Indian investment-capacity figures."""
+    return f"₹{amount_inr / 100000:,.2f} lakh"
+
+
 # -----------------------------------------------------------------------
 # Prompt + AI call
 # -----------------------------------------------------------------------
@@ -168,12 +204,14 @@ def _normalize_name(s):
 # against THIS portfolio's instrument list (unlike e.g. "SBI" or "ICICI"
 # alone, which are genuinely ambiguous between the bank stock and the
 # same-house mutual fund -- those are intentionally left unmatched
-# rather than risk mis-assigning a verdict to the wrong instrument).
+# rather than risk mis-assigning a recommendation to the wrong instrument).
 _UNAMBIGUOUS_ALIASES = {
     "lt": "Larsen & Toubro",
     "l t": "Larsen & Toubro",  # "L&T" normalizes to this ("and" is a noise word)
     "bel": "Bharat Electronics (BEL)",
     "nps": "NPS (HDFC Pension Fund Mgmt)",  # only one NPS instrument -- unambiguous, unlike SBI/ICICI
+    "epf": "Employee Provident Fund",  # only one EPF instrument -- unambiguous shorthand
+    "ppf": "Public Provident Fund",  # only one PPF instrument -- unambiguous shorthand
 }
 
 
@@ -185,7 +223,7 @@ def _match_instrument_name(raw_key, normalized_lookup):
     Small Cap Fund SIP" -> "SBI Small Cap Fund"), then a fuzzy ratio
     match. Falls back to the raw key (unmatched) only if nothing clears
     the similarity bar -- an unmatched key just means that instrument
-    keeps its default "Continue" row rather than getting a wrong verdict.
+    keeps its default "Unavailable" row rather than getting a wrong recommendation.
     """
     key_norm = _normalize_name(str(raw_key))
     if key_norm in normalized_lookup:
@@ -202,7 +240,7 @@ def _match_instrument_name(raw_key, normalized_lookup):
     # Small Cap Fund" (which literally starts with it), and a loose
     # containment/fuzzy check below would happily match the wrong one.
     # Only an explicit alias above should resolve these; otherwise skip
-    # straight to "unmatched" rather than risk a wrong-instrument verdict.
+    # straight to "unmatched" rather than risk a wrong-instrument recommendation.
     if " " not in key_norm and len(key_norm) <= 5:
         return raw_key
 
@@ -242,23 +280,24 @@ def _parse_wealth_report_json(text, instrument_names):
         except json.JSONDecodeError:
             return {}, None
 
-    raw_verdicts = data.get("instrument_verdicts") if isinstance(data, dict) else None
+    raw_recommendations = data.get("instrument_recommendations") if isinstance(data, dict) else None
     raw_take = data.get("portfolio_take") if isinstance(data, dict) else None
+    raw_snapshot = data.get("portfolio_snapshot") if isinstance(data, dict) else None
 
-    verdicts = {}
-    if isinstance(raw_verdicts, dict):
+    recommendations = {}
+    if isinstance(raw_recommendations, dict):
         normalized_lookup = {_normalize_name(n): n for n in instrument_names}
-        for key, val in raw_verdicts.items():
+        for key, val in raw_recommendations.items():
             matched_name = _match_instrument_name(key, normalized_lookup)
             if matched_name not in instrument_names:
-                log.warning(f"Monthly Wealth Report: AI returned verdict for unrecognized instrument {key!r} -- ignoring.")
+                log.warning(f"Monthly Wealth Report: AI returned recommendation for unrecognized instrument {key!r} -- ignoring.")
                 continue
             if isinstance(val, dict):
-                verdict = str(val.get("verdict", "")).strip() or "Continue"
+                recommendation = str(val.get("recommendation", "")).strip() or "Continue"
                 reason = str(val.get("reason", "")).strip()
             else:
-                verdict, reason = "Continue", str(val).strip()
-            verdicts[matched_name] = {"verdict": verdict, "reason": reason}
+                recommendation, reason = "Continue", str(val).strip()
+            recommendations[matched_name] = {"recommendation": recommendation, "reason": reason}
             if str(key) != matched_name:
                 log.info(f"Monthly Wealth Report: matched AI key {key!r} -> configured instrument {matched_name!r}.")
 
@@ -275,12 +314,44 @@ def _parse_wealth_report_json(text, instrument_names):
                 "suggestions": suggestions[:AI_SUGGESTION_POINTS],
             }
 
-    return verdicts, portfolio_take
+    portfolio_snapshot = None
+    if isinstance(raw_snapshot, dict):
+        rows = {}
+        complete = True
+        for key, _label in SNAPSHOT_FIELDS:
+            entry = raw_snapshot.get(key)
+            band = entry.get("band") if isinstance(entry, dict) else None
+            label = entry.get("label") if isinstance(entry, dict) else None
+            band = str(band).strip().title() if isinstance(band, str) and band.strip() else None
+            label = str(label).strip() if isinstance(label, str) and label.strip() else None
+            if band not in SNAPSHOT_BAND_STYLES or not label:
+                complete = False
+                continue
+            rows[key] = {"band": band, "label": label}
+        raw_score = raw_snapshot.get("overall_portfolio_health")
+        score = None
+        try:
+            score = int(round(float(raw_score)))
+        except (TypeError, ValueError):
+            complete = False
+        if score is not None:
+            score = max(0, min(100, score))
+        # Require every dimension plus a valid score -- a partial scorecard
+        # would misrepresent the portfolio (e.g. showing 8 of 9 ratings
+        # with no indication one is missing), so treat any gap as "the
+        # whole snapshot is unavailable this run" rather than render it
+        # incomplete.
+        if complete and len(rows) == len(SNAPSHOT_FIELDS) and score is not None:
+            portfolio_snapshot = {"rows": rows, "overall_portfolio_health": score}
+        else:
+            log.warning("Monthly Wealth Report: AI portfolio_snapshot was incomplete or malformed -- omitting scorecard this run.")
+
+    return recommendations, portfolio_take, portfolio_snapshot
 
 
-def _fallback_verdicts(instrument_names):
+def _fallback_recommendations(instrument_names):
     return {
-        name: {"verdict": "Continue", "reason": "AI analysis unavailable this run -- no change flagged."}
+        name: {"recommendation": "Unavailable", "reason": "AI analysis unavailable this run -- no change flagged."}
         for name in instrument_names
     }
 
@@ -288,10 +359,9 @@ def _fallback_verdicts(instrument_names):
 def _fallback_portfolio_take():
     return {
         "headline": "Portfolio Commentary Unavailable This Run",
+        "note": "AI read was unavailable this run -- re-check next month's report before acting.",
         "diversification_notes": [],
-        "suggestions": [
-            "AI read was unavailable this run -- re-check next month's report before acting.",
-        ],
+        "suggestions": [],
     }
 
 
@@ -300,11 +370,16 @@ def generate_wealth_report(portfolio, usd_inr_rate):
     Single AI call covering the whole SIP portfolio at once (same
     live-search-first fallback chain as stock_controller's AI Stocks
     Story, via llm_backend.generate_analysis). Returns
-    (verdicts, portfolio_take, used_live_search):
-      verdicts: {instrument_name: {"verdict": str, "reason": str}} --
-        falls back to a generic "Continue" per instrument if every AI
+    (recommendations, portfolio_take, portfolio_snapshot, used_live_search):
+      recommendations: {instrument_name: {"recommendation": str, "reason": str}} --
+        falls back to a generic "Unavailable" per instrument if every AI
         tier fails, so the table is never left blank.
       portfolio_take: {"headline", "diversification_notes", "suggestions"}
+      portfolio_snapshot: {"rows": {field_key: {"band", "label"}, ...},
+        "overall_portfolio_health": int} or None if the AI didn't return a
+        complete scorecard this run -- the report falls back to showing
+        just the computed capacity figures in that case, rather than a
+        partial or fabricated set of ratings.
       used_live_search: True if the tier that produced the result was
         genuinely grounded in live search results.
     """
@@ -314,8 +389,8 @@ def generate_wealth_report(portfolio, usd_inr_rate):
     prompt = _build_wealth_prompt(holdings_block, today_str)
 
     def _validate(text):
-        verdicts, _take = _parse_wealth_report_json(text, instrument_names)
-        return bool(verdicts)
+        recommendations, _take, _snapshot = _parse_wealth_report_json(text, instrument_names)
+        return bool(recommendations)
 
     text, _sources, used_live = llm_backend.generate_analysis(
         prompt,
@@ -328,50 +403,50 @@ def generate_wealth_report(portfolio, usd_inr_rate):
     )
 
     if text:
-        verdicts, portfolio_take = _parse_wealth_report_json(text, instrument_names)
-        if verdicts:
+        recommendations, portfolio_take, portfolio_snapshot = _parse_wealth_report_json(text, instrument_names)
+        if recommendations:
             # Fill in any instrument the model skipped so the table is
             # always complete, rather than silently missing a row. Before
-            # giving up and defaulting to "Continue", retry once for just
+            # giving up and defaulting to "Unavailable", retry once for just
             # the missing instruments -- most of the time a partial miss
             # is recoverable, so this should make the generic fallback
             # text rare rather than routine.
-            missing = [name for name in instrument_names if name not in verdicts]
+            missing = [name for name in instrument_names if name not in recommendations]
             if missing:
                 log.warning(
-                    f"Monthly Wealth Report: AI response covered {len(verdicts)}/{len(instrument_names)} "
+                    f"Monthly Wealth Report: AI response covered {len(recommendations)}/{len(instrument_names)} "
                     f"instruments -- retrying for: {', '.join(missing)}. "
-                    f"Check above for 'unrecognized instrument' warnings -- if the AI returned a verdict "
+                    f"Check above for 'unrecognized instrument' warnings -- if the AI returned a recommendation "
                     f"under a name that didn't match, it's counted there instead of here."
                 )
-                retry_verdicts = _retry_missing_verdicts(missing, portfolio, usd_inr_rate)
-                if retry_verdicts:
-                    verdicts.update(retry_verdicts)
+                retry_recommendations = _retry_missing_recommendations(missing, portfolio, usd_inr_rate)
+                if retry_recommendations:
+                    recommendations.update(retry_recommendations)
                     log.info(
-                        f"Monthly Wealth Report: retry recovered AI verdicts for: {', '.join(retry_verdicts.keys())}."
+                        f"Monthly Wealth Report: retry recovered AI recommendations for: {', '.join(retry_recommendations.keys())}."
                     )
-                still_missing = [name for name in instrument_names if name not in verdicts]
+                still_missing = [name for name in instrument_names if name not in recommendations]
                 if still_missing:
                     log.warning(
-                        f"Monthly Wealth Report: still no AI verdict after retry for: {', '.join(still_missing)} "
-                        f"-- defaulting to 'Continue'."
+                        f"Monthly Wealth Report: still no AI recommendation after retry for: {', '.join(still_missing)} "
+                        f"-- defaulting to 'Unavailable'."
                     )
             for name in instrument_names:
-                verdicts.setdefault(name, {"verdict": "Continue", "reason": "Not flagged by AI this run."})
-            return verdicts, portfolio_take or _fallback_portfolio_take(), used_live
+                recommendations.setdefault(name, {"recommendation": "Unavailable", "reason": "Not flagged by AI this run."})
+            return recommendations, portfolio_take or _fallback_portfolio_take(), portfolio_snapshot, used_live
 
-    log.error("Monthly Wealth Report: every AI tier failed or returned nothing usable -- using fallback verdicts.")
-    return _fallback_verdicts(instrument_names), _fallback_portfolio_take(), False
+    log.error("Monthly Wealth Report: every AI tier failed or returned nothing usable -- using fallback recommendations.")
+    return _fallback_recommendations(instrument_names), _fallback_portfolio_take(), None, False
 
 
-def _retry_missing_verdicts(missing_names, portfolio, usd_inr_rate):
+def _retry_missing_recommendations(missing_names, portfolio, usd_inr_rate):
     """
     One-shot retry for instruments the first AI call skipped entirely --
     asks again, but only for those instruments, so a partial miss doesn't
     fall straight through to the generic "Not flagged by AI this run"
     filler. Uses the same prompt/parsing path as the main call, just
     scoped to a smaller holdings block. Returns whatever subset of
-    verdicts it manages to recover (possibly empty if the retry also
+    recommendations it manages to recover (possibly empty if the retry also
     fails) -- anything still missing after this is backfilled by the
     caller as before.
     """
@@ -384,7 +459,7 @@ def _retry_missing_verdicts(missing_names, portfolio, usd_inr_rate):
     prompt = _build_wealth_prompt(holdings_block, today_str)
 
     def _validate(text):
-        v, _ = _parse_wealth_report_json(text, missing_names)
+        v, _take, _snapshot = _parse_wealth_report_json(text, missing_names)
         return bool(v)
 
     text, _sources, _used_live = llm_backend.generate_analysis(
@@ -396,8 +471,8 @@ def _retry_missing_verdicts(missing_names, portfolio, usd_inr_rate):
     if not text:
         return {}
 
-    verdicts, _take = _parse_wealth_report_json(text, missing_names)
-    return verdicts
+    recommendations, _take, _snapshot = _parse_wealth_report_json(text, missing_names)
+    return recommendations
 
 
 # -----------------------------------------------------------------------
@@ -469,7 +544,7 @@ def _group_by_category(portfolio):
     return [(cat, groups[cat]) for cat in order]
 
 
-def _build_table_html(portfolio, verdicts, usd_inr_rate):
+def _build_table_html(portfolio, recommendations, usd_inr_rate):
     grouped = _group_by_category(portfolio)
     body_parts = []
 
@@ -477,20 +552,21 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
 
     for category, entries in grouped:
         category_total = sum(_instrument_monthly_inr(e, usd_inr_rate) for e in entries)
+        category_pct = (category_total / grand_total * 100) if grand_total else 0
         body_parts.append(f"""
             <tr>
               <td colspan="4" style="padding:10px 10px 6px;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#B08D57;background:#FAF8F1;border-top:1px solid #E7DFC9;border-bottom:1px solid #E7DFC9;">
-                {html.escape(category)} &nbsp;&middot;&nbsp; ₹{category_total:,.0f}/mo
+                {html.escape(category)} &nbsp;&middot;&nbsp; ₹{category_total:,.0f}/mo &nbsp;({category_pct:,.1f}% of overall)
               </td>
             </tr>""")
         for entry in entries:
             name = entry["instrument"]
-            v = verdicts.get(name, {"verdict": "Continue", "reason": ""})
-            text_color, bg_color = VERDICT_STYLES.get(v["verdict"], DEFAULT_VERDICT_STYLE)
+            v = recommendations.get(name, {"recommendation": "Unavailable", "reason": ""})
+            text_color, bg_color = RECOMMENDATION_STYLES.get(v["recommendation"], DEFAULT_RECOMMENDATION_STYLE)
             badge = (
                 f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
                 f'font-size:11px;font-weight:700;color:{text_color};background:{bg_color};">'
-                f'{html.escape(v["verdict"])}</span>'
+                f'{html.escape(v["recommendation"])}</span>'
             )
             body_parts.append(f"""
             <tr>
@@ -511,15 +587,106 @@ def _build_table_html(portfolio, verdicts, usd_inr_rate):
             <tr>
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Instrument</th>
               <th style="padding:8px 10px;text-align:right;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Monthly SIP</th>
-              <th style="padding:8px 10px;text-align:center;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Verdict</th>
+              <th style="padding:8px 10px;text-align:center;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Recommendation</th>
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Why</th>
             </tr>"""
 
     return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">{header}{''.join(body_parts)}</table>"""
 
 
+def _score_band(score):
+    """Maps the 0-100 overall_portfolio_health score to the same
+    Green/Yellow/Orange/Red bands used for the individual rows, so the
+    score's color is always consistent with how a rating of that severity
+    would otherwise be shown."""
+    if score >= 80:
+        return "Green"
+    if score >= 60:
+        return "Yellow"
+    if score >= 40:
+        return "Orange"
+    return "Red"
+
+
+def _build_portfolio_snapshot_html(portfolio_snapshot, grand_total_inr):
+    """
+    Renders the Portfolio Snapshot scorecard: two always-available,
+    code-computed capacity rows (monthly/annual investment capacity, from
+    the actual configured portfolio -- no AI involved), followed by the
+    AI-rated dimension rows and an overall health score when the AI
+    returned a complete scorecard this run. If it didn't (portfolio_snapshot
+    is None), only the capacity rows show, plus a short status note --
+    same "don't fabricate, just say it's unavailable" approach as the
+    Portfolio Take fallback.
+    """
+    monthly_cap = _format_lakh(grand_total_inr)
+    annual_cap = _format_lakh(grand_total_inr * 12)
+
+    def _plain_row(label, value):
+        return f"""
+            <tr>
+              <td style="padding:6px 10px;font-family:{SANS};font-size:12px;color:#3C4256;">{html.escape(label)}</td>
+              <td style="padding:6px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#1F2430;text-align:right;">{html.escape(value)}</td>
+            </tr>"""
+
+    def _band_row(label, band, badge_label):
+        emoji, text_color, bg_color = SNAPSHOT_BAND_STYLES.get(band, DEFAULT_SNAPSHOT_BAND_STYLE)
+        badge = (
+            f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+            f'font-size:11px;font-weight:700;color:{text_color};background:{bg_color};">'
+            f'{emoji} {html.escape(badge_label)}</span>'
+        )
+        return f"""
+            <tr>
+              <td style="padding:6px 10px;font-family:{SANS};font-size:12px;color:#3C4256;">{html.escape(label)}</td>
+              <td style="padding:6px 10px;text-align:right;">{badge}</td>
+            </tr>"""
+
+    rows_html = [
+        _plain_row("Monthly investment capacity", monthly_cap),
+        _plain_row("Annual investment capacity", annual_cap),
+    ]
+
+    note_html = ""
+    if portfolio_snapshot:
+        rows = portfolio_snapshot["rows"]
+        for key, label in SNAPSHOT_FIELDS:
+            entry = rows[key]
+            rows_html.append(_band_row(label, entry["band"], entry["label"]))
+        score = portfolio_snapshot["overall_portfolio_health"]
+        score_band = _score_band(score)
+        rows_html.append(_band_row("Overall portfolio health", score_band, f"{score}/100"))
+    else:
+        note_html = (
+            f'<div style="margin:8px 0 0;font-family:{SANS};font-size:12px;'
+            f'font-style:italic;line-height:1.5;color:#8A8F9C;">Portfolio ratings unavailable this run -- re-check next month\'s report.</div>'
+        )
+
+    table_html = (
+        f'<table width="100%" cellpadding="0" cellspacing="0" role="presentation" '
+        f'style="border-collapse:collapse;">{"".join(rows_html)}</table>'
+    )
+
+    return f"""
+    <tr>
+      <td style="padding:0 28px 18px;" class="email-padding">
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-radius:6px;background:#FAF8F1;border:1px solid #E7DFC9;">
+          <tr>
+            <td style="padding:14px 16px 16px;">
+              <div style="font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#B08D57;">📊 Portfolio Snapshot</div>
+              {note_html}
+              {table_html}
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+    """
+
+
 def _build_portfolio_take_html(portfolio_take, used_live_search):
     headline = portfolio_take.get("headline")
+    note = portfolio_take.get("note")
     notes = portfolio_take.get("diversification_notes") or []
     suggestions = portfolio_take.get("suggestions") or []
     live_tag = " &nbsp;&middot;&nbsp; LIVE-GROUNDED" if used_live_search else ""
@@ -529,6 +696,17 @@ def _build_portfolio_take_html(portfolio_take, used_live_search):
         headline_html = (
             f'<div style="margin:6px 0 10px;font-family:{SERIF};font-size:17px;'
             f'font-weight:700;line-height:1.3;color:#1F2430;">{html.escape(headline)}</div>'
+        )
+
+    # Status note (e.g. "AI read was unavailable this run") -- only set on
+    # the fallback path, so it never competes with real AI-generated
+    # suggestions. Rendered as a plain line, not a bulleted "suggestion",
+    # since it's a run-status message rather than portfolio advice.
+    note_html = ""
+    if note:
+        note_html = (
+            f'<div style="margin:6px 0 0;font-family:{SANS};font-size:12px;'
+            f'font-style:italic;line-height:1.5;color:#8A8F9C;">{html.escape(note)}</div>'
         )
 
     def _bullet_list(title, items):
@@ -549,6 +727,7 @@ def _build_portfolio_take_html(portfolio_take, used_live_search):
             <td style="padding:14px 16px 16px;">
               <div style="font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#B08D57;">🤖 Portfolio Take{live_tag}</div>
               {headline_html}
+              {note_html}
               {_bullet_list("Diversification Notes", notes)}
               {_bullet_list("Suggestions For Next Month", suggestions)}
             </td>
@@ -559,11 +738,12 @@ def _build_portfolio_take_html(portfolio_take, used_live_search):
     """
 
 
-def build_report_html(portfolio, verdicts, portfolio_take, used_live_search, usd_inr_rate, rate_is_live):
+def build_report_html(portfolio, recommendations, portfolio_take, portfolio_snapshot, used_live_search, usd_inr_rate, rate_is_live):
     total_inr = _portfolio_totals(portfolio, usd_inr_rate)
     now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
     date_str = get_date_with_suffix(now_ist)
-    table_html = _build_table_html(portfolio, verdicts, usd_inr_rate)
+    table_html = _build_table_html(portfolio, recommendations, usd_inr_rate)
+    snapshot_html = _build_portfolio_snapshot_html(portfolio_snapshot, total_inr)
     take_html = _build_portfolio_take_html(portfolio_take, used_live_search)
     fx_tag = "live rate" if rate_is_live else "fallback estimate -- live fetch failed"
 
@@ -606,6 +786,7 @@ def build_report_html(portfolio, verdicts, portfolio_take, used_live_search, usd
               <p style="margin:4px 0 0;font-family:{SANS};font-size:11px;color:#8A8F9C;">USD/INR: ₹{usd_inr_rate:,.2f} ({fx_tag})</p>
             </td>
           </tr>
+          {snapshot_html}
           {take_html}
           <tr>
             <td style="padding:0 28px 24px;" class="email-padding">
@@ -641,8 +822,8 @@ def main(dry_run=False):
     log.info(f"Generating monthly wealth report for {len(portfolio)} instruments...")
 
     usd_inr_rate, rate_is_live = fetch_live_usd_inr_rate()
-    verdicts, portfolio_take, used_live = generate_wealth_report(portfolio, usd_inr_rate)
-    report_html = build_report_html(portfolio, verdicts, portfolio_take, used_live, usd_inr_rate, rate_is_live)
+    recommendations, portfolio_take, portfolio_snapshot, used_live = generate_wealth_report(portfolio, usd_inr_rate)
+    report_html = build_report_html(portfolio, recommendations, portfolio_take, portfolio_snapshot, used_live, usd_inr_rate, rate_is_live)
 
     if dry_run:
         out_path = "wealth_report_preview.html"
