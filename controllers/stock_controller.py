@@ -3064,7 +3064,15 @@ def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, 
     # and _classify_buy_zone's now-separate "hold_signal" status), so a
     # Buy/Hold row no longer gets a misleading green "active buy" highlight
     # and a genuine Strong Buy row no longer gets skipped.
-    row_bg = " background:#F4FAF3;" if priority == 1 else ""
+    # Sell-signal rows get a light red row background (same idea as the
+    # green Buy-call highlight above) so an active Sell call is just as
+    # easy to spot at a glance while scanning the table.
+    if status_key == "sell_signal":
+        row_bg = " background:#FDF2F2;"
+    elif priority == 1:
+        row_bg = " background:#F4FAF3;"
+    else:
+        row_bg = ""
     if tranche_amount_inr is not None:
         # Commodities (gold/silver): render "Buy ₹X" / "Sell ₹X" / "Sell all"
         # instead of the equity-style "Add N (~%)" / "Reduce N" tranches.

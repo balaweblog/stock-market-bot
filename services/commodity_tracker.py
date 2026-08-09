@@ -438,18 +438,6 @@ class CommodityTracker:
             f'border:1px solid #e2e8f0;font-size:12px;color:#475569;">{macro_note}</div>'
         ) if macro_note else ""
 
-        # 30-day sparkline. Falls back to the 7-day history if a longer
-        # window wasn't provided, so this stays backward compatible.
-        spark_source = sparkline_history if sparkline_history else history
-        spark_prices = [row["price"] for row in spark_source]
-        spark_days = len(spark_prices)
-        sparkline_text = self.generate_sparkline(spark_prices) if spark_days >= 2 else ""
-        spark_trend_color = "#047857" if (spark_prices and spark_prices[-1] >= spark_prices[0]) else "#dc2626"
-        trend_value_html = (
-            f'<span style="color:{spark_trend_color};font-family:\'SF Mono\',Menlo,Consolas,\'Courier New\',monospace;letter-spacing:1px;font-size:16px;">{sparkline_text}</span>'
-            if sparkline_text else "&mdash;"
-        )
-
         # Which entry tier the recommendation actually landed on, so the
         # matching chip below can be visually singled out instead of all
         # three reading as equally-weighted options.
@@ -461,9 +449,8 @@ class CommodityTracker:
         kpi_grid_html = f"""
                             <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="margin-top:16px;">
                                 <tr>
-                                    <td width="33.33%" style="padding:0 4px 8px 0;">{self._kpi_tile_html("Current Price", f'&#8377;{current_price:.2f}<div style="margin-top:2px;font-size:10px;font-weight:500;color:#8A8F9C;">per gram</div>')}</td>
-                                    <td width="33.33%" style="padding:0 4px 8px 4px;">{self._kpi_tile_html(f"{spark_days}-Day Trend", trend_value_html)}</td>
-                                    <td width="33.34%" style="padding:0 0 8px 4px;">{self._kpi_tile_html("Bias", plan['bias'], value_color=bias_color)}</td>
+                                    <td width="50%" style="padding:0 4px 8px 0;">{self._kpi_tile_html("Current Price", f'&#8377;{current_price:.2f}<div style="margin-top:2px;font-size:10px;font-weight:500;color:#8A8F9C;">per gram</div>')}</td>
+                                    <td width="50%" style="padding:0 0 8px 4px;">{self._kpi_tile_html("Bias", plan['bias'], value_color=bias_color)}</td>
                                 </tr>
                                 <tr>
                                     <td width="33.33%" style="padding:0 4px 0 0;">{self._kpi_tile_html("Entry Zone", f"&#8377;{plan['entry_low']:.2f} &ndash; &#8377;{plan['entry_high']:.2f}", font_size=13)}</td>
