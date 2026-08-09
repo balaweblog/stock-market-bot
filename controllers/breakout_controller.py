@@ -113,7 +113,7 @@ from utils.breakout_failure import (
     BULL_TRAP_MIN_FLAGS,
 )
 from utils.breakout_confirmation import compute_confirmation_score, SECTOR_DATA_NOTE
-from constants import STOCKS
+from utils.constants import STOCKS
 
 SERIF = "Georgia, 'Times New Roman', serif"
 SANS = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif"
