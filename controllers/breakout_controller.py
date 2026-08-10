@@ -52,18 +52,17 @@ Pipeline, per run:
       prioritizing. Rows with no R:R data (missing entry/stop/target)
       are left alone rather than penalized for a gap elsewhere in the
       pipeline.
-  11. False-breakout / bull-trap check (utils.breakout_failure), applied
-      BEFORE the R:R split above: today's own bar is checked for the
-      classic bull-trap fingerprints (below-average volume, a long upper
-      wick, a weak close in the day's range, giving back most of the
-      day's gain). Rows with enough of those flags are pulled entirely
-      out of Confirmed/Watch into their own "🔴 Failed Breakout" section
-      -- a pattern firing on paper doesn't matter if the same bar already
-      shows it being rejected. Every surviving row also carries a
-      historical Failure Risk read: how often this exact pattern has
-      fallen back below its own breakout-day low within
-      utils.breakout_failure.FAILURE_WINDOW_DAYS days on this exact stock
-      before -- informational context, not a second gate.
+  11. Historical Failure Risk read (utils.breakout_failure): how often
+      this exact pattern has fallen back below its own breakout-day low
+      within utils.breakout_failure.FAILURE_WINDOW_DAYS days on this
+      exact stock before -- informational context on every row, not a
+      gate. (Earlier versions of this pipeline also ran a same-day
+      bull-trap check -- below-average volume, a long upper wick, a weak
+      close, giving back most of the day's gain -- and pulled flagged
+      rows into a dedicated "🔴 Failed Breakout" section. That section
+      has been removed; rows are no longer segregated on same-day
+      characteristics and are bucketed by the normal
+      backtest/Risk:Reward rules below like everything else.)
   12a. Fundamental quality gate, Confirmed Breakouts ONLY: for any row
       still on track for Confirmed after steps 10-11, fetch yfinance's
       .info for that symbol (lazily -- only for rows about to qualify,
@@ -121,7 +120,6 @@ from utils.market_regime import (
 from utils.breakout_failure import (
     evaluate_failure_risk, FailureRisk,
     FAILURE_WINDOW_DAYS, MIN_SAMPLES_FOR_FAILURE_RATE, HIGH_FAILURE_RATE_CEILING,
-    BULL_TRAP_MIN_FLAGS,
 )
 from utils.breakout_confirmation import compute_confirmation_score, SECTOR_DATA_NOTE
 from utils.constants import STOCKS
@@ -136,7 +134,6 @@ MAX_CONFIRMED_ROWS = 25  # keep the email skimmable even on a big breakout day
 MAX_WATCH_ROWS = 15
 MAX_NEAR_BREAKOUT_ROWS = 15
 MAX_FILTERED_RR_ROWS = 15
-MAX_FAILED_BREAKOUT_ROWS = 15
 
 ENTRY_CLASSIFIER_CONFIG = ClassifierConfig()
 TARGETS_CONFIG = TargetsConfig()
@@ -294,6 +291,89 @@ def fetch_universe_history(symbols):
 
 
 # -----------------------------------------------------------------------
+# Setup Strength -- composite read across everything ELSE this pipeline
+# already computed for a row (Quality Score, Risk:Reward, Failure Risk,
+# Confirmation Score, and the Fundamentals gate where it ran). This is
+# NOT a new, independent signal -- it doesn't backtest anything itself --
+# it's a single weighted-average summary of the other columns, so a row
+# that's strong on every axis stands out at a glance instead of making
+# you scan five separate cells.
+#
+# Explicitly NOT a probability or a guarantee, and it does NOT override
+# the Confirmed/Watch/Filtered/Failed bucket a row already landed in --
+# see build_report_html's disclaimer. Weighted like this when every
+# component is available:
+#   Quality Score        35%  (backtest hit-rate/sample/consistency, already blended)
+#   Risk:Reward           25%  (capped at 3:1 -- beyond that treated as maxed out)
+#   Failure Risk          20%  (inverse of this pattern's historical failure rate)
+#   Confirmation Score    15%  (today's 9-point technical checklist)
+#   Fundamentals           5%  (ROE/Debt-Equity/earnings growth, Confirmed-only)
+# Fail-soft, same convention as every other score in this file: a
+# component that wasn't computed for this row (e.g. no R:R because there
+# was no exact entry price) is simply dropped and the remaining weights
+# are renormalized -- a data gap elsewhere never silently drags the score
+# down or up.
+SETUP_STRENGTH_WEIGHTS = {
+    "quality": 35,
+    "risk_reward": 25,
+    "failure_risk": 20,
+    "confirmation": 15,
+    "fundamentals": 5,
+}
+SETUP_STRENGTH_RR_CAP = 3.0  # R:R at/above this is treated as fully maxed out on that component
+
+SETUP_STRENGTH_BANDS = (
+    (80, "Very Strong"),
+    (65, "Strong"),
+    (50, "Moderate"),
+    (0, "Weak"),
+)
+
+
+def compute_setup_strength(row):
+    """Returns {"score": int 0-100, "label": str, "components_used": int,
+    "components_total": int} or None if NONE of the underlying components
+    were available for this row (e.g. an entirely unscored, un-classified
+    signal)."""
+    components = []  # (weight, fraction 0-1)
+
+    quality = row.get("quality")
+    if quality:
+        components.append((SETUP_STRENGTH_WEIGHTS["quality"], quality["score"] / 100.0))
+
+    risk_reward = row.get("risk_reward")
+    if risk_reward:
+        rr_frac = min(risk_reward["ratio"] / SETUP_STRENGTH_RR_CAP, 1.0)
+        components.append((SETUP_STRENGTH_WEIGHTS["risk_reward"], rr_frac))
+
+    failure_risk = row.get("failure_risk")
+    if failure_risk and failure_risk.backtest and failure_risk.backtest.failure_rate is not None:
+        components.append((SETUP_STRENGTH_WEIGHTS["failure_risk"], 1.0 - failure_risk.backtest.failure_rate))
+
+    confirmation = row.get("confirmation")
+    if confirmation and confirmation.available_count:
+        components.append((SETUP_STRENGTH_WEIGHTS["confirmation"], confirmation.passed_count / confirmation.available_count))
+
+    fundamentals = row.get("fundamentals")
+    if fundamentals and fundamentals["available"] and fundamentals["checks"]:
+        passed_frac = sum(1 for _, ok, _ in fundamentals["checks"] if ok) / len(fundamentals["checks"])
+        components.append((SETUP_STRENGTH_WEIGHTS["fundamentals"], passed_frac))
+
+    if not components:
+        return None
+
+    total_weight = sum(w for w, _ in components)
+    score = round(sum(w * frac for w, frac in components) / total_weight * 100)
+    label = next(lbl for threshold, lbl in SETUP_STRENGTH_BANDS if score >= threshold)
+    return {
+        "score": score,
+        "label": label,
+        "components_used": len(components),
+        "components_total": len(SETUP_STRENGTH_WEIGHTS),
+    }
+
+
+# -----------------------------------------------------------------------
 # Scan
 # -----------------------------------------------------------------------
 def scan_universe(histories, bhav_df, regime: RegimeResult):
@@ -310,7 +390,7 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
             clear the backtest -- see REGIME_INTERPRETATION in
             utils.market_regime. Rows that clear the backtest but not
             this stricter bar are downgraded to Watch, never dropped.
-    Returns (confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch, skipped_count):
+    Returns (confirmed, watch_list, filtered_low_rr, near_breakout_watch, skipped_count):
       confirmed: list of signal dicts that cleared the backtest bar AND
         (where R:R data was available) cleared RISK_REWARD_MIN_THRESHOLD
         AND, in a Bearish regime, the stricter regime bar above
@@ -322,22 +402,18 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
         Confirmed/Watch but were pulled out because R:R < RISK_REWARD_MIN_THRESHOLD
         -- shown separately, never silently dropped, per this project's
         "everything shown is labeled for what it is" convention
-      failed_breakouts: signals whose OWN TODAY'S BAR (utils.breakout_failure.
-        assess_same_day_risk) already shows bull-trap characteristics --
-        below-average volume, a long upper wick, a weak close in the day's
-        range, giving back most of the day's gain. This is checked and
-        applied BEFORE the R:R split, since a breakout that already looks
-        like it's failing today is a more urgent disqualifier than a
-        weak reward ratio on a move that's still structurally intact.
-        Every row here also carries row["failure_risk"].backtest -- the
-        historical probability THIS pattern has failed within
-        {FAILURE_WINDOW_DAYS} days on THIS stock before, for context.
       near_breakout_watch: symbols that haven't broken out yet but are
         close, per utils.entry_classification -- surfaced even though no
         pattern fired today, so the screener is useful before the breakout too
       skipped_count: symbols dropped entirely by the data-quality gate
+
+      Every row (in every bucket above) also carries row["failure_risk"].backtest
+      -- the historical probability THIS exact pattern has failed within
+      {FAILURE_WINDOW_DAYS} days on THIS stock before, for context. There is
+      no longer a same-day bull-trap gate that segregates rows into their own
+      section -- rows are bucketed purely on the backtest/R:R rules above.
     """
-    confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch = [], [], [], [], []
+    confirmed, watch_list, filtered_low_rr, near_breakout_watch = [], [], [], []
     skipped_count = 0
     market_trend_supportive = regime.entries_supportive
     fundamentals_cache = {}  # per-run cache, symbol -> yfinance .info dict
@@ -444,6 +520,11 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
                 # fundamentals -- see evaluate_fundamental_quality above.
                 "fundamental_downgraded": fundamental_downgraded,
             }
+            # Computed last -- needs quality/risk_reward/failure_risk/
+            # confirmation/fundamentals to already be in the row dict
+            # above, since it's a weighted blend of those, not an
+            # independent calculation. See compute_setup_strength.
+            row["setup_strength"] = compute_setup_strength(row)
 
             # Risk/Reward is a CORE FILTER, not decoration: a row with
             # computed R:R below threshold gets pulled into its own
@@ -452,9 +533,7 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
             # over time. Rows with no R:R data (missing entry/stop/target)
             # are left in their normal bucket -- don't punish a row for a
             # gap elsewhere in the pipeline.
-            if failure_risk.is_failed_breakout:
-                failed_breakouts.append(row)
-            elif risk_reward and not risk_reward["meets_threshold"]:
+            if risk_reward and not risk_reward["meets_threshold"]:
                 filtered_low_rr.append(row)
             elif meets_confirmed_bar:
                 confirmed.append(row)
@@ -477,11 +556,8 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
     confirmed.sort(key=_rank_key, reverse=True)
     watch_list.sort(key=_rank_key, reverse=True)
     filtered_low_rr.sort(key=lambda r: (r["risk_reward"] or {}).get("ratio", 0), reverse=True)
-    # Worst same-day bull-trap score first -- the rows most obviously
-    # failing lead the section.
-    failed_breakouts.sort(key=lambda r: r["failure_risk"].same_day.score, reverse=True)
     near_breakout_watch.sort(key=lambda r: r["entry"].distance_to_breakout_pct or 999)
-    return confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch, skipped_count
+    return confirmed, watch_list, filtered_low_rr, near_breakout_watch, skipped_count
 
 
 # -----------------------------------------------------------------------
@@ -541,6 +617,18 @@ def _entry_badge_html(entry_result):
         detail += f'<div style="margin-top:3px;font-size:10.5px;color:#3C4256;">Entry: ₹{lo:,.2f}&ndash;₹{hi:,.2f}</div>'
     elif entry_result.entry_trigger:
         detail += f'<div style="margin-top:3px;font-size:10.5px;color:#3C4256;">Trigger: ≥₹{entry_result.entry_trigger:,.2f}</div>'
+    elif entry_result.state == EntryState.NONE:
+        # No exact price, no zone, no trigger -- the price-structure
+        # overlay found nothing to key an entry off (e.g. already
+        # extended past resistance, or no usable trailing-high/retest
+        # reference in this stock's history). Say so explicitly rather
+        # than leaving Entry/Stop-Loss/Targets/R:R blank with no
+        # explanation -- same "nothing shown without a reason" rule as
+        # the rest of this report.
+        detail += (
+            f'<div style="margin-top:3px;font-size:10.5px;color:#8A8F9C;">'
+            f'No clean entry structure found &mdash; Stop-Loss/Targets/R:R not available.</div>'
+        )
     return badge + detail
 
 
@@ -633,10 +721,8 @@ def _risk_reward_cell_html(risk_reward):
 
 
 def _failure_risk_cell_html(failure_risk):
-    """Dedicated Failure Risk column for rows that survived the same-day
-    bull-trap filter (rows that didn't survive it are in their own
-    section -- see _failed_breakout_block). Shows the historical
-    probability THIS exact pattern has failed within
+    """Dedicated Failure Risk column, shown on every row. Reports the
+    historical probability THIS exact pattern has failed within
     utils.breakout_failure.FAILURE_WINDOW_DAYS days on THIS stock before
     -- informational context, not itself a gate, same convention as the
     Quality Score badge."""
@@ -708,6 +794,42 @@ def _confirmation_cell_html(score):
     return badge + failed_html
 
 
+SETUP_STRENGTH_BADGE_COLORS = {
+    # label -> (background, text) -- reuses the same visual language as
+    # the Quality badge so "strong" always means the same color across
+    # this email.
+    "Very Strong": ("#DCEFE0", "#0f5132"),
+    "Strong": ("#E4F0E9", "#3d7a52"),
+    "Moderate": ("#FCF1D8", "#7a5b00"),
+    "Weak": ("#F8DADA", "#8a1c1c"),
+}
+
+
+def _setup_strength_cell_html(strength):
+    """Dedicated Setup Strength column -- a single weighted-average read
+    across the Quality, Risk:Reward, Failure Risk, Confirmation, and
+    Fundamentals columns already in this row (see compute_setup_strength
+    above). Shown as a score/label plus how many of the 5 underlying
+    components were actually available, same transparency convention as
+    every other score in this email -- and explicitly NOT framed as a
+    guarantee or an override of the row's Confirmed/Watch/Filtered
+    bucket; see the disclaimer in the report footer."""
+    if not strength:
+        return '<span style="font-family:{0};font-size:10.5px;color:#8A8F9C;">Not enough data</span>'.format(SANS)
+
+    bg, fg = SETUP_STRENGTH_BADGE_COLORS.get(strength["label"], ("#EDEAE2", "#3C4256"))
+    badge = (
+        f'<span style="display:inline-block;min-width:34px;text-align:center;padding:3px 8px;border-radius:10px;'
+        f'background:{bg};color:{fg};font-family:{SANS};font-size:12px;font-weight:700;">{strength["score"]}%</span>'
+        f'<div style="margin-top:3px;font-family:{SANS};font-size:10px;color:{fg};">{html.escape(strength["label"])}</div>'
+    )
+    note = (
+        f'<div style="margin-top:2px;font-size:9.5px;color:#8A8F9C;">'
+        f'{strength["components_used"]}/{strength["components_total"]} factors available</div>'
+    )
+    return badge + note
+
+
 def _fundamentals_note_html(fundamentals):
     """Sub-line under the Quality badge showing the fundamental-quality
     read (ROE / Debt-Equity / Earnings growth) for rows where it was
@@ -740,7 +862,7 @@ def _row_bg_for_symbol(symbol, default_bg):
 
 def _signal_rows_html(rows, row_bg):
     if not rows:
-        return '<tr><td style="padding:10px 12px;font-family:{0};font-size:12px;color:#8A8F9C;" colspan="11">None today.</td></tr>'.format(SANS)
+        return '<tr><td style="padding:10px 12px;font-family:{0};font-size:12px;color:#8A8F9C;" colspan="12">None today.</td></tr>'.format(SANS)
 
     out = []
     for row in rows:
@@ -769,17 +891,18 @@ def _signal_rows_html(rows, row_bg):
         bg = _row_bg_for_symbol(row["symbol"], row_bg)
         out.append(f"""
         <tr style="background:{bg};">
-          <td style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{fund_note}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{_backtest_cell(row['backtest'])}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_quality_badge_html(row['quality'])}{_fundamentals_note_html(row.get('fundamentals'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_entry_badge_html(row.get('entry'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_stop_loss_cell_html(row.get('entry'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_targets_cell_html(row.get('targets'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_risk_reward_cell_html(row.get('risk_reward'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_failure_risk_cell_html(row.get('failure_risk'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_confirmation_cell_html(row.get('confirmation'))}</td>
+          <td data-label="Symbol" style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
+          <td data-label="Pattern" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{fund_note}</td>
+          <td data-label="Price" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
+          <td data-label="Backtest" style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{_backtest_cell(row['backtest'])}</td>
+          <td data-label="Quality" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_quality_badge_html(row['quality'])}{_fundamentals_note_html(row.get('fundamentals'))}</td>
+          <td data-label="Entry" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_entry_badge_html(row.get('entry'))}</td>
+          <td data-label="Stop-Loss" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_stop_loss_cell_html(row.get('entry'))}</td>
+          <td data-label="Targets" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_targets_cell_html(row.get('targets'))}</td>
+          <td data-label="Risk:Reward" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_risk_reward_cell_html(row.get('risk_reward'))}</td>
+          <td data-label="Failure Risk" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_failure_risk_cell_html(row.get('failure_risk'))}</td>
+          <td data-label="Confirmation" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_confirmation_cell_html(row.get('confirmation'))}</td>
+          <td data-label="Setup Strength" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_setup_strength_cell_html(row.get('setup_strength'))}</td>
         </tr>
         """)
     return "".join(out)
@@ -803,10 +926,10 @@ def _near_breakout_rows_html(rows, row_bg):
         bg = _row_bg_for_symbol(row["symbol"], row_bg)
         out.append(f"""
         <tr style="background:{bg};">
-          <td style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['current_price']:,.2f}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{html.escape(distance_str)}{caution}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_entry_badge_html(entry)}</td>
+          <td data-label="Symbol" style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
+          <td data-label="Price" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['current_price']:,.2f}</td>
+          <td data-label="Distance" style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{html.escape(distance_str)}{caution}</td>
+          <td data-label="Entry" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_entry_badge_html(entry)}</td>
         </tr>
         """)
     return "".join(out)
@@ -814,7 +937,7 @@ def _near_breakout_rows_html(rows, row_bg):
 
 def _table_block(title, subtitle, rows, row_bg, accent):
     header = (
-        f'<tr><td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
+        f'<tr class="table-header-row"><td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
         f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Symbol</td>'
         f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
         f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Pattern</td>'
@@ -835,7 +958,9 @@ def _table_block(title, subtitle, rows, row_bg, accent):
         f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
         f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Failure Risk ({FAILURE_WINDOW_DAYS}d)</td>'
         f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Confirmation</td></tr>'
+        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Confirmation</td>'
+        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
+        f'color:#3C4256;border-bottom:1px solid #DAD5CB;text-align:center;">Setup Strength</td></tr>'
     )
     rows_html = _signal_rows_html(rows, row_bg)
     return f"""
@@ -846,7 +971,7 @@ def _table_block(title, subtitle, rows, row_bg, accent):
             <td style="padding:14px 16px 4px;">
               <div style="font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:{accent};">{title}</div>
               <div style="margin:2px 0 8px;font-family:{SANS};font-size:11px;color:#8A8F9C;">{subtitle}</div>
-              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="stack-table" style="border-collapse:collapse;">
                 {header}
                 {rows_html}
               </table>
@@ -928,7 +1053,7 @@ def _regime_block(regime: RegimeResult):
 
 def _near_breakout_block(rows):
     header = (
-        f'<tr><td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
+        f'<tr class="table-header-row"><td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
         f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Symbol</td>'
         f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
         f'color:#3C4256;border-bottom:1px solid #DAD5CB;text-align:right;">Price</td>'
@@ -946,7 +1071,7 @@ def _near_breakout_block(rows):
             <td style="padding:14px 16px 4px;">
               <div style="font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#1c4a8a;">🔵 Near Breakout &mdash; Watch</div>
               <div style="margin:2px 0 8px;font-family:{SANS};font-size:11px;color:#8A8F9C;">No pattern fired today, but price is within {ENTRY_CLASSIFIER_CONFIG.near_breakout_pct:.0f}% of trailing resistance -- not a buy yet, watch for the trigger price with volume confirmation.</div>
-              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="stack-table" style="border-collapse:collapse;">
                 {header}
                 {rows_html}
               </table>
@@ -958,82 +1083,7 @@ def _near_breakout_block(rows):
     """
 
 
-def _failed_breakout_rows_html(rows, row_bg):
-    if not rows:
-        return '<tr><td style="padding:10px 12px;font-family:{0};font-size:12px;color:#8A8F9C;" colspan="6">None today.</td></tr>'.format(SANS)
-
-    out = []
-    for row in rows:
-        emoji = PATTERN_STYLES.get(row["pattern"], "🔹")
-        same_day = row["failure_risk"].same_day
-        flags_html = "".join(
-            f'<div style="font-size:10.5px;color:#8a1c1c;">&#10007; {html.escape(label)}</div>'
-            for label in same_day.reasons
-        )
-        caution = ""
-        if row["dq_notes"]:
-            caution = (
-                f'<div style="margin-top:3px;font-size:10.5px;color:#9a3412;">'
-                f'⚠ {html.escape("; ".join(row["dq_notes"]))}</div>'
-            )
-        bg = _row_bg_for_symbol(row["symbol"], row_bg)
-        out.append(f"""
-        <tr style="background:{bg};">
-          <td style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}</td>
-          <td style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{flags_html}<div style="margin-top:2px;font-size:10px;color:#8A8F9C;">{same_day.score} of 4 bull-trap flags fired.</div></td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_failure_risk_cell_html(row.get('failure_risk'))}</td>
-          <td style="padding:9px 12px;border-bottom:1px solid #EDEAE2;">{_confirmation_cell_html(row.get('confirmation'))}</td>
-        </tr>
-        """)
-    return "".join(out)
-
-
-def _failed_breakout_block(rows):
-    header = (
-        f'<tr><td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Symbol</td>'
-        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Pattern</td>'
-        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;text-align:right;">Price</td>'
-        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Today\'s bull-trap flags</td>'
-        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Failure Risk ({FAILURE_WINDOW_DAYS}d)</td>'
-        f'<td style="padding:6px 12px;font-family:{SANS};font-size:10px;font-weight:700;'
-        f'color:#3C4256;border-bottom:1px solid #DAD5CB;">Confirmation</td></tr>'
-    )
-    rows_html = _failed_breakout_rows_html(rows, "#ffffff")
-    return f"""
-    <tr>
-      <td style="padding:0 28px 18px;" class="email-padding">
-        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-radius:6px;background:#FBEEEC;border:1px solid #F2C9C2;">
-          <tr>
-            <td style="padding:14px 16px 4px;">
-              <div style="font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#8a1c1c;">🔴 Failed Breakout &mdash; Bull Trap Warning</div>
-              <div style="margin:2px 0 8px;font-family:{SANS};font-size:11px;color:#8A8F9C;">
-                Pattern fired today, but the bar itself already shows {BULL_TRAP_MIN_FLAGS}+ of 4 classic bull-trap
-                signs (below-average volume, a long upper wick, a weak close in the day's range, giving back most
-                of the day's gain) -- pulled out of Confirmed/Watch entirely rather than shown as if the breakout
-                were intact. The Failure Risk column is the historical base rate: how often this exact pattern has
-                fallen back below its own breakout-day low within {FAILURE_WINDOW_DAYS} days on this exact stock
-                before.
-              </div>
-              <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">
-                {header}
-                {rows_html}
-              </table>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-    """
-
-
-def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch, scan_stats):
+def build_report_html(confirmed, watch_list, filtered_low_rr, near_breakout_watch, scan_stats):
     now_ist = dt.datetime.now(ZoneInfo("Asia/Kolkata"))
     date_str = get_date_with_suffix(now_ist)
     regime: RegimeResult = scan_stats["regime"]
@@ -1075,7 +1125,6 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
         f"Setups with R:R &ge; {RISK_REWARD_PREFERRED_THRESHOLD:.1f} are the ones worth prioritizing in the tables above.",
         filtered_low_rr[:MAX_FILTERED_RR_ROWS], "#ffffff", "#8a1c1c",
     )
-    failed_breakout_block = _failed_breakout_block(failed_breakouts[:MAX_FAILED_BREAKOUT_ROWS])
     near_breakout_block = _near_breakout_block(near_breakout_watch[:MAX_NEAR_BREAKOUT_ROWS])
 
     universe_note = (
@@ -1083,8 +1132,7 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
         f"({'live index list' if scan_stats['universe_is_live'] else 'fallback core list -- live NSE index fetch failed this run'}); "
         f"{scan_stats['history_count']} returned usable price history; "
         f"{scan_stats['skipped_count']} skipped by the data-quality gate; "
-        f"{scan_stats['filtered_low_rr_count']} filtered out on Risk:Reward &lt; {RISK_REWARD_MIN_THRESHOLD:.1f}; "
-        f"{scan_stats['failed_breakout_count']} flagged 🔴 Failed Breakout on same-day bull-trap characteristics."
+        f"{scan_stats['filtered_low_rr_count']} filtered out on Risk:Reward &lt; {RISK_REWARD_MIN_THRESHOLD:.1f}."
     )
     bhav_note = (
         f"Same-day NSE bhavcopy cross-check: active ({scan_stats['bhav_date']})."
@@ -1105,6 +1153,46 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
   @media screen and (max-width:600px) {{
     .email-container {{ width:100% !important; max-width:100% !important; }}
     .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}
+    /* Wide data tables (11/6/4 columns) don't fit a phone screen -- on
+       screens under 600px, drop the header row and stack every <td> into
+       its own full-width block instead, with the column name (from
+       data-label) printed above the value. Same information, no
+       side-scrolling and no squashed columns. */
+    .stack-table, .stack-table tbody, .stack-table tr, .stack-table td {{
+      display:block !important;
+      width:100% !important;
+      box-sizing:border-box !important;
+    }}
+    .stack-table .table-header-row {{ display:none !important; }}
+    .stack-table tr {{
+      border-bottom:1px solid #DAD5CB !important;
+      padding:10px 0 !important;
+    }}
+    .stack-table tr:last-child {{ border-bottom:none !important; }}
+    .stack-table td {{
+      border-bottom:none !important;
+      padding:6px 14px !important;
+      text-align:left !important;
+    }}
+    .stack-table td[data-label]:before {{
+      content: attr(data-label);
+      display:block;
+      font-family:{SANS};
+      font-size:9.5px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:#B0A98C;
+      margin-bottom:3px;
+    }}
+    /* Bump up the smallest text a touch so it's still readable at arm's
+       length on a phone, without changing the desktop email at all. */
+    .stack-table td, .stack-table td div, .stack-table td span {{ font-size:13px !important; }}
+    .stack-table td div[style*="font-size:9"],
+    .stack-table td div[style*="font-size:10"] {{ font-size:11.5px !important; }}
+    /* The closing legend/disclaimer paragraph is dense reference text --
+       10px is too small to read comfortably on a phone. */
+    .legend-text {{ font-size:12.5px !important; line-height:1.6 !important; }}
   }}
 </style>
 </head>
@@ -1133,13 +1221,12 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
           </tr>
           {regime_block}
           {confirmed_block}
-          {failed_breakout_block}
           {watch_block}
           {filtered_rr_block}
           {near_breakout_block}
           <tr>
             <td style="padding:16px 28px;border-top:1px solid #EDEAE2;" class="email-padding">
-              <p style="margin:0;font-family:{SANS};font-size:10px;color:#8A8F9C;line-height:1.5;">
+              <p class="legend-text" style="margin:0;font-family:{SANS};font-size:10px;color:#8A8F9C;line-height:1.5;">
                 Market Regime (top of this email) is a 5-check read on the NIFTY 500 as a whole -- NIFTY vs its
                 50/200-day moving averages, NIFTY above its own trailing resistance, breadth (% of this run's
                 scanned universe above their own 50-day average), and India VIX -- scored 0-5 and bucketed into
@@ -1180,23 +1267,18 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
                 everything else in this email -- a strong backtest hit-rate doesn't matter if the reward on offer
                 doesn't clear a sane multiple of the risk. R:R &ge; {RISK_REWARD_PREFERRED_THRESHOLD:.1f} (green badge)
                 is worth prioritizing over the rest.
-                🔴 Failed Breakout (checked before the R:R split, so it's an even earlier CORE FILTER than R:R) means
-                today's own bar already shows {BULL_TRAP_MIN_FLAGS}+ of 4 classic bull-trap signs -- below-average
-                volume, a long upper wick, a weak close in the day's range, giving back most of the day's gain --
-                and is pulled into its own section rather than left in Confirmed/Watch as if the breakout were
-                intact. The Failure Risk column shown on every surviving row (and inside that section) is a
-                separate, historical number: how often this exact pattern has fallen back below its own
-                breakout-day low within {FAILURE_WINDOW_DAYS} days on this exact stock before -- a base rate for
-                context, not itself a gate, shown "(sample &lt;{MIN_SAMPLES_FOR_FAILURE_RATE})" when there isn't
-                enough history yet to call it reliable.
+                The Failure Risk column, shown on every row, is a separate, historical number: how often this
+                exact pattern has fallen back below its own breakout-day low within {FAILURE_WINDOW_DAYS} days on
+                this exact stock before -- a base rate for context, not itself a gate, shown "(sample
+                &lt;{MIN_SAMPLES_FOR_FAILURE_RATE})" when there isn't enough history yet to call it reliable.
                 The Confirmation column is a 9-point checklist tally (price above resistance, volume &gt;2x average,
                 a close near the day's high, RSI 55-75, price above both the 20- and 50-day averages, relative
                 strength vs NIFTY 50, sector confirmation, the NIFTY regime read above, and no excessive extension
                 past resistance) -- shown as "(passed)/(available)", e.g. "8/8". Sector confirmation is always N/A
                 in this build -- {html.escape(SECTOR_DATA_NOTE)} -- so every score currently maxes out at 8/8, not
                 9/9; unavailable checks are excluded from the tally rather than counted as a failure. This is
-                additional context on a row whose Confirmed/Watch/Filtered/Failed bucket is already decided --
-                it doesn't itself gate anything, the way Risk:Reward and the Failed Breakout check do.
+                additional context on a row whose Confirmed/Watch/Filtered bucket is already decided --
+                it doesn't itself gate anything, the way Risk:Reward does.
                 <b>Fundamentals gate (Confirmed Breakouts only):</b> clearing the technical backtest bar is necessary but no
                 longer sufficient for the Confirmed section -- the underlying business also has to clear a classic
                 "quality stock" screen, pulled from yfinance at run time: Return on Equity \u2265{FUNDAMENTAL_MIN_ROE*100:.0f}%,
@@ -1210,6 +1292,16 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, 
                 Rows shaded <span style="background:#E9F7ED;padding:0 3px;">light green</span> are symbols already
                 in your own direct-equity list (constants.STOCKS) -- called out purely to jump out from the wider
                 NIFTY 500 scan, not a separate signal.
+                <b>Setup Strength</b> is a single weighted summary of the columns to its left -- Quality Score (35%),
+                Risk:Reward (25%, capped at 3:1), Failure Risk (20%), Confirmation Score (15%), and the Fundamentals
+                gate where it ran (5%) -- so a row that's strong across the board stands out without reading five
+                separate cells. It is a summary, not a new calculation: it backtests nothing on its own, and any
+                component missing for a row (e.g. no R:R because there's no exact entry price) is dropped and the
+                remaining weights renormalized, same fail-soft rule as everywhere else here -- the "X/5 factors
+                available" note under the score shows how much of it a given row is actually resting on. It does
+                <b>not</b> override or replace the Confirmed/Watch/Filtered/Failed bucket a row already landed in,
+                and it is not a probability of the stock going up -- treat it as one more input to weigh alongside
+                the columns it summarizes and your own judgment, not a stand-alone buy signal.
                 Past pattern performance does not guarantee future results. Informational only -- not
                 investment advice. Verify before acting.
               </p>
@@ -1247,7 +1339,7 @@ def main(dry_run=False):
     regime = compute_market_regime(histories)
     log.info(f"Breakout Screener: market regime {regime.label()} (score {regime.score}/5) -- {regime.checks}")
 
-    confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch, skipped_count = scan_universe(
+    confirmed, watch_list, filtered_low_rr, near_breakout_watch, skipped_count = scan_universe(
         histories, bhav_df, regime
     )
 
@@ -1257,20 +1349,18 @@ def main(dry_run=False):
         "history_count": len(histories),
         "skipped_count": skipped_count,
         "filtered_low_rr_count": len(filtered_low_rr),
-        "failed_breakout_count": len(failed_breakouts),
         "bhav_is_live": bhav_is_live,
         "bhav_date": bhav_date.strftime("%d %b %Y") if bhav_date else None,
         "regime": regime,
     }
     log.info(
         f"Breakout Screener: {len(confirmed)} confirmed, {len(watch_list)} watch-list, "
-        f"{len(filtered_low_rr)} filtered on Risk:Reward, {len(failed_breakouts)} flagged as failed breakouts "
-        f"(same-day bull-trap characteristics), {len(near_breakout_watch)} near-breakout signals "
+        f"{len(filtered_low_rr)} filtered on Risk:Reward, {len(near_breakout_watch)} near-breakout signals "
         f"out of {len(histories)} symbols scanned ({skipped_count} skipped on data quality). "
         f"Market regime: {regime.label()}."
     )
 
-    report_html = build_report_html(confirmed, watch_list, filtered_low_rr, failed_breakouts, near_breakout_watch, scan_stats)
+    report_html = build_report_html(confirmed, watch_list, filtered_low_rr, near_breakout_watch, scan_stats)
 
     if dry_run:
         out_path = "breakout_report_preview.html"
