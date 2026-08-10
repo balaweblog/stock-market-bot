@@ -1146,10 +1146,20 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, near_breakout_watc
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no">
 <title>Daily Breakout Screener</title>
 <style>
   body {{ margin:0; padding:0; background:#F2F0EC; }}
   table {{ border-collapse:collapse !important; }}
+  /* Stop iOS/macOS Mail's auto dark-mode from repainting our own
+     colors -- without this, backgrounds/text can invert unpredictably
+     on an iPhone even though color-scheme/supported-color-schemes
+     above say "light only". Belt-and-suspenders for iOS Mail. */
+  @media (prefers-color-scheme: dark) {{
+    body, .email-container {{ background:#F2F0EC !important; }}
+  }}
   @media screen and (max-width:600px) {{
     .email-container {{ width:100% !important; max-width:100% !important; }}
     .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}

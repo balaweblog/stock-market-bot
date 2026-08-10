@@ -3955,13 +3955,18 @@ def build_email_html(horizons_html, today_str, sources, used_live_search, sessio
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no, date=no, address=no, email=no">
+<meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
 <title>Nifty Options Strategy Note</title>
 <style>
+  body, table, td, a {{ -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; }}
   body {{ margin:0; padding:0; background:#F2F0EC; }}
   table {{ border-collapse:collapse !important; }}
   img {{ max-width:100%; height:auto; }}
   @media screen and (max-width:600px) {{
-    body {{ -webkit-text-size-adjust:100%; }}
     .email-container {{ width:100% !important; max-width:100% !important; border-radius:0 !important; }}
     .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}
     h1 {{ font-size:20px !important; }}

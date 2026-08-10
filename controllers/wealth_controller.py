@@ -570,28 +570,28 @@ def _build_table_html(portfolio, recommendations, usd_inr_rate):
             )
             body_parts.append(f"""
             <tr>
-              <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;">{html.escape(name)}</td>
-              <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;text-align:right;white-space:nowrap;">{html.escape(_format_amount(entry, usd_inr_rate))}</td>
-              <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;text-align:center;">{badge}</td>
-              <td style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:11px;color:#4A5063;">{html.escape(v["reason"])}</td>
+              <td data-label="Instrument" style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;">{html.escape(name)}</td>
+              <td data-label="Monthly SIP" style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:12px;color:#1B2233;text-align:right;white-space:nowrap;">{html.escape(_format_amount(entry, usd_inr_rate))}</td>
+              <td data-label="Recommendation" style="padding:8px 10px;border-bottom:1px solid #EDEAE2;text-align:center;">{badge}</td>
+              <td data-label="Why" style="padding:8px 10px;border-bottom:1px solid #EDEAE2;font-family:{SANS};font-size:11px;color:#4A5063;">{html.escape(v["reason"])}</td>
             </tr>""")
 
     body_parts.append(f"""
             <tr>
-              <td style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:2px solid #14213D;">Total</td>
-              <td style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;text-align:right;white-space:nowrap;border-top:2px solid #14213D;">₹{grand_total:,.0f}/mo</td>
+              <td data-label="Total" style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;border-top:2px solid #14213D;">Total</td>
+              <td data-label="Monthly SIP" style="padding:10px 10px;font-family:{SANS};font-size:12px;font-weight:700;color:#14213D;text-align:right;white-space:nowrap;border-top:2px solid #14213D;">₹{grand_total:,.0f}/mo</td>
               <td style="padding:10px 10px;border-top:2px solid #14213D;" colspan="2"></td>
             </tr>""")
 
     header = f"""
-            <tr>
+            <tr class="table-header-row">
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Instrument</th>
               <th style="padding:8px 10px;text-align:right;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Monthly SIP</th>
               <th style="padding:8px 10px;text-align:center;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Recommendation</th>
               <th style="padding:8px 10px;text-align:left;font-family:{SANS};font-size:10px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#8A8F9C;border-bottom:2px solid #14213D;">Why</th>
             </tr>"""
 
-    return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border-collapse:collapse;">{header}{''.join(body_parts)}</table>"""
+    return f"""<table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="stack-table" style="border-collapse:collapse;">{header}{''.join(body_parts)}</table>"""
 
 
 def _score_band(score):
@@ -753,13 +753,55 @@ def build_report_html(portfolio, recommendations, portfolio_take, portfolio_snap
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="color-scheme" content="light">
+<meta name="supported-color-schemes" content="light">
+<meta name="x-apple-disable-message-reformatting">
+<meta name="format-detection" content="telephone=no,date=no,address=no,email=no,url=no">
 <title>Monthly Wealth &amp; SIP Report</title>
 <style>
   body {{ margin:0; padding:0; background:#F2F0EC; }}
   table {{ border-collapse:collapse !important; }}
+  /* Stop iOS/macOS Mail's auto dark-mode from repainting our own
+     colors -- without this, backgrounds/text can invert unpredictably
+     on an iPhone even though color-scheme/supported-color-schemes
+     above say "light only". Belt-and-suspenders for iOS Mail. */
+  @media (prefers-color-scheme: dark) {{
+    body, .email-container {{ background:#F2F0EC !important; }}
+  }}
   @media screen and (max-width:600px) {{
     .email-container {{ width:100% !important; max-width:100% !important; }}
     .email-padding {{ padding-left:14px !important; padding-right:14px !important; }}
+    /* The SIP/recommendation table has 4 columns -- too tight for a
+       phone screen. Stack each <td> into its own full-width block
+       instead, with the column name (from data-label) printed above
+       the value, same as the other report's mobile treatment. */
+    .stack-table, .stack-table tbody, .stack-table tr, .stack-table td {{
+      display:block !important;
+      width:100% !important;
+      box-sizing:border-box !important;
+    }}
+    .stack-table .table-header-row {{ display:none !important; }}
+    .stack-table tr {{
+      border-bottom:1px solid #DAD5CB !important;
+      padding:10px 0 !important;
+    }}
+    .stack-table tr:last-child {{ border-bottom:none !important; }}
+    .stack-table td {{
+      border-bottom:none !important;
+      padding:6px 14px !important;
+      text-align:left !important;
+    }}
+    .stack-table td[data-label]:before {{
+      content: attr(data-label);
+      display:block;
+      font-family:{SANS};
+      font-size:9.5px;
+      font-weight:700;
+      letter-spacing:0.08em;
+      text-transform:uppercase;
+      color:#B0A98C;
+      margin-bottom:3px;
+    }}
+    .stack-table td, .stack-table td div, .stack-table td span {{ font-size:13px !important; }}
   }}
 </style>
 </head>
