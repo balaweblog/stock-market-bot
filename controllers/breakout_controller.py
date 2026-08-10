@@ -374,6 +374,59 @@ def compute_setup_strength(row):
 
 
 # -----------------------------------------------------------------------
+# Best Execution Case -- a rule-based read across signals ALREADY computed
+# for a row (which bucket it landed in, Entry State, Setup Strength,
+# Risk:Reward, Failure Risk). Not a new backtest, not a probability, and
+# not a replacement for Setup Strength -- it's a stricter, all-of-the-above
+# filter on top of it, meant to flag only the handful of rows an
+# at-a-glance read would actually be comfortable acting on TODAY, out of
+# everything that fired. Same fail-soft convention as the rest of this
+# file: a row missing a needed component simply doesn't qualify -- it's
+# never flagged as bad, just not called out as a best case.
+#
+# A row qualifies ONLY when ALL of the following hold:
+#   1. It landed in the Confirmed Breakouts bucket (checked by the caller
+#      -- Watch/Filtered/Near-Breakout rows never qualify, no matter how
+#      high their component scores are).
+#   2. Entry State is Fresh Breakout or Retest -- there's a concrete entry
+#      price today, not just a pattern fire with no actionable zone.
+#   3. Setup Strength >= BEST_EXECUTION_MIN_SETUP_STRENGTH (the composite
+#      already blends Quality / Risk:Reward / Failure Risk / Confirmation
+#      / Fundamentals -- see compute_setup_strength above).
+#   4. Risk:Reward is at/above RISK_REWARD_PREFERRED_THRESHOLD, not just
+#      the bare minimum that keeps a row out of the Filtered section.
+#   5. Failure Risk isn't flagged elevated on a reliable sample (reuses
+#      utils.breakout_failure's own "elevated" read rather than
+#      re-deriving a second threshold here).
+BEST_EXECUTION_MIN_SETUP_STRENGTH = 80  # matches the "Very Strong" Setup Strength band
+BEST_EXECUTION_ROW_BG = "#87CEFA"       # light sky blue -- "best case for execution today"
+BEST_EXECUTION_LABEL = "\U0001F3AF Best Execution Case"
+
+
+def is_best_execution_case(row):
+    """row is expected to already carry entry/setup_strength/risk_reward/
+    failure_risk (i.e. called after those are set on the row, and only
+    for rows about to be placed in the Confirmed bucket)."""
+    entry = row.get("entry")
+    if not entry or entry.state not in (EntryState.FRESH_BREAKOUT, EntryState.RETEST):
+        return False
+
+    strength = row.get("setup_strength")
+    if not strength or strength["score"] < BEST_EXECUTION_MIN_SETUP_STRENGTH:
+        return False
+
+    risk_reward = row.get("risk_reward")
+    if not risk_reward or risk_reward["ratio"] < RISK_REWARD_PREFERRED_THRESHOLD:
+        return False
+
+    failure_risk = row.get("failure_risk")
+    if failure_risk and failure_risk.backtest and failure_risk.backtest.elevated:
+        return False
+
+    return True
+
+
+# -----------------------------------------------------------------------
 # Scan
 # -----------------------------------------------------------------------
 def scan_universe(histories, bhav_df, regime: RegimeResult):
@@ -534,24 +587,33 @@ def scan_universe(histories, bhav_df, regime: RegimeResult):
             # are left in their normal bucket -- don't punish a row for a
             # gap elsewhere in the pipeline.
             if risk_reward and not risk_reward["meets_threshold"]:
+                row["best_execution"] = False
                 filtered_low_rr.append(row)
             elif meets_confirmed_bar:
+                # Best Execution Case is only ever evaluated for rows
+                # about to land in Confirmed -- see is_best_execution_case.
+                row["best_execution"] = is_best_execution_case(row)
                 confirmed.append(row)
             else:
+                row["best_execution"] = False
                 watch_list.append(row)
 
     def _rank_key(row):
-        # Primary sort: Breakout Quality Score (None -- no historical
-        # sample at all -- ranks last, not first, since an unscored
-        # signal is the least-trustworthy one to lead with). Secondary:
-        # Risk/Reward ratio (0 if unavailable), since among similarly
-        # scored setups the better-paying one should lead. Tertiary:
-        # backtest sample size, as before.
+        # Primary sort: Best Execution Case rows lead every list they're
+        # eligible for (see is_best_execution_case -- Confirmed only).
+        # Then Setup Strength score (None -- no components available at
+        # all -- ranks last, not first, since an unscored row is the
+        # least-trustworthy one to lead with). Ties broken by the same
+        # keys as before: Breakout Quality Score, then Risk/Reward ratio,
+        # then backtest sample size.
+        best_execution = 1 if row.get("best_execution") else 0
+        strength = row.get("setup_strength")
+        strength_score = strength["score"] if strength else -1
         quality_score = row["quality"]["score"] if row["quality"] else -1
         rr = row.get("risk_reward")
         rr_ratio = rr["ratio"] if rr else 0
         bt = row["backtest"] or {}
-        return (quality_score, rr_ratio, bt.get("sample_size", 0))
+        return (best_execution, strength_score, quality_score, rr_ratio, bt.get("sample_size", 0))
 
     confirmed.sort(key=_rank_key, reverse=True)
     watch_list.sort(key=_rank_key, reverse=True)
@@ -860,6 +922,18 @@ def _row_bg_for_symbol(symbol, default_bg):
     return default_bg
 
 
+def _row_bg_for_row(row, default_bg):
+    """Background override, checked in priority order:
+      1. Best Execution Case (light sky blue) -- see is_best_execution_case.
+         Takes priority over the own-stock shading below since it's the
+         stronger, more actionable signal.
+      2. Own-stock symbol (light green) -- see MY_STOCK_ROW_BG.
+      3. The table's normal alternating background otherwise."""
+    if row.get("best_execution"):
+        return BEST_EXECUTION_ROW_BG
+    return _row_bg_for_symbol(row["symbol"], default_bg)
+
+
 def _signal_rows_html(rows, row_bg):
     if not rows:
         return '<tr><td style="padding:10px 12px;font-family:{0};font-size:12px;color:#8A8F9C;" colspan="12">None today.</td></tr>'.format(SANS)
@@ -888,10 +962,16 @@ def _signal_rows_html(rows, row_bg):
                 f'(needs ROE \u2265{FUNDAMENTAL_MIN_ROE*100:.0f}%, Debt/Equity \u2264{FUNDAMENTAL_MAX_DEBT_TO_EQUITY:.0f}%, '
                 f'non-negative earnings growth -- see Quality column).</div>'
             )
-        bg = _row_bg_for_symbol(row["symbol"], row_bg)
+        best_execution_note = ""
+        if row.get("best_execution"):
+            best_execution_note = (
+                f'<div style="margin-top:3px;font-size:10.5px;font-weight:700;color:#0B4C7C;">'
+                f'{BEST_EXECUTION_LABEL}</div>'
+            )
+        bg = _row_bg_for_row(row, row_bg)
         out.append(f"""
         <tr style="background:{bg};">
-          <td data-label="Symbol" style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}</td>
+          <td data-label="Symbol" style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}{best_execution_note}</td>
           <td data-label="Pattern" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{fund_note}</td>
           <td data-label="Price" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
           <td data-label="Backtest" style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{_backtest_cell(row['backtest'])}</td>
@@ -1101,6 +1181,12 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, near_breakout_watc
             f" 🔴 Bearish regime is active, so this list is also restricted to Quality \u2265{BEAR_MARKET_MIN_QUALITY_SCORE} "
             f"and preferred Risk:Reward (\u2265{RISK_REWARD_PREFERRED_THRESHOLD:.1f}) -- see Market Regime above."
         )
+    confirmed_subtitle += (
+        f' Rows shaded <span style="background:{BEST_EXECUTION_ROW_BG};padding:0 3px;">light sky blue</span> are this '
+        f"run's {BEST_EXECUTION_LABEL} rows -- Confirmed, Fresh Breakout/Retest (a concrete entry price today), "
+        f"Setup Strength \u2265{BEST_EXECUTION_MIN_SETUP_STRENGTH}, Risk:Reward \u2265{RISK_REWARD_PREFERRED_THRESHOLD:.1f}, "
+        "and Failure Risk not flagged elevated -- see disclaimer below for the full rule."
+    )
     confirmed_block = _table_block(
         "✅ Confirmed Breakouts",
         confirmed_subtitle,
@@ -1302,6 +1388,18 @@ def build_report_html(confirmed, watch_list, filtered_low_rr, near_breakout_watc
                 Rows shaded <span style="background:#E9F7ED;padding:0 3px;">light green</span> are symbols already
                 in your own direct-equity list (constants.STOCKS) -- called out purely to jump out from the wider
                 NIFTY 500 scan, not a separate signal.
+                <b>{html.escape(BEST_EXECUTION_LABEL)}</b> rows -- shaded <span style="background:{BEST_EXECUTION_ROW_BG};padding:0 3px;">light
+                sky blue</span> in the Confirmed table above, and taking priority over the light-green own-stock
+                shading when both would apply -- are a stricter, rule-based filter layered on top of everything else
+                on this page, meant to surface only the handful of setups worth a first look TODAY rather than the
+                full Confirmed list: (1) already in the Confirmed Breakouts bucket, (2) Entry State is Fresh Breakout
+                or Retest, i.e. there's an exact entry price today, (3) Setup Strength
+                \u2265{BEST_EXECUTION_MIN_SETUP_STRENGTH} ("Very Strong"), (4) Risk:Reward
+                \u2265{RISK_REWARD_PREFERRED_THRESHOLD:.1f}, and (5) Failure Risk not flagged elevated on a reliable
+                sample. It runs no new backtest and adds no new data -- it's a same-fail-soft, all-of-the-above pass
+                over the columns already on this page, so a row missing any one component simply doesn't qualify
+                rather than being marked bad. Like Setup Strength, this is <b>not</b> a probability of success and
+                <b>not</b> investment advice -- verify every number on the row yourself before acting on it.
                 <b>Setup Strength</b> is a single weighted summary of the columns to its left -- Quality Score (35%),
                 Risk:Reward (25%, capped at 3:1), Failure Risk (20%), Confirmation Score (15%), and the Fundamentals
                 gate where it ran (5%) -- so a row that's strong across the board stands out without reading five

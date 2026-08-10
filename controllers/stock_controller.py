@@ -36,7 +36,7 @@ from utils.logger import log
 from services.commodity_tracker import CommodityTracker
 from utils.compliance import build_compliance_block_html
 from utils import email_service
-from models.track_record import update_track_record, build_track_record_html
+from models.track_record import update_track_record
 from models.support_resistance import compute_pivot_levels, compute_swing_zones, build_support_resistance_html
 from llm import llm_backend
 
@@ -3093,7 +3093,7 @@ def _action_plan_row_html(name, currency_symbol, buy_level, target, status_key, 
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{current_price_display}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{add_below}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};border-top:1px solid #EDEAE2;">
-                <span style="display:inline-block;padding:2px 8px;border-radius:999px;background:{bg};color:{color};font-size:11px;font-weight:700;">{label}</span>
+                <span style="display:inline-block;padding:3px 8px;border-radius:4px;border:1px solid {color};background:{bg};color:{color};font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;">{label}</span>
             </td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{next_action}</td>
             <td style="padding:7px 10px;font-size:12px;font-family:{sans};color:#14213D;border-top:1px solid #EDEAE2;">{profit_booking}</td>
@@ -3124,6 +3124,16 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             f'<tr><td colspan="6" style="padding:10px 10px 6px;font-family:{sans};'
             f'font-size:11px;font-weight:700;color:#14213D;text-transform:uppercase;'
             f'letter-spacing:0.05em;background:#F4F2ED;">{label}</td></tr>'
+        )
+
+    def sub_group_header_row(label):
+        # Nested one level under a market group_header_row (e.g. "Core" /
+        # "Non-Core" under "India Stocks") -- lighter weight and indented
+        # so it doesn't read as a sibling top-level group.
+        return (
+            f'<tr><td colspan="6" style="padding:6px 10px 4px 20px;font-family:{sans};'
+            f'font-size:10px;font-weight:700;color:#B08D57;text-transform:uppercase;'
+            f'letter-spacing:0.08em;background:#FBFAF7;">{label}</td></tr>'
         )
 
     # Sector-crowding pre-pass: mirrors build_concentration_alert_html's
@@ -3176,13 +3186,18 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
             sector_crowded=_is_sector_crowded(market_key, entry.get("sector")),
             day_change_pct=entry.get("day_change_pct"),
         )
-        stock_rows_by_market.setdefault(market_key, []).append((entry.get("total_score") or 0, row_html_str))
+        stock_rows_by_market.setdefault(market_key, []).append(
+            (entry.get("total_score") or 0, entry.get("ticker"), row_html_str)
+        )
 
     def sorted_rows(market_key):
-        return [r for _, r in sorted(stock_rows_by_market.get(market_key, []), key=lambda x: x[0], reverse=True)]
+        return [
+            (ticker, r) for _, ticker, r in
+            sorted(stock_rows_by_market.get(market_key, []), key=lambda x: x[0], reverse=True)
+        ]
 
-    us_rows = sorted_rows("US")
-    india_rows = sorted_rows("India")
+    us_rows = [r for _, r in sorted_rows("US")]
+    india_rows_with_ticker = sorted_rows("India")
 
     def commodity_row(name, data, levels, plan, tranche_amount_inr):
         if not data:
@@ -3227,8 +3242,18 @@ def build_action_plan_table_html(summary_rows, commodity_data=None, gold_levels=
     body = ""
     if us_rows:
         body += group_header_row("🇺🇸 US Stocks") + "".join(us_rows)
-    if india_rows:
-        body += group_header_row("🇮🇳 India Stocks") + "".join(india_rows)
+    if india_rows_with_ticker:
+        # Split India Stocks into Core / Non-Core sub-groups, same split
+        # used elsewhere in the report (classify_india_core), rather than
+        # one flat India list. Each side stays sorted by score (already
+        # sorted going in, since india_rows_with_ticker is pre-sorted).
+        india_core_rows = [r for ticker, r in india_rows_with_ticker if classify_india_core(ticker) == "Core"]
+        india_non_core_rows = [r for ticker, r in india_rows_with_ticker if classify_india_core(ticker) != "Core"]
+        body += group_header_row("🇮🇳 India Stocks")
+        if india_core_rows:
+            body += sub_group_header_row("Core") + "".join(india_core_rows)
+        if india_non_core_rows:
+            body += sub_group_header_row("Non-Core") + "".join(india_non_core_rows)
     if gold_row:
         body += group_header_row("🥇 Gold") + gold_row
     if silver_row:
@@ -4494,10 +4519,6 @@ def main(mode, use_llm, detailed_llm=False):
         gold_plan=gold_plan, silver_plan=silver_plan,
     )
 
-    # Prediction vs Reality: renders "" until at least one call has closed,
-    # so a brand-new deployment doesn't show an empty/zero panel.
-    track_record_html = build_track_record_html(track_record_state)
-
     # Signal Matrix reference table -- static (doesn't depend on this run's
     # data), shown once so per-stock "Signal Matrix: WAIT 🟢🔴🟢" badges
     # further down have something to look up against.
@@ -4541,7 +4562,6 @@ def main(mode, use_llm, detailed_llm=False):
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html
-        + track_record_html
         + action_plan_html
         + data_quality_banner_html
         + signal_matrix_legend_html
@@ -4568,7 +4588,6 @@ def main(mode, use_llm, detailed_llm=False):
         + ai_portfolio_story_html
         + market_takeaway_html
         + quick_summary_html
-        + track_record_html
         + action_plan_html
         + data_quality_banner_html
         + commodity_row_html
