@@ -211,7 +211,6 @@ _QUOTA_CACHE_FILE = "quota_cache.json"
 
 
 def _load_quota_cache():
-    global _groq_quota, _tavily_quota
     try:
         if os.path.exists(_QUOTA_CACHE_FILE):
             with open(_QUOTA_CACHE_FILE, "r") as f:

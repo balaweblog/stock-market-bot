@@ -22,7 +22,8 @@ class OptionStrategyTests(unittest.TestCase):
         prompt = build_prompt(live_data={})
 
         self.assertIn("Weekly", prompt)
-        self.assertIn("Monthly", prompt)
+        self.assertIn("Next Week", prompt)
+        self.assertIn("Next to Next Week", prompt)
 
 
 if __name__ == "__main__":

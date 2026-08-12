@@ -96,7 +96,7 @@ The platform operates as **5 autonomous advisory pipelines**, each engineered to
 - **Expected Move Calculation**: Calculates 1-SD Expected Move for 3 distinct horizons:
   $$\text{EM} = \text{Spot} \times \text{IV} \times \sqrt{\frac{\text{DTE}}{365}}$$
 - **Defined-Risk Constraint**: Mandates 100% defined-risk structures only (`Bull Call Spread`, `Bear Call Spread`, `Bull Put Spread`, `Bear Put Spread`, `Iron Condor`, `Iron Butterfly`). Naked options and ratio spreads are strictly rejected.
-- **Multi-Horizon Strategy Normalization**: Renders primary and alternative trade setups for **Weekly**, **Next Week**, and **Monthly** expiries.
+- **Multi-Horizon Strategy Normalization**: Renders primary and alternative trade setups for **Weekly**, **Next Week**, and **Next to Next Week** expiries.
 
 ### 5. Mutual Fund Portfolio Review Pipeline (`controllers/mutual_fund_controller.py`)
 - **AMFI Integration**: Fetches official scheme NAVs and 1Y/3Y/5Y rolling returns directly from AMFI (Association of Mutual Funds in India).

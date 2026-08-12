@@ -190,6 +190,9 @@ SAMPLE_SIZE_FOR_FULL_CONFIDENCE = 20
 # Return-magnitude scoring band (at PRIMARY_HORIZON): full marks at/above this.
 RETURN_MAGNITUDE_CEILING = 0.05  # 5%
 
+# Historical failure rate at/above this is called out as elevated.
+HIGH_FAILURE_RATE_CEILING = 0.35
+
 QUALITY_LABELS = (
     (80, "Excellent"),
     (65, "Strong"),
