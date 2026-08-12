@@ -23,6 +23,7 @@ class RecommendationLogicTests(unittest.TestCase):
         dividend_record_date = (datetime.now(ZoneInfo("Asia/Kolkata")).date() + timedelta(days=2)).strftime("%d %b %Y")
         rows = [
             {
+                "ticker": "SBIN.NS",
                 "stock_name": "SBIN",
                 "signal": "BUY / HOLD",
                 "recommended_buy_level": 1030,
@@ -33,6 +34,7 @@ class RecommendationLogicTests(unittest.TestCase):
                 },
             },
             {
+                "ticker": "ICICIBANK.NS",
                 "stock_name": "ICICI Bank",
                 "signal": "HOLD",
                 "recommended_buy_level": 1200,
@@ -46,6 +48,7 @@ class RecommendationLogicTests(unittest.TestCase):
                 },
             },
             {
+                "ticker": "ITC.NS",
                 "stock_name": "ITC",
                 "signal": "SELL",
                 "recommended_buy_level": 400,
@@ -56,6 +59,7 @@ class RecommendationLogicTests(unittest.TestCase):
                 },
             },
             {
+                "ticker": "TCS.NS",
                 "stock_name": "TCS",
                 "signal": "HOLD",
                 "recommended_buy_level": 3500,
@@ -188,8 +192,8 @@ class RecommendationLogicTests(unittest.TestCase):
     def test_build_data_quality_banner_flags_missing_core_fields(self):
         html = build_data_quality_banner(
             [
-                {"ticker": "AAPL", "recommendation": "Buy", "decision_note": "Strong setup", "current_price": 100},
-                {"ticker": "TSLA", "recommendation": "", "decision_note": "", "current_price": None},
+                {"ticker": "AAPL", "signal": "BUY", "current_price": 100},
+                {"ticker": "TSLA", "signal": "", "current_price": None},
             ],
             section_name="stocks",
         )
@@ -204,7 +208,7 @@ class RecommendationLogicTests(unittest.TestCase):
             hold_count=1,
             sell_count=0,
             err_count=0,
-            summary_rows=[{"stock_name": "SBIN", "signal": "BUY", "current_price": 100, "recommended_buy_level": 102}],
+            summary_rows=[{"stock_name": "SBIN", "signal": "BUY", "priority": 1, "current_price": 100, "recommended_buy_level": 102}],
             commodity_bullets_by_metal={"gold": ["✅ Buy Signal: Gold at ₹70"], "silver": []},
         )
 
@@ -219,9 +223,9 @@ class RecommendationLogicTests(unittest.TestCase):
             sell_count=1,
             err_count=0,
             summary_rows=[
-                {"stock_name": "SBIN", "signal": "BUY", "current_price": 100, "recommended_buy_level": 102},
-                {"stock_name": "ICICI", "signal": "HOLD", "current_price": 105, "recommended_buy_level": 103},
-                {"stock_name": "ITC", "signal": "SELL", "current_price": 95, "recommended_buy_level": 98},
+                {"stock_name": "SBIN", "signal": "BUY", "priority": 1, "current_price": 100, "recommended_buy_level": 102},
+                {"stock_name": "ICICI", "signal": "HOLD", "priority": 2, "current_price": 105, "recommended_buy_level": 103},
+                {"stock_name": "ITC", "signal": "SELL", "priority": 3, "current_price": 95, "recommended_buy_level": 98},
             ],
             commodity_bullets_by_metal={"gold": ["✅ Gold is holding support"], "silver": []},
         )

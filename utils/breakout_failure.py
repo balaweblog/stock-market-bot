@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 
-from utils.breakout_backtest import find_historical_events
+from utils.breakout_backtest import find_historical_events, HIGH_FAILURE_RATE_CEILING
 from utils.logger import log
 
 # ---------------------------------------------------------------------
@@ -59,7 +59,6 @@ CAUTION_MIN_FLAGS = 2             # of 4 -- fires ⚠️ Caution, short of the f
 
 FAILURE_WINDOW_DAYS = 3           # "did it fail within N days" -- the window this module backtests
 MIN_SAMPLES_FOR_FAILURE_RATE = 5  # below this, the historical rate is shown but not called reliable
-HIGH_FAILURE_RATE_CEILING = 0.35  # historical failure rate at/above this is called out as elevated
 
 
 class FailureRisk(Enum):
