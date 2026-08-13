@@ -52,10 +52,205 @@ def _linreg_slope(y):
 
 
 # ---------------------------------------------------------------------
+# Guardrails -- shared pre-checks every detector runs before its own
+# pattern-specific logic, all gated purely on df.iloc[:i+1] like every
+# detector here (see the lookahead-bias note at the top of this file).
+# These are baked into EACH detector function (not bolted on as a
+# separate wrapper around scan_all_patterns) specifically so that
+# utils/breakout_backtest.py's historical replay hits the exact same
+# gate a live signal would. Left as a wrapper-only check, a corporate
+# action, a data glitch, or an illiquid stretch buried somewhere in a
+# stock's own trailing history would still count as a "past occurrence"
+# in that stock's backtest -- quietly inflating or deflating the very
+# hit-rate number the email calls "confirmed."
+# ---------------------------------------------------------------------
+
+# Liquidity / penny-stock gate.
+LIQUIDITY_LOOKBACK = 20
+MIN_AVG_PRICE = 20.0          # rupees -- below this, treat as a penny stock
+MIN_AVG_TURNOVER = 1.0e7      # rupees/day (~₹1 crore), 20-day average Close*Volume
+
+# Corporate-action gate -- flags an overnight gap that lines up with a
+# common split/bonus/consolidation ratio rather than genuine trading.
+CORP_ACTION_RATIOS = (0.5, 0.2, 0.25, 0.1, 1 / 3, 2.0, 3.0, 4.0, 5.0, 10.0)
+CORP_ACTION_TOLERANCE = 0.04  # 4% band around a "clean" ratio counts as a match
+CORP_ACTION_MIN_GAP = 0.15    # only worth checking once the overnight gap is already big
+
+# Data-sanity gate -- how many trailing bars to sanity-check for feed glitches.
+DATA_SANITY_CHECK_DAYS = 5
+
+
+def _data_sanity_ok(df, i, check_days=DATA_SANITY_CHECK_DAYS):
+    """Basic OHLCV integrity check over the last few bars. Catches feed
+    glitches -- bad ticks, a frozen/stale bar repeated by a caching
+    layer, zero/negative prices, or an impossible High/Low/Close
+    relationship -- that would otherwise get read as a genuine breakout."""
+    start = max(0, i - check_days + 1)
+    recent = df.iloc[start:i + 1]
+    if recent.empty:
+        return False
+
+    for col in ("Open", "High", "Low", "Close"):
+        vals = recent[col]
+        if vals.isna().any() or (vals <= 0).any():
+            return False
+
+    if (recent["High"] < recent["Low"]).any():
+        return False
+    if (recent["High"] < recent[["Open", "Close"]].max(axis=1) - 1e-6).any():
+        return False
+    if (recent["Low"] > recent[["Open", "Close"]].min(axis=1) + 1e-6).any():
+        return False
+
+    # A frozen/stale feed: identical OHLC repeated across the whole
+    # window. A real market essentially never prints the exact same
+    # four prices on three-plus consecutive sessions.
+    if len(recent) >= 3 and recent[["Open", "High", "Low", "Close"]].nunique().eq(1).all():
+        return False
+
+    return True
+
+
+def _is_liquid(df, i, lookback=LIQUIDITY_LOOKBACK, min_price=MIN_AVG_PRICE, min_turnover=MIN_AVG_TURNOVER):
+    """Penny-stock / illiquid-stock gate. A pattern firing on a thinly
+    traded name isn't really a tradable setup -- entering or exiting at
+    any real size would move the price itself -- and its "past
+    occurrences" in the backtest are just as unreliable for the same
+    reason."""
+    if i < lookback - 1:
+        return False
+    window = df.iloc[i - lookback + 1:i + 1]
+    if window["Close"].isna().any() or window["Volume"].isna().any():
+        return False
+    avg_price = window["Close"].mean()
+    avg_turnover = (window["Close"] * window["Volume"]).mean()
+    return avg_price >= min_price and avg_turnover >= min_turnover
+
+
+def _looks_like_corporate_action(df, i, ratios=CORP_ACTION_RATIOS, tol=CORP_ACTION_TOLERANCE, min_gap=CORP_ACTION_MIN_GAP):
+    """Flags an overnight gap that lines up with a common split/bonus/
+    consolidation ratio (1:2, 1:5, 1:10, 3:1, etc.) rather than genuine
+    trading. Left unfiltered, a 1:5 split reads as an ~80% single-day
+    drop that can masquerade as several patterns below, and a bonus
+    issue can just as easily look like a volume-surge breakout -- purely
+    a price-adjustment artifact, not a signal."""
+    if i < 1:
+        return False
+    prev_close = df.iloc[i - 1]["Close"]
+    today_open = df.iloc[i]["Open"]
+    if prev_close <= 0 or today_open <= 0:
+        return False
+    gap = abs(today_open - prev_close) / prev_close
+    if gap < min_gap:
+        return False
+    ratio = today_open / prev_close
+    return any(abs(ratio - r) / r <= tol for r in ratios)
+
+
+# Extension / exhaustion gate -- a stock that has already run too far
+# from its own mean, or is already deeply overbought off an outsized
+# single-day move, has less room left before mean-reversion/profit-taking
+# than its raw hit-rate alone would suggest. E.g. a 4.9x-volume, +8.2%
+# day (real example: NATIONALUM) can carry a strong historical hit-rate
+# AND a meaningfully elevated near-term failure rate at the same time --
+# these aren't contradictory, they're the same phenomenon (the move is
+# already extended) showing up in two different numbers. Gating on
+# extension keeps a screener signal from being "confirmed" purely on a
+# stock's own backtest average, when TODAY's specific instance is
+# already more stretched than the average historical occurrence was.
+EXTENSION_ATR_LOOKBACK = 14
+EXTENSION_MAX_ATR_MULTIPLE = 3.5   # today's Close vs. its 20-day SMA, in ATR(14) multiples
+EXTENSION_RSI_CEILING = 80.0       # RSI(14) at/above this = deeply overbought
+EXTENSION_MIN_DAY_MOVE = 0.06      # only let RSI-overbought gate a signal if today's move was itself already big
+
+
+def _atr(df, i, period=EXTENSION_ATR_LOOKBACK):
+    """Average True Range over `period` sessions ending at i, using only
+    df.iloc[:i+1] -- standard True Range (max of high-low, |high-prev
+    close|, |low-prev close|) averaged over the trailing window."""
+    if i < period:
+        return None
+    highs = df["High"].iloc[:i + 1]
+    lows = df["Low"].iloc[:i + 1]
+    prev_close = df["Close"].iloc[:i + 1].shift(1)
+    tr = pd.concat([
+        highs - lows,
+        (highs - prev_close).abs(),
+        (lows - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = tr.iloc[-period:].mean()
+    return float(atr) if pd.notna(atr) else None
+
+
+def _rsi(df, i, period=14):
+    """Classic RSI(period) using only df.iloc[:i+1]."""
+    if i < period:
+        return None
+    closes = df["Close"].iloc[:i + 1]
+    delta = closes.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.iloc[-period:].mean()
+    avg_loss = losses.iloc[-period:].mean()
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _is_too_extended(df, i):
+    """True if today's bar is already stretched too far from its own
+    mean to trust as a fresh signal -- either (a) Close is more than
+    EXTENSION_MAX_ATR_MULTIPLE average-true-ranges away from its own
+    20-day SMA, or (b) RSI(14) is already deeply overbought AND today's
+    own move was itself large (so it's not just a slow grind that
+    happens to be overbought, but a sharp spike on top of one)."""
+    if i < 20:
+        return False
+    closes = df["Close"].iloc[:i + 1]
+    ma20 = closes.iloc[-20:].mean()
+    today_close = closes.iloc[-1]
+
+    atr = _atr(df, i)
+    if atr and atr > 0:
+        extension_atr = abs(today_close - ma20) / atr
+        if extension_atr > EXTENSION_MAX_ATR_MULTIPLE:
+            return True
+
+    rsi = _rsi(df, i)
+    if rsi is not None and rsi >= EXTENSION_RSI_CEILING:
+        prev_close = df.iloc[i - 1]["Close"]
+        if prev_close > 0:
+            day_move = (today_close - prev_close) / prev_close
+            if day_move >= EXTENSION_MIN_DAY_MOVE:
+                return True
+
+    return False
+
+
+def _passes_guardrails(df, i):
+    """Single entry point every detector calls before its own
+    pattern-specific logic. True only if today's bar is clean enough,
+    liquid enough, not a corporate-action price artifact, and not
+    already too extended to trust for pattern detection."""
+    if not _data_sanity_ok(df, i):
+        return False
+    if not _is_liquid(df, i):
+        return False
+    if _looks_like_corporate_action(df, i):
+        return False
+    if _is_too_extended(df, i):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------
 # 1. Resistance / consolidation breakout
 # ---------------------------------------------------------------------
 def detect_resistance_breakout(df, i, lookback=20, min_range_days=10, buffer=0.002):
     if i < lookback:
+        return None
+    if not _passes_guardrails(df, i):
         return None
     prior = df.iloc[i - lookback:i]  # strictly before today
     today = df.iloc[i]
@@ -91,6 +286,8 @@ def detect_resistance_breakout(df, i, lookback=20, min_range_days=10, buffer=0.0
 def detect_volume_surge(df, i, lookback=20, vol_mult=2.0, min_price_change=0.02):
     if i < lookback:
         return None
+    if not _passes_guardrails(df, i):
+        return None
     prior = df.iloc[i - lookback:i]
     today = df.iloc[i]
 
@@ -119,6 +316,8 @@ def detect_volume_surge(df, i, lookback=20, vol_mult=2.0, min_price_change=0.02)
 def detect_52w_high(df, i, lookback=252, tolerance=0.003):
     if i < 60:  # allow this on shorter histories too, using whatever's available
         return None
+    if not _passes_guardrails(df, i):
+        return None
     prior = df.iloc[max(0, i - lookback):i]
     today = df.iloc[i]
     high_52w = prior["High"].max()
@@ -138,6 +337,8 @@ def detect_52w_high(df, i, lookback=252, tolerance=0.003):
 # ---------------------------------------------------------------------
 def detect_ma_crossover(df, i, fast=50, slow=200, confirm_days=3):
     if i < slow + confirm_days:
+        return None
+    if not _passes_guardrails(df, i):
         return None
     closes = df["Close"].iloc[:i + 1]
     fast_ma = closes.rolling(fast).mean()
@@ -163,6 +364,8 @@ def detect_ma_crossover(df, i, fast=50, slow=200, confirm_days=3):
 # ---------------------------------------------------------------------
 def detect_bollinger_squeeze_breakout(df, i, window=20, squeeze_lookback=60, squeeze_pct=0.35, num_std=2.0):
     if i < window + squeeze_lookback:
+        return None
+    if not _passes_guardrails(df, i):
         return None
     closes = df["Close"].iloc[:i + 1]
     ma = closes.rolling(window).mean()
@@ -199,6 +402,8 @@ def detect_flag_pattern(df, i, pole_lookback=15, flag_lookback=8, min_pole_move=
     slightly-downward-or-flat drift (the flag), then a breakout above the
     flag's high on today's bar."""
     if i < pole_lookback + flag_lookback:
+        return None
+    if not _passes_guardrails(df, i):
         return None
 
     flag = df.iloc[i - flag_lookback:i]  # before today
@@ -242,6 +447,8 @@ def detect_triangle_pattern(df, i, lookback=40, min_touches=2):
     lookback window, breakout above the upper trendline today."""
     if i < lookback:
         return None
+    if not _passes_guardrails(df, i):
+        return None
     window = df.iloc[i - lookback:i]  # before today
     today = df.iloc[i]
 
@@ -282,6 +489,8 @@ def detect_cup_and_handle(df, i, cup_lookback=90, handle_lookback=12, max_handle
     high. Handle: a shallow pullback right after. Breakout: close above
     both the cup's prior high and the handle's high today."""
     if i < cup_lookback + handle_lookback:
+        return None
+    if not _passes_guardrails(df, i):
         return None
 
     cup = df.iloc[i - cup_lookback - handle_lookback:i - handle_lookback]
