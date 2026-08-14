@@ -23,8 +23,49 @@ MIN_SAMPLES_FOR_CONFIDENCE = 5
 CONFIRM_HIT_RATE_THRESHOLD = 0.55  # >=55% of past occurrences positive at the primary horizon
 PRIMARY_HORIZON = 10
 
+# -----------------------------------------------------------------------
+# Realistic trade simulation -- see simulate_trades() / compute_trade_stats()
+# below. The hit-rate/avg-return read above answers "did price end up
+# higher N days later" -- it says nothing about the PATH price took to
+# get there, what it would have cost to actually trade it, or whether a
+# high hit-rate is being propped up by a few large losers. A strategy
+# can post an 80% hit-rate and still lose money (small wins, rare fat
+# losses); a 55% hit-rate strategy with a good win/loss ratio can be far
+# more profitable. Expectancy -- (Win% x Avg Win) - (Loss% x Avg Loss) --
+# is the number that actually answers "is this worth trading", so it
+# and the metrics that feed it (profit factor, drawdown, MAE/MFE, Sharpe/
+# Sortino) sit alongside the existing hit-rate stats rather than
+# replacing them.
+# -----------------------------------------------------------------------
+ATR_PERIOD_TRADE_SIM = 14
 
-def find_historical_events(df, detector_fn, as_of_i, min_gap_days=5, max_events=60, max_horizon=None):
+# Stop-loss placed this many ATRs below entry, checked against each
+# day's LOW during the holding window -- exits on the earliest day the
+# stop is touched rather than waiting for the fixed horizon. Without
+# this, "average return at 10 days" hides trades that were down 15% on
+# day 3 and merely happened to recover by day 10; no real trader holds
+# through that blind to a stop.
+STOP_LOSS_ATR_MULT = 2.0
+
+# Cost assumptions -- TUNE THESE to the actual broker/account being
+# modeled; these are placeholder, conservative-ish defaults for NSE
+# equity delivery via a discount broker, not a substitute for real
+# figures. Both are round-trip unless noted.
+SLIPPAGE_BPS = 10          # each side (entry AND exit) fills this much worse
+                            # than the reference price -- 20bps round-trip total
+BROKERAGE_TAX_BPS = 15     # brokerage + STT + exchange/SEBI charges + stamp duty
+                            # + GST, combined, round-trip, as a fraction of
+                            # trade value
+
+# Trades are simulated using the SAME event set find_historical_events()
+# already produces (no separate, possibly-inconsistent replay), held for
+# up to this many trading days unless the ATR stop fires first. Reuses
+# PRIMARY_HORIZON so the "realistic" read is asking about the same
+# holding period as the headline hit-rate stat, not a different question.
+TRADE_SIM_HORIZON = PRIMARY_HORIZON
+
+
+def find_historical_events(df, detector_fn, as_of_i, min_gap_days=5, max_events=60, max_horizon=None, scan_start_i=None):
     """
     Replays detector_fn across df[:as_of_i] (i.e. everything strictly
     BEFORE today's signal, so today's own occurrence never leaks into
@@ -49,6 +90,17 @@ def find_historical_events(df, detector_fn, as_of_i, min_gap_days=5, max_events=
     that don't pass their own horizon still get a safe, conservative cutoff
     consistent with backtest_pattern's own scan.
 
+    scan_start_i: positional floor for the scan, default 60 (the
+    detector's own minimum-lookback requirement -- unrelated to and not
+    a substitute for that floor, just an additional lower bound). Lets a
+    caller bound the scan to a specific WINDOW of history rather than
+    always starting at the beginning of df -- e.g. utils.breakout_walkforward
+    uses this to keep each walk-forward fold's event set confined to
+    that fold's own date range, so a "Train" fold can't see events that
+    actually belong to "Test". Always clamped to >= 60 regardless of
+    what's passed, since detectors need that much trailing data to run
+    at all.
+
     Returns [] if there's not enough runway to scan at all, or if the
     pattern simply never fired historically -- callers distinguish "no
     runway" from "zero events" via as_of_i themselves if they need to.
@@ -58,13 +110,14 @@ def find_historical_events(df, detector_fn, as_of_i, min_gap_days=5, max_events=
     if as_of_i < 60:
         return []
 
+    scan_start = max(60, scan_start_i) if scan_start_i is not None else 60
     scan_end = as_of_i - max_horizon
-    if scan_end < 60:
+    if scan_end < scan_start:
         return []
 
     event_indices = []
-    last_event_i = -min_gap_days - 1
-    for hist_i in range(60, scan_end):
+    last_event_i = scan_start - min_gap_days - 1
+    for hist_i in range(scan_start, scan_end):
         if hist_i - last_event_i < min_gap_days:
             continue
         try:
@@ -91,6 +144,11 @@ def backtest_pattern(df, detector_fn, as_of_i, min_gap_days=5, max_events=60):
         "horizons": {5: {"hit_rate": float, "avg_return": float, "median_return": float}, ...},
         "confirmed": bool,   # sample_size >= MIN_SAMPLES_FOR_CONFIDENCE
                               # and PRIMARY_HORIZON hit_rate >= CONFIRM_HIT_RATE_THRESHOLD
+        "trade_stats": dict or None,  # see compute_trade_stats() -- win_rate,
+                              # avg_winner, avg_loser, expectancy, profit_factor,
+                              # max_drawdown, sharpe, sortino, avg_holding_days,
+                              # avg_mae, avg_mfe, avg_gap, stop_out_rate,
+                              # gap_risk_rate, and the cost assumptions used
       }
     or None if there's not enough trailing history to attempt a
     backtest at all (as opposed to "attempted, zero historical events found").
@@ -137,7 +195,277 @@ def backtest_pattern(df, detector_fn, as_of_i, min_gap_days=5, max_events=60):
         and primary["hit_rate"] >= CONFIRM_HIT_RATE_THRESHOLD
     )
 
-    return {"sample_size": sample_size, "horizons": horizons, "confirmed": confirmed}
+    # Additive, non-breaking: a realistic trade-level simulation (entry
+    # next-bar-open, ATR stop, slippage/costs, MAE/MFE) alongside the
+    # same-close/fixed-horizon hit-rate stats above -- see module
+    # docstring and simulate_trades()/compute_trade_stats() for why hit-
+    # rate alone can be a misleading thing to optimize. None if there
+    # weren't enough valid next-bar entries to simulate anything.
+    trades = simulate_trades(df, event_indices)
+    trade_stats = compute_trade_stats(trades)
+
+    return {
+        "sample_size": sample_size,
+        "horizons": horizons,
+        "confirmed": confirmed,
+        "trade_stats": trade_stats,
+    }
+
+
+def _atr_series(df, period=ATR_PERIOD_TRADE_SIM):
+    """Plain rolling ATR (simple mean of True Range, not Wilder-smoothed --
+    consistent with the ATR already computed elsewhere in this project).
+    Returns a numpy array aligned to df's rows; entries before `period`
+    prior closes exist are NaN. Purely historical inputs (High/Low/Close
+    up to and including each row) -- safe to compute over the full df
+    since callers only ever index into positions that were already
+    no-lookahead-safe to begin with."""
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    n = len(closes)
+    atr = np.full(n, np.nan)
+    for i in range(period, n):
+        trs = []
+        for j in range(i - period + 1, i + 1):
+            prior_close = closes[j - 1]
+            tr = max(
+                highs[j] - lows[j],
+                abs(highs[j] - prior_close),
+                abs(lows[j] - prior_close),
+            )
+            trs.append(tr)
+        atr[i] = sum(trs) / len(trs)
+    return atr
+
+
+def simulate_trades(
+    df,
+    event_indices,
+    horizon=None,
+    stop_loss_atr_mult=STOP_LOSS_ATR_MULT,
+    slippage_bps=SLIPPAGE_BPS,
+    cost_bps=BROKERAGE_TAX_BPS,
+):
+    """
+    Turns raw event indices (from find_historical_events) into simulated
+    ROUND-TRIP TRADES instead of a same-close-to-N-days-later snapshot:
+
+      Entry: NEXT bar's OPEN after the signal bar -- the earliest a real
+        order could actually be placed, since the signal itself is only
+        known once bar `ei` has closed. (backtest_pattern()'s own
+        hit-rate stats above use closes[ei] as a same-day reference
+        price for simplicity/backward-compat; this is the more
+        realistic entry.)
+      Exit: whichever comes FIRST of (a) an ATR-based stop-loss touched
+        intraday (checked against each day's LOW), or (b) `horizon`
+        trading days after entry, exiting at that day's close.
+      Costs: slippage_bps applied against the trader on BOTH entry and
+        exit (buy fills higher, sell fills lower); cost_bps (brokerage +
+        taxes, round-trip) subtracted from the gross return.
+      MAE / MFE: the worst and best mark-to-market excursion (using
+        daily High/Low) at any point during the actual holding window --
+        NOT the same as the exit return, and computed even for trades
+        that exit at the horizon rather than the stop.
+      Gap risk: the overnight gap (entry-day open vs. signal-day close)
+        is recorded per trade -- this is the risk a fixed stop can't
+        protect against, since a stock can open BELOW the stop.
+
+    Returns a list of trade dicts (empty if no event produced a valid
+    next-bar entry). Each dict:
+      {event_i, entry_i, exit_i, entry_date, exit_date, entry_price,
+       exit_price, gross_return, net_return, holding_days, exit_reason
+       ("stop"|"horizon"), mae, mfe, gap}
+    """
+    if horizon is None:
+        horizon = TRADE_SIM_HORIZON
+
+    opens = df["Open"].values
+    highs = df["High"].values
+    lows = df["Low"].values
+    closes = df["Close"].values
+    dates = df.index
+    atr = _atr_series(df)
+    n = len(closes)
+
+    trades = []
+    for ei in event_indices:
+        entry_i = ei + 1
+        if entry_i >= n:
+            continue  # signal fired too recently in this replay to have a next bar
+
+        raw_entry = opens[entry_i]
+        signal_close = closes[ei]
+        if raw_entry is None or raw_entry <= 0 or signal_close is None or signal_close <= 0:
+            continue
+
+        gap = (raw_entry - signal_close) / signal_close
+        entry_price = raw_entry * (1 + slippage_bps / 10000.0)  # buy slips up
+
+        entry_atr = atr[ei]
+        stop_price = (
+            entry_price - stop_loss_atr_mult * entry_atr
+            if entry_atr is not None and not np.isnan(entry_atr)
+            else None
+        )
+
+        mae = 0.0  # most negative mark-to-market excursion, as a fraction (0 or negative)
+        mfe = 0.0  # most positive mark-to-market excursion, as a fraction (0 or positive)
+        exit_i = None
+        exit_reason = "horizon"
+        max_i = min(entry_i + horizon, n - 1)
+
+        for j in range(entry_i, max_i + 1):
+            day_low = lows[j]
+            day_high = highs[j]
+            mae = min(mae, (day_low - entry_price) / entry_price)
+            mfe = max(mfe, (day_high - entry_price) / entry_price)
+            if stop_price is not None and day_low <= stop_price:
+                exit_i = j
+                exit_reason = "stop"
+                raw_exit = stop_price  # conservative: assumes fill at the stop itself,
+                break                   # not the (possibly worse) day's actual low
+        if exit_i is None:
+            exit_i = max_i
+            raw_exit = closes[exit_i]
+
+        exit_price = raw_exit * (1 - slippage_bps / 10000.0)  # sell slips down
+        gross_return = (exit_price - entry_price) / entry_price
+        net_return = gross_return - (cost_bps / 10000.0)
+        holding_days = exit_i - entry_i
+
+        trades.append({
+            "event_i": ei,
+            "entry_i": entry_i,
+            "exit_i": exit_i,
+            "entry_date": dates[entry_i],
+            "exit_date": dates[exit_i],
+            "entry_price": float(entry_price),
+            "exit_price": float(exit_price),
+            "gross_return": float(gross_return),
+            "net_return": float(net_return),
+            "holding_days": int(holding_days),
+            "exit_reason": exit_reason,
+            "mae": float(mae),
+            "mfe": float(mfe),
+            "gap": float(gap),
+        })
+
+    return trades
+
+
+def compute_trade_stats(trades):
+    """
+    Aggregates simulate_trades() output into the metrics that actually
+    say whether a pattern is worth trading, not just whether it "worked":
+
+      win_rate, avg_winner, avg_loser  -- avg_loser is the raw (negative)
+        mean of losing trades, so it's a magnitude with sign attached.
+      expectancy  -- (Win% x Avg Win) - (Loss% x Avg Loser-magnitude),
+        computed here as win_rate*avg_winner + loss_rate*avg_loser since
+        avg_loser is already negative; per-trade expected return, net of
+        costs. THIS is the number that should drive whether a pattern is
+        worth acting on -- a high hit-rate with negative expectancy is a
+        losing strategy, and a mediocre hit-rate with positive
+        expectancy can be a good one. See module docstring above.
+      profit_factor  -- gross profit / gross loss (both positive
+        magnitudes). >1 means the winners paid for the losers; below 1
+        means they didn't, regardless of hit-rate. inf if there were
+        zero losing trades.
+      max_drawdown  -- peak-to-trough decline of an equity curve built
+        by compounding trades IN CHRONOLOGICAL ORDER of entry, one after
+        another. Simplification: this assumes trades are taken
+        sequentially (one position in this pattern/stock at a time), not
+        a portfolio running many symbols concurrently -- true portfolio-
+        level drawdown depends on position sizing and overlap across the
+        whole strategy, which this single-pattern/single-stock replay
+        can't see.
+      sharpe / sortino  -- computed on per-trade net returns (mean /
+        std, and mean / downside-std respectively), then ANNUALIZED by
+        scaling by sqrt(trades-per-year), where trades-per-year is
+        estimated from the actual calendar span between first and last
+        trade in the sample. With small samples this estimate is noisy --
+        treat as directional, not precise, and prefer the per-trade
+        (unannualized) figures on thin samples.
+      avg_holding_days, avg_mae, avg_mfe, avg_gap  -- self-explanatory
+        means across trades.
+      stop_out_rate  -- fraction of trades that exited on the stop
+        rather than surviving to the horizon.
+      gap_risk  -- fraction of trades whose overnight entry gap moved
+        AGAINST the position by more than 1% -- the risk a same-day stop
+        can't protect against, since the stock can open through it.
+
+    Returns None if `trades` is empty.
+    """
+    if not trades:
+        return None
+
+    rets = np.array([t["net_return"] for t in trades])
+    wins = rets[rets > 0]
+    losses = rets[rets <= 0]
+
+    win_rate = float(len(wins) / len(rets))
+    loss_rate = 1.0 - win_rate
+    avg_winner = float(wins.mean()) if len(wins) else 0.0
+    avg_loser = float(losses.mean()) if len(losses) else 0.0  # <= 0
+    expectancy = win_rate * avg_winner + loss_rate * avg_loser
+
+    gross_profit = float(wins.sum())
+    gross_loss = float(-losses.sum())  # positive magnitude
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    else:
+        profit_factor = float("inf") if gross_profit > 0 else 0.0
+
+    trades_sorted = sorted(trades, key=lambda t: t["entry_i"])
+    equity = [1.0]
+    for t in trades_sorted:
+        equity.append(equity[-1] * (1 + t["net_return"]))
+    equity = np.array(equity)
+    running_max = np.maximum.accumulate(equity)
+    drawdowns = (equity - running_max) / running_max
+    max_drawdown = float(drawdowns.min())
+
+    mean_ret = float(rets.mean())
+    std_ret = float(rets.std(ddof=1)) if len(rets) > 1 else 0.0
+    sharpe_per_trade = (mean_ret / std_ret) if std_ret > 0 else None
+
+    downside = rets[rets < 0]
+    downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else 0.0
+    sortino_per_trade = (mean_ret / downside_std) if downside_std > 0 else None
+
+    first_date, last_date = trades_sorted[0]["entry_date"], trades_sorted[-1]["entry_date"]
+    span_days = (last_date - first_date).days if last_date != first_date else None
+    trades_per_year = (len(trades) / (span_days / 365.25)) if span_days else None
+
+    sharpe = (sharpe_per_trade * (trades_per_year ** 0.5)) if (sharpe_per_trade is not None and trades_per_year) else sharpe_per_trade
+    sortino = (sortino_per_trade * (trades_per_year ** 0.5)) if (sortino_per_trade is not None and trades_per_year) else sortino_per_trade
+
+    adverse_gap_count = sum(1 for t in trades if t["gap"] < -0.01)
+
+    return {
+        "sample_size": len(trades),
+        "win_rate": win_rate,
+        "avg_winner": avg_winner,
+        "avg_loser": avg_loser,
+        "expectancy": expectancy,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "sharpe_per_trade": sharpe_per_trade,
+        "sortino_per_trade": sortino_per_trade,
+        "trades_per_year_est": trades_per_year,
+        "avg_holding_days": float(np.mean([t["holding_days"] for t in trades])),
+        "avg_mae": float(np.mean([t["mae"] for t in trades])),
+        "avg_mfe": float(np.mean([t["mfe"] for t in trades])),
+        "avg_gap": float(np.mean([t["gap"] for t in trades])),
+        "stop_out_rate": float(np.mean([1.0 if t["exit_reason"] == "stop" else 0.0 for t in trades])),
+        "gap_risk_rate": float(adverse_gap_count / len(trades)),
+        "slippage_bps": SLIPPAGE_BPS,
+        "cost_bps": BROKERAGE_TAX_BPS,
+        "stop_loss_atr_mult": STOP_LOSS_ATR_MULT,
+    }
 
 
 def backtest_signal(symbol, df, detector_fn, as_of_i):
