@@ -164,7 +164,7 @@ from utils.nse_data import get_nifty500_symbols, get_bhavcopy, data_quality_chec
 from utils.breakout_patterns import scan_all_patterns, PATTERN_DETECTOR_BY_NAME
 from utils.breakout_backtest import (
     backtest_signal, compute_quality_score,
-    PRIMARY_HORIZON, MIN_SAMPLES_FOR_CONFIDENCE, CONFIRM_HIT_RATE_THRESHOLD,
+    PRIMARY_HORIZON, MIN_SAMPLES_FOR_CONFIDENCE, CONFIRM_HIT_RATE_THRESHOLD, QUALITY_LABELS,
 )
 from utils.entry_classification import classify_entry, EntryState, ClassifierConfig
 from utils.breakout_targets import (
@@ -2072,20 +2072,38 @@ def scan_universe(histories, bhav_df, regime: RegimeResult, nifty_series=None, s
     near_breakout_watch.sort(key=lambda r: r["entry"].distance_to_breakout_pct or 999)
 
     # One row per symbol across the whole report. A single stock can fire
-    # several independent chart patterns on the same day (e.g. a Resistance
-    # Breakout AND a Triangle Breakout), and each pattern is backtested and
-    # scored on its own merits -- see the per-pattern loop above. Left alone
-    # that means the same symbol can legitimately land in more than one
-    # section (e.g. Confirmed on one pattern, Watch on another), which reads
-    # as a duplicate/bug even though the underlying scoring is correct. To
-    # keep the report to one row per symbol, we keep only that symbol's
-    # single best-ranked pattern and drop the rest, in section-priority
-    # order: Confirmed > Watch > Filtered (low R:R) > Near-Breakout. Each
-    # bucket is already sorted best-first above, so keeping the first
-    # occurrence of a symbol per bucket keeps its strongest pattern.
-    confirmed, watch_list, filtered_low_rr, near_breakout_watch = _dedupe_rows_by_symbol(
+    # several independent chart patterns on the same day (e.g. a 52-Week
+    # High Breakout AND a Volume Surge Breakout), each backtested and
+    # scored on its own merits by the per-pattern loop above. Left alone
+    # that means the same symbol can occupy multiple slots in the same
+    # table (or land in different sections), which distorts ranking --
+    # the stock effectively gets extra "votes" -- and reads as a
+    # duplicate/bug even though each underlying score is correct.
+    #
+    # Rather than keeping only the single best pattern and DROPPING the
+    # rest (the previous behavior here), every pattern that independently
+    # fired for a symbol AND landed in the SAME bucket is now MERGED into
+    # one composite row -- see _consolidate_rows_by_symbol /
+    # _merge_symbol_rows / _compute_composite_score below. Multiple
+    # independently-backtested patterns confirming the same stock the
+    # same day is real corroborating evidence, not noise, and silently
+    # discarding it threw that signal away. A symbol still only occupies
+    # ONE slot in ONE bucket -- bucket priority remains Confirmed > Watch
+    # > Filtered (low R:R) > Near-Breakout, same as before; a pattern
+    # that landed in a LOWER-priority bucket for a symbol already placed
+    # in a higher one is still dropped (that pattern's own downgrade
+    # reason is already documented on whichever row it produced).
+    confirmed, watch_list, filtered_low_rr, near_breakout_watch = _consolidate_rows_by_symbol(
         confirmed, watch_list, filtered_low_rr, near_breakout_watch
     )
+
+    # Re-rank Confirmed/Watch by the just-computed Composite Score so a
+    # symbol with several independently-confirming patterns can rank
+    # above a symbol with one strong-but-solitary pattern, not just keep
+    # whatever position its single best pattern happened to sort to
+    # before consolidation.
+    confirmed.sort(key=lambda r: (r["composite_score"]["score"], r.get("risk_adjusted_score") or float("-inf")), reverse=True)
+    watch_list.sort(key=lambda r: (r["composite_score"]["score"], r.get("risk_adjusted_score") or float("-inf")), reverse=True)
 
     return confirmed, watch_list, filtered_low_rr, near_breakout_watch, skipped_count
 
@@ -2093,7 +2111,10 @@ def scan_universe(histories, bhav_df, regime: RegimeResult, nifty_series=None, s
 def _dedupe_rows_by_symbol(*buckets):
     """Keep only the first row per symbol, scanning buckets in the order
     passed in. Each bucket must already be sorted best-first. Returns a
-    tuple of deduped buckets in the same order/count as the input."""
+    tuple of deduped buckets in the same order/count as the input.
+    Superseded by _consolidate_rows_by_symbol below for scan_universe's
+    own use (which merges instead of dropping) -- kept here as a plain
+    utility in case something needs pure dedup-and-drop behavior."""
     seen_symbols = set()
     deduped = []
     for bucket in buckets:
@@ -2106,6 +2127,183 @@ def _dedupe_rows_by_symbol(*buckets):
             kept.append(row)
         deduped.append(kept)
     return tuple(deduped)
+
+
+# Points that go into a Composite Score for each ADDITIONAL pattern (beyond
+# the symbol's first/best) that independently cleared ITS OWN Confirmed
+# bar. Diminishing, and capped by len(this list) -- agreement alone
+# shouldn't be able to drag a mediocre base score up to "Excellent" on
+# pattern count alone.
+COMPOSITE_AGREEMENT_BONUS_SCHEDULE = (6, 3, 1)
+
+
+def _label_for_score(score):
+    # Reuses the same Excellent/Strong/Moderate/Weak/Poor bands as the
+    # backtest module's Quality Score (utils.breakout_backtest.QUALITY_LABELS)
+    # so a Composite Score reads on the same scale a reader already knows.
+    for threshold, label in QUALITY_LABELS:
+        if score >= threshold:
+            return label
+    return QUALITY_LABELS[-1][1]
+
+
+def _compute_composite_score(rows):
+    """
+    rows: every row for ONE symbol that landed in the same bucket,
+    already best-first sorted (rows[0] is the symbol's strongest single
+    pattern). Returns:
+      {"score": int 0-100, "label": str, "base_score": int,
+       "agreement_bonus": int, "patterns_fired": int,
+       "patterns_confirmed": int}
+
+    Base: rows[0]'s Setup Strength score if available (already the
+    project's own blended "how good is this signal" read -- see
+    compute_setup_strength), else its Quality Score, else 50 (neutral --
+    "no opinion", same fail-soft convention used everywhere else here)
+    if neither is available.
+
+    Agreement bonus: for every pattern AFTER the first that
+    independently cleared its own Confirmed bar (shared backtest module
+    bar AND this controller's tiered bar -- see cleared_backtest in the
+    per-pattern loop above), add the next value from
+    COMPOSITE_AGREEMENT_BONUS_SCHEDULE. A pattern that fired but did NOT
+    itself clear Confirmed still shows up on the checklist (see
+    _composite_checklist_html) for transparency, but contributes no
+    bonus -- an unconfirmed pattern agreeing with a confirmed one is
+    weaker evidence than two confirmed patterns agreeing.
+    """
+    base_row = rows[0]
+    if base_row.get("setup_strength"):
+        base = base_row["setup_strength"]["score"]
+    elif base_row.get("quality"):
+        base = base_row["quality"]["score"]
+    else:
+        base = 50
+
+    def _cleared_confirmed(r):
+        bt = r.get("backtest") or {}
+        return bool(bt.get("confirmed")) and r.get("confirmation_tier") is not None
+
+    patterns_confirmed = sum(1 for r in rows if _cleared_confirmed(r))
+
+    bonus = 0.0
+    extra_confirmed = max(0, patterns_confirmed - (1 if _cleared_confirmed(base_row) else 0))
+    for k in range(extra_confirmed):
+        bonus += COMPOSITE_AGREEMENT_BONUS_SCHEDULE[k] if k < len(COMPOSITE_AGREEMENT_BONUS_SCHEDULE) else 1
+
+    score = int(min(100, round(base + bonus)))
+    return {
+        "score": score,
+        "label": _label_for_score(score),
+        "base_score": round(base),
+        "agreement_bonus": round(bonus),
+        "patterns_fired": len(rows),
+        "patterns_confirmed": patterns_confirmed,
+    }
+
+
+def _merge_symbol_rows(rows):
+    """rows: every row for ONE symbol that landed in the same bucket,
+    already best-first sorted by _rank_key. Builds one composite row for
+    the report: keeps the best-ranked row's fields as the base (its
+    entry/targets/R:R/fundamentals/RS/sector-confirmation reads are
+    genuinely per-SYMBOL information, just recomputed once per pattern in
+    the loop above, so the strongest pattern's version is representative),
+    then adds the consolidated pattern checklist and Composite Score.
+
+    Near-Breakout rows have a different shape entirely (no fired pattern
+    at all -- see scan_universe's near_breakout_watch.append call) and
+    are passed through unchanged (there's nothing to consolidate: no
+    pattern-level backtest/quality exists on that row to merge)."""
+    primary = rows[0]
+    if "pattern" not in primary:
+        return dict(primary)
+
+    composite = dict(primary)  # shallow copy -- every existing field/renderer keeps working unchanged
+    composite["consolidated_patterns"] = [
+        {
+            "pattern": r["pattern"],
+            "detail": r["detail"],
+            "backtest": r.get("backtest"),
+            "quality": r.get("quality"),
+            "confirmation_tier": r.get("confirmation_tier"),
+            "cleared_confirmed": bool((r.get("backtest") or {}).get("confirmed")) and r.get("confirmation_tier") is not None,
+        }
+        for r in rows
+    ]
+    composite["pattern"] = (
+        primary["pattern"] if len(rows) == 1
+        else f"Composite Breakout ({len(rows)} patterns)"
+    )
+    composite["detail"] = (
+        primary["detail"] if len(rows) == 1
+        else " + ".join(r["pattern"] for r in rows)
+    )
+    composite["composite_score"] = _compute_composite_score(rows)
+    return composite
+
+
+def _consolidate_rows_by_symbol(*buckets):
+    """Groups rows by symbol WITHIN each bucket (buckets already sorted
+    best-first) and merges every same-symbol row in a bucket into one
+    composite row via _merge_symbol_rows, instead of keeping the single
+    best pattern and dropping the rest. A symbol still lands in only ONE
+    bucket total -- once a symbol has been placed (in bucket-priority
+    order: the order `buckets` is passed in, matching Confirmed > Watch >
+    Filtered > Near-Breakout at the call site), any of its rows in a
+    LOWER-priority bucket are dropped, same as the old dedupe behavior.
+    Returns a tuple of consolidated buckets in the same order/count as
+    the input."""
+    seen_symbols = set()
+    consolidated = []
+    for bucket in buckets:
+        by_symbol = {}
+        order = []
+        for row in bucket:
+            symbol = row["symbol"]
+            if symbol in seen_symbols:
+                continue
+            if symbol not in by_symbol:
+                by_symbol[symbol] = []
+                order.append(symbol)
+            by_symbol[symbol].append(row)
+        merged = []
+        for symbol in order:
+            seen_symbols.add(symbol)
+            merged.append(_merge_symbol_rows(by_symbol[symbol]))
+        consolidated.append(merged)
+    return tuple(consolidated)
+
+
+def _composite_checklist_html(row):
+    """Renders the per-symbol checklist for a Composite row (2+ independently
+    fired patterns) -- each pattern that fired, with a check/cross for
+    whether IT ALONE cleared Confirmed, plus the resulting Composite Score.
+    Returns '' for an ordinary single-pattern row (nothing to consolidate)."""
+    patterns = row.get("consolidated_patterns") or []
+    if len(patterns) < 2:
+        return ""
+    items = []
+    for p in patterns:
+        mark = "\u2713" if p["cleared_confirmed"] else "\u2717"
+        color = "#0f5132" if p["cleared_confirmed"] else "#8A8F9C"
+        bt = p.get("backtest") or {}
+        primary_stats = (bt.get("horizons") or {}).get(PRIMARY_HORIZON) if bt else None
+        stat_bit = f' ({primary_stats["hit_rate"]*100:.0f}% hit-rate, n={bt.get("sample_size", 0)})' if primary_stats else ""
+        items.append(
+            f'<div style="color:{color};">{mark} {html.escape(p["pattern"])}{stat_bit}</div>'
+        )
+    cs = row.get("composite_score") or {}
+    summary = (
+        f'<div style="margin-top:3px;font-weight:700;color:#1F2430;">'
+        f'Composite Score: {cs.get("score", "?")} ({html.escape(cs.get("label", ""))}) -- '
+        f'{cs.get("patterns_confirmed", 0)}/{cs.get("patterns_fired", 0)} patterns confirmed'
+        f'</div>'
+    )
+    return (
+        f'<div style="margin-top:4px;padding-top:4px;border-top:1px dashed #DAD5CB;font-size:10.5px;">'
+        + "".join(items) + summary + "</div>"
+    )
 
 
 # -----------------------------------------------------------------------
@@ -2804,11 +3002,12 @@ def _signal_rows_html(rows, row_bg):
                 f'<div style="margin-top:3px;font-size:10.5px;font-weight:700;color:#0B4C7C;">'
                 f'{BEST_EXECUTION_LABEL}</div>'
             )
+        composite_checklist = _composite_checklist_html(row)
         bg = _row_bg_for_row(row, row_bg)
         out.append(f"""
         <tr style="background:{bg};">
           <td data-label="Symbol" style="padding:9px 12px;font-family:{SANS};font-size:13px;font-weight:700;color:#1F2430;border-bottom:1px solid #EDEAE2;">{html.escape(row['symbol'])}{best_execution_note}</td>
-          <td data-label="Pattern" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{strict_bar_note}{extension_note}{extreme_volume_note}</td>
+          <td data-label="Pattern" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{emoji} {html.escape(row['pattern'])}<div style="margin-top:2px;font-size:10.5px;color:#8A8F9C;">{html.escape(row['detail'])}</div>{caution}{regime_note}{strict_bar_note}{extension_note}{extreme_volume_note}{composite_checklist}</td>
           <td data-label="Price" style="padding:9px 12px;font-family:{SANS};font-size:12px;color:#3C4256;border-bottom:1px solid #EDEAE2;text-align:right;">₹{row['signal_price']:,.2f}</td>
           <td data-label="Backtest" style="padding:9px 12px;font-family:{SANS};font-size:11.5px;color:#3C4256;border-bottom:1px solid #EDEAE2;">{_backtest_cell(row)}</td>
           <td data-label="Quality" style="padding:9px 12px;border-bottom:1px solid #EDEAE2;text-align:center;">{_quality_badge_html(row['quality'])}{_fundamentals_note_html(row.get('fundamentals'), row.get('fundamental_classification'))}</td>
