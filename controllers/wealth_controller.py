@@ -274,11 +274,11 @@ def _parse_wealth_report_json(text, instrument_names):
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
-            return {}, None
+            return {}, None, None
         try:
             data = json.loads(match.group(0))
         except json.JSONDecodeError:
-            return {}, None
+            return {}, None, None
 
     raw_recommendations = data.get("instrument_recommendations") if isinstance(data, dict) else None
     raw_take = data.get("portfolio_take") if isinstance(data, dict) else None
@@ -392,15 +392,23 @@ def generate_wealth_report(portfolio, usd_inr_rate):
         recommendations, _take, _snapshot = _parse_wealth_report_json(text, instrument_names)
         return bool(recommendations)
 
-    text, _sources, used_live = llm_backend.generate_analysis(
-        prompt,
-        # Bumped from 1800 -- WEALTH_TAKE_GUIDANCE asks for named
-        # funds/ETFs/sectors and exact ₹ amounts in every bullet, which
-        # runs longer per point than the old percentage-only phrasing.
-        max_tokens=2400,
-        validate_fn=_validate,
-        log_label="Monthly Wealth Report",
-    )
+    try:
+        text, _sources, used_live = llm_backend.generate_analysis(
+            prompt,
+            # Bumped from 1800 -- WEALTH_TAKE_GUIDANCE asks for named
+            # funds/ETFs/sectors and exact ₹ amounts in every bullet, which
+            # runs longer per point than the old percentage-only phrasing.
+            max_tokens=2400,
+            validate_fn=_validate,
+            log_label="Monthly Wealth Report",
+        )
+    except Exception:
+        # Any failure in the LLM chain (quota/network errors, or a bug in
+        # a tier's response parsing) should degrade to the fallback report
+        # below, never crash the run -- this is a monthly report, not a
+        # critical path, so a missed AI read is far preferable to no report.
+        log.exception("Monthly Wealth Report: generate_analysis raised unexpectedly -- using fallback recommendations.")
+        text, used_live = None, False
 
     if text:
         recommendations, portfolio_take, portfolio_snapshot = _parse_wealth_report_json(text, instrument_names)
@@ -462,12 +470,20 @@ def _retry_missing_recommendations(missing_names, portfolio, usd_inr_rate):
         v, _take, _snapshot = _parse_wealth_report_json(text, missing_names)
         return bool(v)
 
-    text, _sources, _used_live = llm_backend.generate_analysis(
-        prompt,
-        max_tokens=600,
-        validate_fn=_validate,
-        log_label="Monthly Wealth Report (retry - missing instruments)",
-    )
+    try:
+        text, _sources, _used_live = llm_backend.generate_analysis(
+            prompt,
+            max_tokens=600,
+            validate_fn=_validate,
+            log_label="Monthly Wealth Report (retry - missing instruments)",
+        )
+    except Exception:
+        # This is a best-effort recovery retry -- if the whole LLM chain
+        # blows up (quota errors, network issues, a tier's parsing bug),
+        # the caller already knows how to backfill "Unavailable" for
+        # whatever's still missing, so fail soft instead of propagating.
+        log.exception("Monthly Wealth Report (retry - missing instruments): generate_analysis raised unexpectedly -- skipping retry.")
+        return {}
     if not text:
         return {}
 
