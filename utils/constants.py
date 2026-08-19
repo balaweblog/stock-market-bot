@@ -96,7 +96,6 @@ SIP_PORTFOLIO = [
     {"instrument": "Bharat Electronics (BEL)", "category": "Direct Equity", "amount_inr": 5000},
     {"instrument": "Chennai Petroleum", "category": "Direct Equity", "amount_inr": 8000},
     {"instrument": "Bajaj Finance", "category": "Direct Equity", "amount_inr": 8000},
-    {"instrument": "Kalyan Jewellers", "category": "Direct Equity", "amount_inr": 7000},
     {"instrument": "Gold (Tanishq)", "category": "Physical Gold", "amount_inr": 10000},
     {"instrument": "Silver (Bhima Jewellers)", "category": "Physical Silver", "amount_inr": 5000},
     {"instrument": "ICICI Prudential Manufacturing Fund", "category": "Mutual Fund - Thematic", "amount_inr": 3000},
