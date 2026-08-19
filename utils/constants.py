@@ -19,7 +19,6 @@ STOCKS = {
     "Goog": "GOOG",
     "AMZN": "AMZN",
     "QQQ": "QQQ",
-    "KALYANJEWEL": "KALYANKJIL.NS",
     "CHENNPETRO": "CHENNPETRO.NS",
     "BAJFINANCE": "BAJFINANCE.NS"
 }
@@ -41,7 +40,6 @@ WATCHLIST = [
     "Apple Inc.",
     "Amazon.com, Inc.",
     "Alphabet Inc.",
-    "Kalyan Jewellers India Ltd.",
     "Chennai Petroleum Corporation Ltd.",
     "Bajaj Finance Ltd."
 ]
